@@ -1,13 +1,16 @@
 # AGENTS.md
 
 ## What this repo is
-- **Spec-only, pre-implementation.** There is no `rtl/`, `sim/`, or Python code yet. Nothing to build, run, or test — do not assume a build/test/lint command exists.
-- Git repository (initialized). The eventual code layout is defined in `fpga_tick_to_trade_master_spec.md` §13.
+- **Spec-only, pre-implementation.** There is no `rtl/`, `sim/`, `tb/`, `model/`, or `hls4ml/` yet. Nothing to build, run, or test — do not assume a build/test/lint command exists. The eventual code layout is defined in `fpga_tick_to_trade_master_spec.md` §13.
+- See `CLAUDE.md` for the full version of this guidance (project description, architecture diagram, toolchain, MCP servers) — this file mirrors it in short form; keep both in sync.
 
 ## Which file is authoritative
 - `fpga_tick_to_trade_master_spec.md` is the **single source of truth** (merged master spec). It supersedes `fpga_top_of_book_engine_spec.md` and incorporates the (since removed) adverse-selection classifier spec.
 - `fpga_top_of_book_engine_spec.md` is a **superseded** historical document. Do not edit it as authoritative; make changes in the master spec and keep its §0 reconciliation table consistent.
 - `ml_engineer_brief.md` is a self-contained handoff for the ML collaborator (Python/hls4ml only, zero Verilog), mirroring §5–§11 of the master spec from the ML owner's side. Keep it in sync when the ML contract changes.
+- `README.md` is the public-facing deliverable (architecture, wire format, decision rule, results); update it when master-spec user-facing facts change.
+- `fpga_project_flow.md` is a general (non-project-specific) reference on the 9-stage FPGA methodology this repo follows.
+- `PREREQUISITES.md` tracks toolchain versions/paths verified on the dev machine and open S0 items.
 
 ## Spec conventions (when editing the master doc)
 - Requirements are numbered `FR-n` / `NFR-n`; every requirement must map to a test in §11.4. Adding a requirement without a test breaks the traceability model.
