@@ -1,0 +1,13 @@
+# Pinned per ml_engineer_brief.md SS13 pitfall #5 ("unpinned versions change
+# arithmetic behavior"). Update deliberately, re-run tests/, and re-record
+# here plus in docs/hls4ml_flow.md when you do.
+numpy==2.5.2
+pytest==9.1.1
+
+# Added at roadmap Step 6 (training) -- uncomment when you get there:
+# tensorflow==2.16.*
+
+# Added at roadmap Step 7 (hls4ml convert/export) -- uncomment when you get there:
+# hls4ml==...
+# h5py==...
+# pyyaml==...

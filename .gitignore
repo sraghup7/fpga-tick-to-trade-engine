@@ -10,3 +10,9 @@ hls4ml/.Xil/
 *.jou
 *.log
 .Xil/
+
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
