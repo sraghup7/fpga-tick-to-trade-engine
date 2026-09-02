@@ -9,7 +9,7 @@
 | Author | Sai Charan Raghupatruni (FPGA / bring-up) |
 | Collaborator | TBD (ML / hls4ml) |
 | Target device | Xilinx Artix-7 `XC7A35T-2FGG484I` (ALINX AX7035B) |
-| Ethernet PHY | Micrel KSZ9031RNX, RGMII, 10/100/1000 Mbps |
+| Ethernet PHY | JLSemi JL2121(D), RGMII, 10/100/1000 Mbps — corrected 2026-09-01; the board's own schematic and every earlier doc here said Micrel KSZ9031RNX, which is wrong for the physically populated chip (see §0 reconciliation and `docs/design_decisions.md` D4) |
 | RTL language | Verilog-2001 (synthesizable subset) for `rtl/`; the ML core is HLS-generated IP |
 | ML flow | Python (Keras) → hls4ml → Vitis HLS IP |
 | Toolchain | Vivado 2023.x or later, Vitis HLS 2023.x or later, Python 3.11+ |
@@ -37,6 +37,11 @@ This is the single source of truth for the project. Requirements are numbered (`
 | Mid price | `(b+a)/2` (real) | Integer mid `(bid+ask)>>1` everywhere — hardware, golden model, and labeler |
 | Trade-print `side` | `0xFF` not applicable | For `msg_type=0x02`, `side` = aggressor side (feeds feature F6) |
 | Classifier RTL | Hand-written `linear_classifier.sv` | hls4ml-generated IP (`Dense(8→1)`) wrapped in Verilog; threshold/hysteresis in hand RTL |
+| Ethernet MAC | Assumed hand-written `eth_mac_tx`/`eth_mac_rx`, shape undecided | Reused from ALINX's AX7035B reference tree (`rtl/vendor/alinx_mac/`); boundary is a byte-push TX FIFO + whole-frame RX RAM, not AXI4-Stream or GMII — see `docs/design_decisions.md` D1 |
+| System clock | Implicitly "125 MHz, source unspecified" | The MAC's recovered RGMII RX clock (`gmii_rx_clk`) *is* the single system clock; no separate CDC at the MAC boundary — D2 |
+| `LINK_MODE` at bring-up | Raw Ethernet assumed lower-risk default | UDP (`LINK_MODE=1`) is the bring-up default; raw EtherType mode deferred (the reused MAC only dispatches ARP/IPv4/UDP) — D3 |
+| PHY management | Assumed reusable as-is | Hand-written `mdio_ctrl.v` replaces ALINX's borrowed MIIM block (license incompatibility + a PHY-address bug) — D4 |
+| Ethernet PHY identity | Micrel KSZ9031RNX (stated everywhere, incl. the board's own schematic) | JLSemi JL2121(D) — the schematic and every ALINX doc are wrong for the physically populated chip; corrected 2026-09-01 after re-reading `docs/refs/AX7035B_pinout_notes.md` (which already carries this correction from unrelated bring-up work) — D4 |
 
 ---
 
@@ -142,7 +147,7 @@ The project succeeds if all of the following are demonstrated and documented:
    └────────────────────────┬─────────────────────────────────────┘
                             │ 1000BASE-T
                     ┌───────▼────────┐
-                    │  KSZ9031RNX    │  PHY
+                    │  JL2121(D)     │  PHY
                     └───────┬────────┘
                             │ RGMII (4-bit DDR @125 MHz)
    ═════════════════════════▼══════════════════════════════════════
@@ -200,6 +205,10 @@ Because the ML path is deeper than the signal path, the order intent is delayed 
 `[Q] ml_policy` is hand-written Verilog: it applies the hysteresis threshold (`T_high`/`T_low`), produces the `adverse_risk` bit and the `risk_level` telemetry byte. Thresholds and normalization parameters are runtime-configurable registers; weights are baked (see §5.5).
 
 Keeping the threshold and hysteresis *outside* the hls4ml IP is deliberate: the deterministic control logic stays in testable, easily-verified RTL, and the hls4ml model stays minimal (one `Dense` layer), which is the lowest-risk possible hls4ml integration.
+
+### 3.5 The MAC in context
+
+`[B] eth_mac_rx` / `[K] eth_mac_tx` are not hand-written. They are ALINX's own RTL from the AX7035B reference tree, vendored into `rtl/vendor/alinx_mac/` unmodified except for two new status-output ports (§17 Q2). The boundary it presents is neither AXI4-Stream nor raw GMII — a byte-push TX FIFO and a whole-frame-buffered RX RAM — so a new adapter, `rtl/eth_mac_if.v`, converts it to the byte-stream shape the rest of the datapath (`frame_classifier` onward) expects. The MAC's recovered RGMII RX clock, `gmii_rx_clk`, is the engine's single 125 MHz system clock (no separate CDC at this boundary — the vendor MAC ties its own TX clock to the same recovered clock). Full rationale, the exact port list, and what was deliberately *not* reused (PHY management — see `rtl/common/mdio_ctrl.v`) are in `docs/design_decisions.md` (D1–D5).
 
 ---
 
@@ -792,6 +801,7 @@ fpga-tick-to-trade-engine/
 │   └── design_decisions.md    # every "why not X" answered
 ├── rtl/
 │   ├── tob_top.v
+│   ├── eth_mac_if.v            # adapts vendor/alinx_mac's byte-push/RAM boundary to a byte-stream
 │   ├── frame_classifier.v
 │   ├── md_parser.v
 │   ├── symbol_filter.v
@@ -806,7 +816,9 @@ fpga-tick-to-trade-engine/
 │   ├── order_builder.v
 │   ├── latency_histogram.v
 │   ├── csr_block.v
-│   └── common/                 # sync_2ff.v, counter_sat.v, ...
+│   ├── vendor/
+│   │   └── alinx_mac/           # ALINX reference MAC, vendored per docs/design_decisions.md D1
+│   └── common/                 # sync_2ff.v, counter_sat.v, mdio_ctrl.v, ...
 ├── hls4ml/                     # generated project (gitignored, rebuilt by script)
 │   └── myproject_prj/          # Vitis HLS project output
 ├── tb/
@@ -893,7 +905,7 @@ Two-person plan. Review gate at the end of each stage; nothing proceeds past a g
 | Risk | Impact | Mitigation |
 | :-- | :-- | :-- |
 | MAC not production-ready | Blocks S8/S11 | Abstracted ingress; UART fallback; MAC only on the wire-to-wire number |
-| RGMII timing on KSZ9031RNX | Bring-up delay | Bring up the ALINX Ethernet example first; confirm RX/TX clock skew config before integrating |
+| RGMII timing on JL2121(D) | Bring-up delay | Bring up the ALINX Ethernet example first; RX/TX clock delay is strap-configured (RXDLY/TXDLY pins, both already strapped +2ns on this board per `docs/refs/AX7035B_pinout_notes.md`), not register-configured — nothing for `mdio_ctrl.v` to tune here |
 | hls4ml build fails on small part | Blocks S6 | `linear_classifier.v` fallback behind the same wrapper; hls4ml isolated by `ml_classifier_wrap` |
 | DSP overrun on MLP v2 (72 MACs vs 90 DSP) | Fails NFR-7 | `ReuseFactor`/LUT multipliers; ship v1 (8 DSP) as the guaranteed fit |
 | ap_fixed bit-exactness pain | Verification churn | Fix truncation/saturation/width in `ml_golden.py` at S1; lock arithmetic before RTL |
@@ -908,17 +920,17 @@ Two-person plan. Review gate at the end of each stage; nothing proceeds past a g
 
 ## 17. Open Questions
 
-Resolve during S0:
+All resolved as of 2026-09-01 (rationale in `docs/design_decisions.md`, one entry `D1`–`D8` per decision). Kept here as a record, not a to-do list.
 
-1. **MAC interface shape.** Plain 8-bit valid/last stream, or AXI4-Stream with `tkeep`/`tready`? S2's TB should drive the real shape from the start.
-2. **MAC RX error signalling.** Error flag after the fact, or frame suppressed? Determines `frame_classifier`'s discard-in-flight path.
-3. **`LINK_MODE` at bring-up.** Raw-Ethernet first (lower risk) vs. UDP from S2 (avoid writing the classifier twice)?
-4. **Board keys.** AX7035B has two user keys; confirm the variant in hand (kill switch, counter clear, mode select all want buttons).
-5. **Reject reporting.** Keep `0x11` diagnostic frames, or counters-only?
-6. **ML normalization: registers vs. baked.** Runtime-configurable offsets/shifts (flexible, more CSR logic) vs. baked constants (simpler, re-synthesize to change)? Default: runtime registers.
-7. **Gate `0x09` semantics.** Block-only for v1, or include `cfg_ml_action=reduce`? Default: block-only shipped first, reduce as a follow-on.
-8. **Exact Vivado part string.** Confirm `xc7a35tfgg484-2` is accepted by the installed Vivado version (the device is `XC7A35T-2FGG484I`).
-9. **hls4ml version pin.** Pin the hls4ml, Keras, and Vitis HLS versions in `hls4ml_flow.md` and lock them for reproducibility.
+1. **MAC interface shape.** ~~Plain 8-bit valid/last stream, or AXI4-Stream?~~ **Resolved:** neither — a byte-push TX FIFO + whole-frame-buffered RX RAM, ALINX's `mac_top.v` boundary, adapted via a new `rtl/eth_mac_if.v`. See D1.
+2. **MAC RX error signalling.** ~~Error flag after the fact, or frame suppressed?~~ **Resolved:** frame suppression, confirmed by reading `udp_rx.v`; patched to expose `mac_rec_error`/checksum-error as new output ports so FR-1's `err_fcs` counter is implementable. See D1, D5.
+3. **`LINK_MODE` at bring-up.** ~~Raw-Ethernet first vs. UDP from S2?~~ **Resolved, reversed from the original lean:** UDP (`LINK_MODE=1`) first — the reused MAC only dispatches ARP/IPv4/UDP, so raw EtherType `0x88B5` would need a hand-modified vendor dispatch path. See D3.
+4. **Board keys.** ~~AX7035B has two user keys?~~ **Resolved, premise corrected:** four keys (KEY1–KEY4). KEY1=kill switch, KEY2=counter/latch clear, KEY3=mode select (reserved), KEY4=spare. See D6.
+5. **Reject reporting.** ~~Keep `0x11` diagnostic frames, or counters-only?~~ **Resolved:** counters-only gates S7; `0x11` frames are a post-S7 stretch goal (FR-44 already defaults them off). See D7.
+6. **ML normalization: registers vs. baked.** **Resolved:** default kept — runtime registers.
+7. **Gate `0x09` semantics.** **Resolved:** default kept — block-only for v1.
+8. **Exact Vivado part string.** **Resolved 2026-09-01:** `xc7a35tfgg484-2` accepted by the installed Vivado 2024.2 (confirmed via `get_parts`).
+9. **hls4ml version pin.** Still open — owned by the ML collaborator; pin in `docs/hls4ml_flow.md` when his toolchain is confirmed.
 
 ---
 

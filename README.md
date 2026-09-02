@@ -33,7 +33,7 @@ The model can never override the kill switch, position limits, size limits, pric
    HOST PC (Python): feed_gen / order_rx / golden_model / train
         │  1000BASE-T
    ┌────▼────┐
-   │  KSZ9031RNX  PHY  (RGMII @ 125 MHz)
+   │  JL2121(D)  PHY  (RGMII @ 125 MHz)
    └────┬────┘
    ═════▼══════════════════════════════════════════════════
    FPGA — Artix-7 XC7A35T-2FGG484I, single 125 MHz domain

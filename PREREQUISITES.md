@@ -22,9 +22,11 @@ Reference: `fpga_tick_to_trade_master_spec.md` (single source of truth),
 | Git + Git Bash | 2.55 | PATH / `C:\Program Files\Git\bin\bash.exe` | VCS, `make`/`run_sim.sh` runner |
 
 Notes:
-- Spec targets Vivado "2023.x or later"; 2024.2 qualifies. Confirm the exact
-  part string `xc7a35tfgg484-2` is accepted (§17.8) and pin hls4ml ↔ Vitis HLS
-  2024.2 compatibility (§17.9).
+- Spec targets Vivado "2023.x or later"; 2024.2 qualifies. The exact part is
+  still an open item — see §6.8: `xc7a35tfgg484-2` (commercial grade) is
+  installed and buildable, but the real chip (`XC7A35T-2FGG484I`) is
+  industrial grade, and that exact speed/temp combination isn't installed.
+  Also pin hls4ml ↔ Vitis HLS 2024.2 compatibility (§17.9).
 - Icarus 12.0 is a 2015-era devel snapshot: fine for Verilog-2001, but keep
   testbenches plain Verilog (no SVA/SystemVerilog features Icarus can't parse).
   SVA and any SystemVerilog go to XSim.
@@ -114,7 +116,7 @@ reproducible build itself.
 
 | Item | Status | Notes |
 | :-- | :-- | :-- |
-| ALINX AX7035B board | ✅ on hand | XC7A35T-2FGG484I, onboard Micrel KSZ9031RNX PHY |
+| ALINX AX7035B board | ✅ on hand | XC7A35T-2FGG484I, onboard JLSemi JL2121(D) PHY — corrected 2026-09-01, see `docs/design_decisions.md` D9 (the board's own schematic says KSZ9031RNX, which is wrong for the populated chip) |
 | USB-JTAG | ✅ | "Xilinx ECM driver" present in registry (cable has been used) |
 | 1 GbE link + Ethernet cable | ☐ confirm | raw sockets for LINK_MODE=0; static ARP for Mode 1 (§4.1) |
 | Board power supply | ☐ confirm | |
@@ -137,8 +139,8 @@ Keep these in `docs/refs/` (gitignored binaries/PDFs; link sources in README).
 | Artix-7 datasheet (DS181) | resource counts: 20,800 LUT / 41,600 FF / 50 BRAM36 / 90 DSP (NFR-7) |
 | 7-Series CLB (UG474), BRAM (UG473), DSP48E1 (UG479) | inference patterns (recognizable code → dedicated blocks) |
 | 7-Series Packaging & Pinout (UG475) | pin map |
-| **ALINX AX7035B user manual + schematic** | RGMII/LED/key/JTAG pinout → `tob_pins.xdc` (critical) |
-| **Micrel KSZ9031RNX datasheet** | RGMII timing + register config (spec §16 risk) |
+| **ALINX AX7035B user manual + schematic** | RGMII/LED/key/JTAG pinout → `tob_pins.xdc` (critical). The schematic in `docs/refs/AX7035/SCH/SCH.pdf` names the PHY as KSZ9031RNX — that's wrong for the physically populated chip; `docs/refs/AX7035B_pinout_notes.md` has the corrected story and the real manual's page citations. |
+| **JLSemi JL2121(D) datasheet** (`docs/refs/JL2121_datasheet.pdf`, on hand) | RGMII timing + register config (spec §16 risk) — this is the correct PHY datasheet; `docs/refs/AX7035/DATASHEET/KSZ9031RNX.pdf` is a leftover from the vendor demo tree and describes the wrong chip for this board. |
 | Vivado UG901 (synthesis), UG903 (constraints), UG906 (timing), UG908 (debug/ILA) | stages 6–7 + §12.3 critical-path analysis |
 | Vitis HLS UG1399 | ML collaborator (§5.6) |
 | hls4ml documentation | ML collaborator |
@@ -146,17 +148,21 @@ Keep these in `docs/refs/` (gitignored binaries/PDFs; link sources in README).
 
 ---
 
-## 6. Open items to resolve during S0 (spec §17)
+## 6. Open items to resolve during S0 (spec §17) — all resolved 2026-09-01
 
-1. MAC interface shape: 8-bit valid/last stream vs AXI4-Stream (`tkeep`/`tready`).
-2. MAC RX error signalling: after-the-fact flag vs frame suppression.
-3. `LINK_MODE` at bring-up: Raw-Ethernet (default) vs UDP from S2.
-4. Board keys on AX7035B: which physical buttons map to kill switch / counter clear / mode select.
-5. Reject reporting: `0x11` diagnostic frames vs counters-only.
-6. ML normalization: runtime registers (default) vs baked constants.
-7. Gate `0x09` semantics: block-only first (default) vs `cfg_ml_action=reduce`.
-8. ~~Exact Vivado part string: `xc7a35tfgg484-2` accepted by 2024.2?~~ **Resolved 2026-09-01: yes** — `get_parts -filter {NAME=~xc7a35tfgg484-2}` returns it (siblings `-1`, `-2L`, `-3` also present).
-9. hls4ml ↔ Vitis HLS 2024.2 version pin (lock in `hls4ml_flow.md`).
+Full rationale for 1–7 is in `docs/design_decisions.md` (D1–D8); only the outcome is repeated here.
+
+1. ~~MAC interface shape~~ **Resolved:** neither hypothesis — ALINX's reference MAC (reused, see item 10 below) presents a byte-push TX FIFO + whole-frame RX RAM, adapted via a new `rtl/eth_mac_if.v`.
+2. ~~MAC RX error signalling~~ **Resolved:** frame suppression, confirmed by reading `udp_rx.v`; patched to expose `mac_rec_error`/checksum-error as new ports.
+3. ~~`LINK_MODE` at bring-up~~ **Resolved, reversed:** UDP (`LINK_MODE=1`) first, not raw Ethernet — the reused MAC only dispatches ARP/IPv4/UDP.
+4. ~~Board keys~~ **Resolved, premise corrected:** four keys (KEY1=M13 kill switch, KEY2=K14 counter clear, KEY3=K13 mode select, KEY4=L13 spare), not two.
+5. ~~Reject reporting~~ **Resolved:** counters-only gates S7; `0x11` frames are a post-S7 stretch goal.
+6. ML normalization: runtime registers (default) — kept.
+7. Gate `0x09` semantics: block-only first (default) — kept.
+8. ~~Exact Vivado part string: `xc7a35tfgg484-2` accepted by 2024.2?~~ **Partially resolved, corrected 2026-09-01.** `xc7a35tfgg484-2` is accepted — but it's the **commercial** temperature grade. The real chip is `XC7A35T-2FGG484I` (the trailing `I` = **industrial** grade, per `docs/refs/AX7035B_pinout_notes.md` and the ALINX product page), and the industrial+speed-grade-2 combination is **not installed**: `get_parts -filter {NAME=~xc7a35ti*fgg484*}` returns only `xc7a35tifgg484-1L` (industrial, but speed grade -1L, not -2). Today's build (`scripts/build.tcl`) uses `xc7a35tfgg484-2` as a stand-in — fine for the S0 skeleton, but this means **current WNS/timing numbers are against the wrong temperature-grade part model**, not the real chip's. Before S10 (real timing closure), install the missing `-2I` combination via Vivado's "Add Design Tools or Devices" installer (pinout notes already identify this fix) and re-point `build.tcl`'s `part` variable at `xc7a35tifgg484-2` once it's available.
+9. hls4ml ↔ Vitis HLS 2024.2 version pin (lock in `hls4ml_flow.md`) — **still open, owned by the ML collaborator.**
+10. **New, from the MAC-reuse investigation:** ALINX's borrowed MIIM/MDIO block (`docs/refs/AX7035/.../miim/`) is BSD-3-Clause-plus-military-use-restriction (upstream: [yol/ethernet_mac](https://github.com/yol/ethernet_mac)) — incompatible with this repo's Apache-2.0 licensing and ALINX's own copy dropped the required attribution. **Not reused** — see D4. A small hand-written `rtl/common/mdio_ctrl.v` replaces it.
+11. **New:** the vendored MAC's `.xci` IP cores (`clk_wiz` 5.4, `fifo_generator` 13.2, `blk_mem_gen` 8.4, `ila` 6.2) are Vivado 2016–2018-era and need the IP Status / Upgrade Selected IP flow run under 2024.2 before first synthesis that touches them (not blocking S0's skeleton). See D8.
 
 ---
 
@@ -184,16 +190,26 @@ Takes effect next login. A temporary per-shell workaround also exists (`set NoDe
 
 **§4 Hardware:** unchanged — not re-verifiable from software; still needs your own physical confirmation (board power, JTAG cable, Ethernet cable/link, oscilloscope).
 
-**§5 Manuals/datasheets:** all present under `docs/refs/` and `docs/refs/AX7035/DATASHEET/`, including `KSZ9031RNX.pdf` + eval-board docs and the ALINX Ethernet example (`docs/refs/AX7035/SRC/21_ethernet_test/`, plus 4 more Ethernet-integrated examples). **Still missing:** Vitis HLS UG1399 (no local PDF — use AMD's docs site when the ML collaborator needs it).
+**§5 Manuals/datasheets:** all present under `docs/refs/` and `docs/refs/AX7035/DATASHEET/`, including `KSZ9031RNX.pdf` + eval-board docs and the ALINX Ethernet example (`docs/refs/AX7035/SRC/21_ethernet_test/`, plus 4 more Ethernet-integrated examples) — **note added 2026-09-01: `KSZ9031RNX.pdf` describes the wrong PHY for this board; the correct one, `docs/refs/JL2121_datasheet.pdf`, was already present in `docs/refs/` but not checked before D1–D8 were written (see `docs/design_decisions.md` D9).** **Still missing:** Vitis HLS UG1399 (no local PDF — use AMD's docs site when the ML collaborator needs it).
 
 **MATLAB and Vitis MCP servers** (added 2026-09-01, not part of the original toolchain list): both now registered globally in `~/.claude.json` alongside `vivado` and `hound`. `vitis_mcp` required a fix — see `CLAUDE.md` / `AGENTS.md` "MCP servers" section for the full story (its dependency on the `mcp` SDK collided with `vivado-mcp`'s newer `mcp==2.0.0`; it now runs from its own pinned venv at `E:\Projects\vitis_mcp\.venv`, `mcp==1.29.1`). Both passed a full `initialize` → `tools/list` handshake test. **A Claude Code restart is required for either to appear as callable tools in a running session** — MCP config is read at startup only.
 
 ---
 
-## 7. Out of scope for this machine / role
+## 8. Out of scope for this machine / role
 
 - **ML training & quantization** (`train.py`, hls4ml export, golden vectors) —
   owned by the ML collaborator (§5/§6.5). FPGA side stays behind `ml_classifier_wrap.v`;
   the spec §15 `linear_classifier.v` fallback unblocks the FPGA schedule if the IP is late.
 - **hls4ml IP build** runs on the ML collaborator's Vitis HLS install; here we verify
   the wrapper against the hand-written `linear_classifier.v` in simulation.
+
+---
+
+## 9. S0 environment gap-closure — 2026-09-01
+
+- **GNU Make:** installed (`winget install GnuWin32.Make`, v3.81, `C:\Program Files (x86)\GnuWin32\bin`), added to User PATH. **Open a new terminal** for the PATH change to take effect (this session's shell won't pick it up).
+- **Icarus/GTKWave PATH:** added to User PATH (`C:\iverilog\bin`, `C:\iverilog\gtkwave\bin`) per §2.2. Same new-terminal caveat.
+- **`NoDefaultCurrentDirectoryInExePath` registry fix (§7):** still **not applied** — this is a registry/system-settings change and stays yours to run (`reg add "HKCU\Environment" /v NoDefaultCurrentDirectoryInExePath /d 0 /f`, then re-login), not something automated on your behalf. Icarus-only simulation is unaffected either way.
+- **S0 gate verified end-to-end:** `vivado -mode batch -source scripts/build.tcl` runs synth → impl → bitstream on the `tob_top` skeleton (sys_clk/rst_n/key/LED only) and **passes** — 0 latches, WNS = +17.97 ns, `results/build/tob_top.bit` written, 0 warnings/errors. `iverilog -g2001 -Wall rtl/tob_top.v` also compiles clean. The S0 milestone gate ("`make all` builds an empty bitstream") is met locally; `make all` itself needs the new-terminal PATH refresh above before it'll find `make`.
+- **CI scope decision:** GitHub-hosted runners can't run Vivado (proprietary, multi-GB, licensed install) — `.github/workflows/ci.yml` runs Icarus lint/compile only (and will run the Python golden-model regression once `sim/`/`tb/` exist at S1). The real synth/impl/bit build stays local, per `build.tcl`'s own doctrine.
