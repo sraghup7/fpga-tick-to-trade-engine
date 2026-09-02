@@ -10,3 +10,34 @@ hls4ml/.Xil/
 *.jou
 *.log
 .Xil/
+*.dcp
+*.bit
+*.bin
+*.rpt
+*.rpx
+*.wdb
+*.vcd
+*.xsa
+*.ltx
+*.pb
+*.str
+results/build/
+.cache/
+.hw/
+.ip_user_files/
+.runs/
+.sim/
+webtalk*.log
+usage_statistics_webtalk.html
+usage_statistics_webtalk.xml
+clockInfo.txt
+
+# Icarus / simulation
+*.vvp
+sim/*.out
+
+# Vendor reference PDFs -- large, third-party, not versioned (PREREQUISITES.md §5)
+docs/refs/*.pdf
+
+# Nested vendor demo repo -- a real git repo, not a submodule (CLAUDE.md "Repo quirk")
+docs/refs/AX7035/

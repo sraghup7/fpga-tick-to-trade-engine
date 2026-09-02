@@ -1,0 +1,41 @@
+name: ci
+
+# Scope decision (recorded in docs/design_decisions.md): Vivado has no
+# feasible hosted-runner story (proprietary, multi-GB, licensed install) so
+# "CI green" here means Icarus lint/compile of rtl/ and, once sim/ exists at
+# S1, the Python golden-model + Icarus regression. The real synth/impl/bit
+# build (scripts/build.tcl) is run locally / self-hosted, never here.
+
+on:
+  push:
+    branches: [sai/develop, develop, master]
+  pull_request:
+
+jobs:
+  rtl-lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Icarus Verilog
+        run: sudo apt-get update && sudo apt-get install -y iverilog
+      - name: Lint + compile all RTL (Verilog-2001 only)
+        run: |
+          shopt -s nullglob
+          files=(rtl/*.v rtl/common/*.v)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "No RTL yet — nothing to lint."
+            exit 0
+          fi
+          iverilog -g2001 -Wall -o /tmp/lint.vvp "${files[@]}"
+
+  golden-model-sim:
+    runs-on: ubuntu-latest
+    if: false # flip on at S1 once sim/golden_model.py and tb/ exist
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Icarus Verilog + Python deps
+        run: |
+          sudo apt-get update && sudo apt-get install -y iverilog
+          python -m pip install numpy pytest
+      - name: Run regression
+        run: bash scripts/run_sim.sh
