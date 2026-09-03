@@ -36,6 +36,10 @@ clockInfo.txt
 *.vvp
 sim/*.out
 
+# Python
+__pycache__/
+*.pyc
+
 # Vendor reference PDFs -- large, third-party, not versioned (PREREQUISITES.md §5)
 docs/refs/*.pdf
 
