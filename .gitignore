@@ -1,0 +1,47 @@
+# Office lock/temp files
+~$*
+
+# hls4ml/Vitis HLS generated project (rebuilt by scripts/build_hls4ml.py per the master spec)
+hls4ml/*_prj/
+hls4ml/vitis_hls.log
+hls4ml/.Xil/
+
+# Vivado build artifacts
+*.jou
+*.log
+.Xil/
+*.dcp
+*.bit
+*.bin
+*.rpt
+*.rpx
+*.wdb
+*.vcd
+*.xsa
+*.ltx
+*.pb
+*.str
+results/build/
+.cache/
+.hw/
+.ip_user_files/
+.runs/
+.sim/
+webtalk*.log
+usage_statistics_webtalk.html
+usage_statistics_webtalk.xml
+clockInfo.txt
+
+# Icarus / simulation
+*.vvp
+sim/*.out
+
+# Python
+__pycache__/
+*.pyc
+
+# Vendor reference PDFs -- large, third-party, not versioned (PREREQUISITES.md §5)
+docs/refs/*.pdf
+
+# Nested vendor demo repo -- a real git repo, not a submodule (CLAUDE.md "Repo quirk")
+docs/refs/AX7035/
