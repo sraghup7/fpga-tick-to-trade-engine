@@ -34,6 +34,8 @@ needed that and not the RX side. `tb/sim_models/xilinx_ip_sim_models.v` provides
 stand-ins for three Xilinx IP cores the vendor MAC depends on that have no real sim model
 available locally — simulation-only, never referenced by `scripts/build.tcl` (see D8: the
 real IP cores need regenerating in Vivado before any synthesis that touches `vendor/alinx_mac/`).
+`eth_mac_if.v` also exposes `frame_start`/`rx_len` (D11) so `frame_classifier.v` can gate a
+frame's byte stream before any of its bytes arrive.
 
 Not yet written: `frame_classifier.v` through `csr_block.v`. Before adding the next one:
 define its interface (signals, widths, handshake, latency) per `fpga_project_flow.md` Stage 4,

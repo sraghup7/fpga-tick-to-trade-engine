@@ -33,6 +33,8 @@ module tb_eth_mac_if_rx;
     wire [7:0]  rx_data;
     wire        rx_valid;
     wire        rx_last;
+    wire        frame_start;
+    wire [15:0] rx_len;
 
     eth_mac_if #(.PAYLOAD_BYTES(16)) dut (
         .clk                   (clk),
@@ -40,6 +42,8 @@ module tb_eth_mac_if_rx;
         .rx_data               (rx_data),
         .rx_valid              (rx_valid),
         .rx_last               (rx_last),
+        .frame_start        (frame_start),
+        .rx_len          (rx_len),
         .tx_payload            (128'd0),
         .tx_start              (1'b0),
         .tx_busy               (tx_busy),
@@ -106,6 +110,17 @@ module tb_eth_mac_if_rx;
 
     integer i;
 
+    // Latches the most recent frame_start pulse's rx_len, plus a
+    // count of how many times it's pulsed, for the checks below.
+    reg [15:0] last_frame_len = 16'hFFFF;
+    integer    frame_start_cnt = 0;
+    always @(posedge clk) begin
+        if (frame_start) begin
+            last_frame_len  <= rx_len;
+            frame_start_cnt <= frame_start_cnt + 1;
+        end
+    end
+
     initial begin
         rst_n = 1'b0;
         #20;
@@ -120,6 +135,11 @@ module tb_eth_mac_if_rx;
 
         collect_frame(16);
         check_payload(16, 0);
+        if (frame_start_cnt !== 1 || last_frame_len !== 16'd16) begin
+            $display("FAIL: frame 1 frame_start/rx_len: cnt=%0d len=%0d (expected 1/16)",
+                     frame_start_cnt, last_frame_len);
+            fail = 1'b1;
+        end
 
         // udp_rec_data_valid stays high across the "inter-frame gap" here,
         // exactly like the real udp_rx.v -- must not re-trigger a second
@@ -141,6 +161,35 @@ module tb_eth_mac_if_rx;
 
         collect_frame(32);
         check_payload(32, 8'hA0);
+        if (frame_start_cnt !== 2 || last_frame_len !== 16'd32) begin
+            $display("FAIL: frame 2 frame_start/rx_len: cnt=%0d len=%0d (expected 2/32)",
+                     frame_start_cnt, last_frame_len);
+            fail = 1'b1;
+        end
+
+        // --- Frame 3: a genuinely empty (0-byte) UDP payload (T05, FR-5).
+        //     No byte stream at all is expected -- rx_valid/rx_last must
+        //     never fire -- but frame_start must still pulse with
+        //     rx_len=0, since that's the only way md_parser can ever
+        //     learn this degenerate frame happened at all. ---
+        udp_rec_data_valid = 1'b0;
+        @(posedge clk); #1;
+        udp_rec_data_length = 16'd0;
+        @(posedge clk); #1;
+        udp_rec_data_valid = 1'b1;
+
+        for (i = 0; i < 10; i = i + 1) begin
+            @(posedge clk); #1;
+            if (rx_valid || rx_last) begin
+                $display("FAIL: rx_valid/rx_last fired for a 0-byte frame at t=%0t", $time);
+                fail = 1'b1;
+            end
+        end
+        if (frame_start_cnt !== 3 || last_frame_len !== 16'd0) begin
+            $display("FAIL: frame 3 (empty) frame_start/rx_len: cnt=%0d len=%0d (expected 3/0)",
+                     frame_start_cnt, last_frame_len);
+            fail = 1'b1;
+        end
 
         udp_rec_data_valid = 1'b0;
         @(posedge clk);

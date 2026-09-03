@@ -163,15 +163,34 @@ class OrderRecord:
         )
 
 
-def parse_frame_payload(payload: bytes) -> list[bytes]:
-    """Split a frame's payload into 16-byte messages (S4.4, FR-4/FR-5).
+def parse_frame_payload(payload: bytes) -> tuple[list[bytes], bool]:
+    """Split a frame's payload into complete 16-byte messages (S4.4,
+    FR-4/FR-5). Returns (complete_messages, bad_length); on a bad length,
+    complete_messages is always [] -- discard the frame whole, per FR-5's
+    literal wording.
 
-    Returns the list of message slices, or [] if the payload length is not
-    a multiple of 16 (caller must count err_frame_len and discard whole).
+    A version of this briefly discarded only an incomplete *trailing*
+    remainder, on the reasoning that a streaming parser can't know a
+    frame's total length until it ends, so messages already forwarded
+    can't be retroactively un-forwarded. That reasoning is correct in
+    general but doesn't apply to this project's actual architecture: D1's
+    decision to reuse the vendor MAC means the whole frame is already
+    buffered, with its length known and exposed (eth_mac_if.v's
+    frame_start/rx_len) *before* a single payload byte streams
+    out. frame_classifier.v can and does check the length first and
+    decide whether to forward anything at all -- so "discard whole" is
+    both what FR-5 says and what the real RTL actually does here. Reverted
+    once this was noticed, before md_parser.v was designed against the
+    wrong assumption.
+
+    A 0-byte payload (below FR-4's 1-message minimum) counts as bad_length
+    too. A payload over the 88-message maximum is treated the same way
+    (nothing forwarded) rather than truncated at 88 -- that boundary isn't
+    covered by T05 and is a simplification, not a resolved decision.
     """
     if len(payload) == 0 or len(payload) % 16 != 0 or len(payload) > 88 * 16:
-        return []
-    return [payload[i : i + 16] for i in range(0, len(payload), 16)]
+        return [], True
+    return [payload[i : i + 16] for i in range(0, len(payload), 16)], False
 
 
 # ---------------------------------------------------------------------
@@ -611,9 +630,10 @@ class GoldenModel:
             self.counters.inc("err_fcs")
             return []
 
-        messages = parse_frame_payload(payload)
-        if not messages:
+        messages, bad_length = parse_frame_payload(payload)
+        if bad_length:
             self.counters.inc("err_frame_len")
+        if not messages:
             return []
 
         results = []

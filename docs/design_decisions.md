@@ -365,6 +365,53 @@ cycle-locked checksum engine).
 
 ---
 
+## D11 — Bad-length frames: discard whole, not just the trailing remainder
+
+**Decision:** `eth_mac_if.v` gained two new outputs, `frame_start` (pulses
+once per frame, including a genuinely empty one) and `rx_len` (the
+authoritative length, valid the same cycle) — both available *before* any
+payload byte streams out on `rx_data`. `frame_classifier.v` uses them to
+check `rx_len` up front and decide whether to forward anything for
+that frame at all. `golden_model.py`'s `parse_frame_payload` discards the
+whole frame on a bad length (`[], True`), matching FR-5's literal wording.
+
+**Why this needed two passes to get right.** The first version of
+`parse_frame_payload` also discarded the whole frame, but while designing
+`md_parser.v`'s interface a real objection came up: a genuinely streaming
+parser can't know a frame's *total* length until it ends, and FR-53 times
+each message at "the last byte of a message entering the parser" — implying
+complete 16-byte groups are forwarded as they complete, not held back
+pending the frame's fate. Under that reasoning, "discard whole" isn't
+physically realizable — messages already forwarded three groups ago can't be
+un-forwarded — so `parse_frame_payload` was changed to discard only a
+trailing incomplete remainder, keeping whatever complete messages came
+before it.
+
+That reasoning is correct in general and wrong for this project specifically,
+which is what makes it worth recording rather than just quietly fixing:
+D1 already committed this project to reusing a vendor MAC that buffers the
+*entire* frame and computes its length before `udp_rec_data_valid` ever
+asserts. `eth_mac_if.v` was already sitting on that length — it just wasn't
+exposed yet. Once `frame_start`/`rx_len` were added to surface it,
+`frame_classifier.v` genuinely can decide before forwarding a single byte,
+so the "can't know the length in time" premise doesn't hold here. Reverted
+back to whole-frame discard before `md_parser.v` got designed against the
+wrong assumption, which would have made the two disagree with each other.
+
+**Consequence for `md_parser.v`'s design:** it doesn't need to infer a bad
+length by counting bytes and reasoning about where `rx_last` fell — it can
+just read `rx_len` directly at `frame_start` and know immediately
+whether to expect a byte stream at all.
+
+Also fixes a real gap `frame_start`/`rx_len` incidentally closes: a
+0-byte UDP payload (T05's third case) previously produced *no signal
+whatsoever* from `eth_mac_if.v` — not even `rx_last` — since there was no
+byte to walk the RAM for. Without a length-independent "a frame happened"
+pulse, that case would have been invisible downstream. `tb_eth_mac_if_rx.v`
+now covers it directly.
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |
