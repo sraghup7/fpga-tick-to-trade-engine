@@ -423,19 +423,39 @@ class GoldenModel:
         if msg.flags & FLAG_SNAPSHOT:
             self.seq_gap = False  # FR-12
 
-        # FR-7: symbol filter.
-        if msg.symbol_id not in self.cfg.watched_symbols():
-            self.counters.inc("cnt_msgs_filtered")
-            return ProcessResult()
-
-        # FR-8: undefined msg_type.
+        # FR-8/FR-9: msg_type/flags validation, run BEFORE the symbol
+        # filter -- the mirror image of the seq/dup reordering just above,
+        # and for an architectural reason rather than a spec-priority one:
+        # md_parser.v (S2, already committed) is the module that checks
+        # msg_type/flags, and it sits upstream of symbol_filter.v in the
+        # pipeline (master spec S3.1's block diagram: md_parser ->
+        # symbol_filter -> seq_monitor -> tob_engine). By the time a
+        # message would reach a symbol filter in the real datapath, an
+        # undefined msg_type or a reserved flags bit has already dropped
+        # it -- md_parser never forwards msg_valid for it, and there is no
+        # symbol-filter-shaped module upstream of md_parser to have
+        # filtered it first. A message that is simultaneously on an
+        # unwatched symbol_id and has a bad msg_type therefore reports
+        # err_msg_type in the real RTL, never cnt_msgs_filtered, regardless
+        # of what its symbol_id is. This was a real ordering bug in this
+        # model (filter was checked first) caught by design-decision
+        # review while writing the S3 (symbol_filter/seq_monitor/tob_engine)
+        # contracts, before any S3 test exercised the combination --
+        # docs/design_decisions.md D12. See
+        # sim/test_golden_model_handcase.py messages 21-22 for the
+        # corner case this fixes.
         if msg.msg_type not in VALID_MSG_TYPES:
             self.counters.inc("err_msg_type")
             return ProcessResult()
 
-        # FR-9: reserved flag bits must be 0.
         if msg.flags & FLAG_RESERVED_MASK:
             self.counters.inc("err_flags")
+            return ProcessResult()
+
+        # FR-7: symbol filter. Only ever sees messages md_parser.v already
+        # validated (msg_type/flags both OK) -- see the comment above.
+        if msg.symbol_id not in self.cfg.watched_symbols():
+            self.counters.inc("cnt_msgs_filtered")
             return ProcessResult()
 
         # Counted as accepted here regardless of is_dup: a duplicate is
@@ -453,13 +473,22 @@ class GoldenModel:
         book_modifying = msg.msg_type in (MSG_QUOTE, MSG_CLEAR)
 
         if msg.msg_type == MSG_QUOTE:
-            # FR-14/15: replace price+qty for the addressed side; qty=0 invalidates.
+            # FR-14: replace price+qty for the addressed side.
+            # FR-15 (D14): qty=0 invalidates that side WITHOUT altering the
+            # stored price -- the price write is conditional on quantity !=
+            # 0, not unconditional like FR-14's general case. Any side
+            # value other than SIDE_BID selects ask (golden_model.py's own
+            # convention throughout, not just 0/1 -- matches
+            # docs/contracts/md_parser.md's "msg_side: any value 0-255, no
+            # validation needed here").
             if msg.side == SIDE_BID:
-                book.bid_price = msg.price
+                if msg.quantity != 0:
+                    book.bid_price = msg.price
                 book.bid_qty = msg.quantity
                 book.bid_valid = msg.quantity != 0
             else:
-                book.ask_price = msg.price
+                if msg.quantity != 0:
+                    book.ask_price = msg.price
                 book.ask_qty = msg.quantity
                 book.ask_valid = msg.quantity != 0
             book.last_update_cycle = self.current_cycle

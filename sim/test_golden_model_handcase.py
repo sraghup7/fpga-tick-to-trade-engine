@@ -1,11 +1,13 @@
 """sim/test_golden_model_handcase.py
 
 The S1 milestone gate (master spec S15): "golden models produce expected
-output for a hand-computed 20-message case." 20 messages plus 2 control-
-plane actions (kill switch assert/clear, not messages). Every expected
-value below is computed by hand in the comment above the assertion, not
-derived by running the model and copying its output -- that would just
-confirm the model agrees with itself.
+output for a hand-computed 20-message case." Now 25 messages (the original
+20, plus 3 for D12's filter-vs-type/flags ordering fix and 2 for D14's
+FR-15 price-preservation fix -- see docs/design_decisions.md) plus 2
+control-plane actions (kill switch assert/clear, not messages). Every
+expected value below is computed by hand in the comment above the
+assertion, not derived by running the model and copying its output --
+that would just confirm the model agrees with itself.
 
 This case did its job once already: the first version of golden_model.py
 ran the symbol filter before sequence-gap tracking, so message 3 (an
@@ -243,13 +245,71 @@ r = m.process_message(msg(119, 1, MSG_QUOTE, SIDE_BID, flags=0x80, price=1, qty=
 check("m20b err_flags", m.counters["err_flags"], 1)
 check("m20b order", r.order, None)
 
+# 21. seq=120 sym=99 (unwatched) AND msg_type=0x05 (undefined), both at once.
+#     D12: msg_type/flags is checked before the symbol filter (md_parser.v
+#     already drops this upstream of symbol_filter.v in the real pipeline)
+#     -> err_msg_type+=1, NOT cnt_msgs_filtered. Before D12's reorder this
+#     assertion would have failed (old code checked filter first and would
+#     have reported cnt_msgs_filtered instead).
+r = m.process_message(msg(120, 99, 0x05))
+check("m21 err_msg_type (not filtered)", m.counters["err_msg_type"], 2)
+check("m21 cnt_msgs_filtered unchanged", m.counters["cnt_msgs_filtered"], 1)
+check("m21 order", r.order, None)
+
+# 22. seq=121 sym=99 (unwatched) AND reserved flag bit7 set, both at once.
+#     Same reasoning as m21: err_flags+=1, NOT cnt_msgs_filtered.
+r = m.process_message(msg(121, 99, MSG_QUOTE, SIDE_BID, flags=0x80, price=1, qty=1))
+check("m22 err_flags (not filtered)", m.counters["err_flags"], 2)
+check("m22 cnt_msgs_filtered unchanged", m.counters["cnt_msgs_filtered"], 1)
+check("m22 order", r.order, None)
+
+# 23. seq=122 sym=99 (unwatched), well-formed type/flags -> filtered, as
+#     before -- confirms D12 only reorders the *simultaneous* bad case,
+#     not plain filtering.
+r = m.process_message(msg(122, 99, MSG_QUOTE, SIDE_BID, price=1, qty=1))
+check("m23 cnt_msgs_filtered", m.counters["cnt_msgs_filtered"], 2)
+check("m23 order", r.order, None)
+
+# 24. seq=123 sym2, QUOTE bid qty=0 with a garbage price (9999) -- D14:
+#     FR-15's "clears validity without altering stored price" means the
+#     price write itself is skipped when qty=0, not just that valid is
+#     cleared. book2.bid_price was set to 500 by message 19 and must still
+#     read 500 afterward, not 9999. bid_qty must read 0, bid_valid False.
+r = m.process_message(msg(123, 2, MSG_QUOTE, SIDE_BID, price=9999, qty=0))
+check("m24 bid_price unchanged (D14)", m.books[2].bid_price, 500)
+check("m24 bid_qty cleared", m.books[2].bid_qty, 0)
+check("m24 bid_valid cleared", m.books[2].bid_valid, False)
+check("m24 signal (bid invalid)", r.signal_fired, None)
+
+# 25. seq=124 sym2, QUOTE bid price=505/qty=7 (side revalidated normally --
+#     confirms D14's conditional-price-write didn't break the ordinary
+#     FR-14 path, only the qty=0 case).
+#     book2 now: bid=505/7, ask=520/3 (unchanged since m20). spread=15>=2.
+#     bid_qty(7)>ask_qty(3)<<1=6 -> BUY. price=ask=520, qty=100.
+#     gates: kill=F (cleared since m17). size 100<=500 ok.
+#       position2: 100(from m20)+100=200<=1000 ok.
+#       band: mid=(505+520)>>1=512, |520-512|=8<=50 ok.
+#       stale ok (fresh). seqgap F (cleared since m8, no gap since). crossed F.
+#       throttle: token=3 (after m2,m9,m12,m18,m20 each -1 from 8) >0 ok. ML F.
+#     -> ACCEPTED. position2=200, token=2, cnt_orders_tx=6.
+r = m.process_message(msg(124, 2, MSG_QUOTE, SIDE_BID, price=505, qty=7))
+check("m25 bid_price updated", m.books[2].bid_price, 505)
+check("m25 bid_qty updated", m.books[2].bid_qty, 7)
+check("m25 bid_valid set", m.books[2].bid_valid, True)
+check("m25 signal", r.signal_fired, "buy")
+check("m25 order.msg_type", r.order.msg_type, ORDER_MSG_NEW)
+check("m25 position2", m.position[2], 200)
+check("m25 token", m.token_bucket, 2)
+check("m25 cnt_orders_tx", m.counters["cnt_orders_tx"], 6)
+
 # -- final invariant check (master spec S10): --
 # cnt_signal_buy + cnt_signal_sell = cnt_orders_tx + sum(cnt_rej_*) + cnt_order_overflow
-# Signals fired: m2(buy) m6(sell) m9(buy) m12(buy) m13(buy) m16(buy) m18(sell) m20(buy) = 8
-# Orders_tx (accepted): m2,m9,m12,m18,m20 = 5
+# Signals fired: m2(buy) m6(sell) m9(buy) m12(buy) m13(buy) m16(buy) m18(sell)
+#                m20(buy) m25(buy) = 9
+# Orders_tx (accepted): m2,m9,m12,m18,m20,m25 = 6
 # Rejects: m6(seqgap) m13(band) m16(kill) = 3
 # Overflow: 0
-check("cnt_signal_buy", m.counters["cnt_signal_buy"], 6)
+check("cnt_signal_buy", m.counters["cnt_signal_buy"], 7)
 check("cnt_signal_sell", m.counters["cnt_signal_sell"], 2)
 check(
     "invariant: signals == orders + rejects + overflow",
@@ -260,7 +320,7 @@ check(
     + m.counters["cnt_rej_kill"]
     + m.counters["cnt_order_overflow"],
 )
-check("cnt_msgs_rx", m.counters["cnt_msgs_rx"], 20)
+check("cnt_msgs_rx", m.counters["cnt_msgs_rx"], 25)
 check(
     "invariant: msgs_rx == filtered + accepted + err_msg_type + err_flags",
     m.counters["cnt_msgs_rx"],

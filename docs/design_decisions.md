@@ -412,6 +412,180 @@ now covers it directly.
 
 ---
 
+## D12 — Golden model: check `msg_type`/`flags` before the symbol filter, not after
+
+**Status: applied**, `sim/golden_model.py`. **Decision:** `GoldenModel.process_message`
+now validates `msg_type`/`flags` (FR-8/FR-9) *before* the symbol filter
+(FR-7), reversing their previous order. Sequence gap/dup tracking (FR-10/11/12)
+is unaffected — it still runs first, before either check (that part of the
+ordering was already correct and already tested; see the comment above it in
+`golden_model.py`).
+
+**Why.** Found while defining the exact interfaces for the S3 contracts
+(`symbol_filter.v`, `seq_monitor.v`) — before any S3 test exercised the
+combination that exposes it. `md_parser.v` (S2, already committed,
+`docs/contracts/md_parser.md`) is the module that checks `msg_type`/`flags`,
+and it sits *upstream* of `symbol_filter.v` in the pipeline (master spec
+§3.1's block diagram: `md_parser → symbol_filter → seq_monitor →
+tob_engine`). By construction, a message with an undefined `msg_type` or a
+reserved `flags` bit never gets a `msg_valid` pulse out of `md_parser.v` — it
+never reaches anything downstream, including a symbol filter. There is no
+way to build a `symbol_filter.v` that sees such a message first; `md_parser.v`
+already dropped it. The old golden-model order (filter, then type/flags)
+was therefore not realizable by the actual chosen architecture — it only
+produces a different result than the RTL for one specific corner case (a
+message that is simultaneously on an unwatched `symbol_id` **and** has a bad
+`msg_type`/reserved `flags` bit), which is exactly why no S1/S2 test caught
+it: `sim/test_golden_model_handcase.py`'s original 20 messages never combined
+those two conditions on one message.
+
+**Consequence:** for that corner case, `err_msg_type`/`err_flags` now
+increments and `cnt_msgs_filtered` does not — matching what `md_parser.v`
+actually does. §10's invariant (`cnt_msgs_rx = filtered + accepted +
+Σerr_*`) still holds; only which bucket a doubly-bad message lands in
+changed. `sim/test_golden_model_handcase.py` messages 21–23 cover the
+corner case directly (both combinations, plus a control case confirming
+plain filtering is unaffected) — 23 messages total now, was 20.
+
+**Consequence for S3 contracts:** `symbol_filter.v` only ever needs to
+handle `md_parser.v`'s `msg_valid`-gated output (type/flags already clean by
+construction) — it does not need any special-case interaction with
+`err_msg_type`/`err_flags`. `seq_monitor.v` is the one exception: FR-10's
+"per feed" sequence tracking must still run on every completed message
+regardless of `msg_valid`, so it consumes `msg_valid | err_msg_type |
+err_flags` from `md_parser.v` as its "a message completed, `msg_seq_num` is
+valid" trigger (all three are registered fields in `md_parser.v`,
+unconditionally latched every message regardless of type/flags validity —
+confirmed by reading `rtl/md_parser.v` directly, not assumed). See
+`docs/contracts/seq_monitor.md` §1 for the exact reasoning as handed to the
+implementer.
+
+Not a resolution of a numbered §17 open question — new information the S3
+contract-writing process surfaced, the same way D11 was surfaced by
+designing `md_parser.v`'s interface.
+
+---
+
+## D13 — F5/F7 window semantics, pinned for the FPGA side
+
+**Status: applied**, `sim/feature_golden.py` (new file) +
+`sim/test_feature_golden_handcase.py` (new file). **Decision:** F5 (update
+rate) and F7 (short-term volatility) share **one** W-deep sliding window per
+symbol, which advances on **every accepted event of any `msg_type`**
+(QUOTE/CLEAR/TRADE/HEARTBEAT), not only book-modifying ones. Each slot
+records `(is_update, abs_mid_delta)` for the event that produced it —
+`is_update` true only for QUOTE/CLEAR (FR-19); `abs_mid_delta` is that
+event's `|F1|`, which is 0 for TRADE/HEARTBEAT (mid does not change then)
+and 0 for the first event after a reset/clear. F5 = count of `is_update`
+slots in the window; F7 = sum of `abs_mid_delta` over the window. The
+*current* event's own contribution is included in that same event's output
+(window read as "as of and including now").
+
+**Why this needed a decision at all:** `ml_engineer_brief.md` §4 states
+outright that window inclusion is unresolved and must be pinned by whoever
+builds against it ("Decide whether the current event is included in the
+window or not, and write it down") — the master spec's own feature table
+(§5.3) doesn't fix it either. This blocks writing a correct
+`feature_extractor.v` contract (T27 needs a bit-exact reference to check
+against), so it had to be resolved before, not during, S3 contract writing.
+
+**Why "every event", not "only book-modifying events":** F5 is described as
+"update rate... in the last W events." If the window only ever held
+book-modifying events, F5 would trivially equal `min(events-seen, W)` —
+saturated almost immediately and constant thereafter, which makes "clipped"
+a pointless thing for the spec to call out. Reading "events" as *all*
+accepted traffic (with F5 counting the book-modifying fraction of it) is the
+only reading that makes F5 a real, varying signal — heavier trade/heartbeat
+traffic relative to quotes correctly lowers it.
+
+**A book-clear (FR-16) resets `prev_bid`/`prev_ask`/the window to the same
+all-zero state as power-on, then is itself treated as exactly "the first
+event after reset"** (same F1=F3=F4=0 rule `ml_engineer_brief.md` §4 already
+states for post-reset). This was the simplest self-consistent reading of
+"clear resets the feature history to the initial state" and needed no
+separate special case.
+
+**FR-26 (forcing the classifier input to a safe state on an invalid/crossed
+book) is explicitly not this module's job** — `feature_extractor.v` computes
+raw features mechanically from whatever `tob_engine` state it's given, no
+masking. This keeps the S3 contract's scope exactly matching T27's covered
+FRs (FR-20/21); FR-26's forcing belongs to a later ML-path stage
+(`ml_policy.v` or similar, not built yet).
+
+**Raw feature width: 32-bit** (unsigned for F0/F5/F7, signed two's-complement
+for F1/F2/F3/F4/F6) for every feature, uniformly. Not an arbitrary choice —
+it's the one piece of concrete width evidence already in the spec: §9's
+`ML_OFFSET_0..7`/`ML_SHIFT_0..7` registers, which subtract from and shift a
+raw feature before normalization, are already declared 32-bit.
+
+**Window depth `W` is an elaboration-time parameter for this contract, not
+the runtime `ML_WINDOW` CSR register (§9) yet.** FR-32 does list window `W`
+among the parameters required to eventually be runtime-configurable, but
+that requirement sits in §6.5 (ML classifier), not §6.4/T27's scope, and no
+S3 test exercises changing `W` mid-stream. Building true runtime
+reconfigurability now — a window whose *size*, not just contents, changes
+live — would mean either re-deriving F5/F7 from scratch on every possible
+configured depth simultaneously or an incremental running sum that goes
+stale the instant `W` changes; real complexity with no test yet demanding
+it. Deferred to whichever milestone first wires `csr_block.v`'s `ML_WINDOW`
+register into this module (S6), matching this project's own "don't build
+ahead of a gating test" convention. `sim/feature_golden.py`'s
+`FeatureTracker` already takes `window` as a fixed constructor argument, not
+a runtime-mutable field, so no rework was needed there.
+
+**A real RTL pitfall this decision sidesteps, worth recording anyway since
+it's the reason recompute-from-scratch was chosen over the more "obvious"
+efficient design:** a sliding-window sum's natural efficient implementation
+is *incremental* — add the newest value, subtract the value falling out of
+the window — which breaks under per-cycle saturation: once a contribution
+has been clamped on the way in, its original value is gone and can't be
+correctly subtracted back out later. With `W` fixed at elaboration time,
+`docs/contracts/feature_extractor.md` sidesteps this class of bug entirely
+rather than working around it: F5 (popcount) and F7 (sum, saturated only at
+its own 32-bit output, nowhere internally) are both **recomputed from
+scratch** over the full `W`-deep window on every accepted event, via a plain
+adder/popcount tree (`W` ≤ 32, so ≤5 tree levels — cheap, and FR-23-legal
+since a tree is still only adds). No subtraction, so no stale-saturation
+bug to avoid. See `docs/contracts/feature_extractor.md` §2.6 for the full
+reasoning as handed to the implementer.
+
+Not a resolution of a numbered §17 open question — new information the S3
+contract-writing process surfaced, same as D11/D12.
+
+---
+
+## D14 — Golden model: FR-15's price-preservation was not actually implemented
+
+**Status: applied**, `sim/golden_model.py`. **Decision:** `GoldenModel.process_message`'s
+`MSG_QUOTE` handling now writes `bid_price`/`ask_price` only when the
+message's `quantity != 0`; the `quantity`/`valid` writes stay unconditional.
+
+**Why.** Found the same way as D12/D13 — while pinning down the exact
+per-field behavior `tob_engine.v` needs for T10 (`FR-15`'s explicit S3 gate).
+FR-15's text is explicit: quantity=0 "clears that side's `valid` **without
+altering stored price**." The golden model's code, before this fix,
+unconditionally overwrote `bid_price`/`ask_price` with `msg.price` on every
+`QUOTE`, regardless of quantity — i.e. it did not actually implement the
+"without altering stored price" half of FR-15 at all. No existing test
+caught it because no S1/S2 hand-case ever sent a `quantity=0` `QUOTE`.
+`sim/test_golden_model_handcase.py` messages 24–25 now cover it directly: a
+`qty=0` quote carrying a deliberately wrong price (`9999`) must leave the
+side's stored price unchanged, and a subsequent normal (non-zero-quantity)
+quote on the same side must still update price normally (confirming the fix
+didn't break FR-14's ordinary case).
+
+**Consequence for `tob_engine.v`:** the price register write for a side must
+be gated on `msg_quantity != 0`, not written every `QUOTE` cycle — an easy
+detail to drop since "replace price+qty for the addressed side" (FR-14) reads
+like an unconditional pair-write until FR-15's exception is read carefully.
+See `docs/contracts/tob_engine.md` §2.2 for the exact wording handed to the
+implementer.
+
+Not a resolution of a numbered §17 open question — new information the S3
+contract-writing process surfaced, same as D11/D12/D13.
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |
