@@ -25,9 +25,18 @@ vendor/alinx_mac/      ALINX reference MAC, vendored per docs/design_decisions.m
 common/                shared modules (sync_2ff.v, counter_sat.v, mdio_ctrl.v, ...)
 ```
 
-Only `tob_top.v` exists so far (the S0 Tier-A skeleton — clock/reset/key/LED only, no
-datapath yet). Before adding the next module: define its interface (signals, widths,
-handshake, latency) per `fpga_project_flow.md` Stage 4, lint it, and write its testbench in
-`tb/` against the golden model in `sim/` before wiring it into `tob_top.v`. See
-`docs/design_decisions.md` for the MAC-integration decisions (D1–D5) that shape
-`eth_mac_if.v` and `common/mdio_ctrl.v` before you write them.
+`tob_top.v` (S0 Tier-A skeleton), `eth_mac_if.v`, `vendor/alinx_mac/` (D1, D5), and
+`common/{sync_2ff,counter_sat,mdio_ctrl}.v` exist. `eth_mac_if.v` is tested two ways —
+`tb/tb_eth_mac_if_rx.v` against a mocked RAM boundary, `tb/tb_eth_mac_if_tx.v` against the
+*real* vendored `mac_top.v` (checking the actual transmitted UDP checksum against an
+independent RFC 768 computation) — see `docs/design_decisions.md` D10 for why the TX side
+needed that and not the RX side. `tb/sim_models/xilinx_ip_sim_models.v` provides simulation
+stand-ins for three Xilinx IP cores the vendor MAC depends on that have no real sim model
+available locally — simulation-only, never referenced by `scripts/build.tcl` (see D8: the
+real IP cores need regenerating in Vivado before any synthesis that touches `vendor/alinx_mac/`).
+
+Not yet written: `frame_classifier.v` through `csr_block.v`. Before adding the next one:
+define its interface (signals, widths, handshake, latency) per `fpga_project_flow.md` Stage 4,
+lint it, and write its testbench in `tb/` against the golden model in `sim/` before wiring it
+into `tob_top.v`. `docs/design_decisions.md` D1–D10 record the MAC-integration decisions
+already made.

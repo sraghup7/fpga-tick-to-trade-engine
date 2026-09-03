@@ -149,8 +149,14 @@ information the MAC-reuse investigation surfaced.
 
 ## D5 — Minimal, surgical patch to expose MAC RX error status
 
+**Status: applied.** `rtl/vendor/alinx_mac/rx/udp_rx.v`, `mac_rx_top.v`, and
+`rtl/vendor/alinx_mac/mac_top.v` carry this patch now (two new output ports
+each, wiring `mac_rec_error` and a new `udp_checksum_error` port up to the
+top level; `mac_rx.v` needed no change, `mac_rec_error` was already one of
+its output ports).
+
 **Decision:** two new output ports are added to the vendored (D1)
-`mac_rx.v`/`udp_rx.v` — wiring out the `mac_rec_error` (CRC/FCS fail) and the
+`mac_rx_top.v`/`udp_rx.v` — wiring out the `mac_rec_error` (CRC/FCS fail) and the
 IP/UDP checksum-error bit that those files already compute internally but
 currently only use to gate `udp_rec_data_valid` low. No other vendor logic
 changes.
@@ -290,6 +296,72 @@ the entire time D1–D8 were written; the investigation that produced D1–D8 on
 ever looked inside `docs/refs/AX7035/` (the nested vendor demo repo). A plain
 `ls docs/refs/` before trusting a nested vendor tree as ground truth would
 have caught this before any RTL was written, not after.
+
+---
+
+## D10 — `eth_mac_if.v`: buffer-and-pace the TX side, don't stream it
+
+**Decision:** `rtl/eth_mac_if.v` is implemented. RX is a straightforward
+two-stage address-walk (present an address, capture the RAM's registered
+response one cycle later) triggered on `udp_rec_data_valid`'s rising edge.
+TX does **not** expose a byte-stream to `order_builder.v`; it exposes a
+fixed-size `tx_payload` bus (the whole 16-byte record presented at once) plus
+`tx_start`/`tx_busy`, and paces the actual `ram_wr_data`/`ram_wr_en`/
+`udp_tx_req` sequence itself.
+
+**Why not a streaming TX interface:** `rtl/vendor/alinx_mac/tx/udp_tx.v`
+computes the UDP checksum *live* off `ram_wr_data` while it's also being
+written into the TX FIFO — sampling it at a fixed cycle offset from
+`udp_tx_req`'s assertion, not from anything `order_builder` would naturally
+expose (no ready/valid, no start-of-frame marker). Get that offset wrong and
+every outgoing order carries a corrupted UDP checksum — silently dropped by
+the host's network stack, no error anywhere in this design to notice it.
+Making `order_builder.v` itself responsible for that exact cycle-lockstep
+timing would leak vendor-internal timing into a module that has no way to
+verify it independently. Buffering the payload here and pacing it out
+internally means the timing-critical part is verified once, in
+`eth_mac_if.v`, against the real vendor logic.
+
+**How the timing was derived and checked — not assumed from a spec table.**
+Traced `rtl/vendor/alinx_mac/tx/udp_tx.v`'s `ck_state` FSM by hand: `checksum_cnt`
+resets to 0 on entering `HEADER_CHECKSUM` and again on entering `GEN_CHECKSUM`
+(it does **not** carry across that transition — the first read of this file
+assumed it did, which would have been wrong), `HEADER_CHECKSUM` lasts exactly
+9 cycles, and `GEN_CHECKSUM` samples `{ram_wr_data_d1, ram_wr_data_d0}` — a
+2-cycle-delayed pair — starting from its own first cycle. Working through
+that delay chain gives: payload byte 0 must land on `ram_wr_data` exactly 9
+cycles after the cycle `udp_tx_req` is asserted, then one byte per cycle,
+back to back (`TX_HEADER_DELAY` in `eth_mac_if.v`).
+
+**That derivation was then verified, not trusted.** No real simulation model
+exists locally for the three Xilinx IP cores this vendor code depends on
+(`udp_tx_data_fifo`, `udp_checksum_fifo`, `udp_rx_ram_8_2048` — only
+synthesis-only black-box stubs are present; see
+`tb/sim_models/xilinx_ip_sim_models.v`'s header for why and what was written
+instead: plain, standard FIFO/dual-port-RAM behavioral models, clearly
+marked simulation-only, matching each core's own `.veo` port list).
+`tb/tb_eth_mac_if_tx.v` instantiates the **real, unmodified** vendored
+`mac_top.v` (D1) together with `eth_mac_if.v`, drives a known payload through
+it, captures the actual transmitted wire bytes, and compares the UDP
+checksum against an independently-computed RFC 768 checksum written from
+scratch in the testbench. It matched on the first payload tried with
+`TX_HEADER_DELAY = 9` — the derivation was right, but the point is that this
+was checked against the real control logic rather than shipped on the
+strength of the trace alone.
+
+**Incidental finding from that same testbench, not a bug:** the vendored
+`udp_tx.v` pads any UDP frame whose header+payload totals under 26 bytes up
+to 26 bytes with trailing zeros (standard Ethernet minimum-frame-size
+padding — our order records are 8-byte UDP header + 16-byte payload = 24
+bytes, so this always fires). The UDP header's own length field still
+correctly reports 24, so a real receiver's `recvfrom()` never sees the
+padding — only a raw packet capture would. Worth knowing before anyone stares
+confused at 2 extra bytes on a wire trace during S11 bring-up.
+
+`tb_eth_mac_if_rx.v` covers the RX side independently, against a mocked RAM
+boundary rather than the full vendor RX pipeline — appropriately proportionate
+to that side's much lower timing risk (a straightforward address-walk, not a
+cycle-locked checksum engine).
 
 ---
 
