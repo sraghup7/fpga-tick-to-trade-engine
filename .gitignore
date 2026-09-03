@@ -36,6 +36,9 @@ clockInfo.txt
 *.vvp
 sim/*.out
 
+# Generated test stimulus (regenerable via sim/gen_soak_vectors.py)
+tb/stimulus/*.mem
+
 # Python
 __pycache__/
 *.pyc

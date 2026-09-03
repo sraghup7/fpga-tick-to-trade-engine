@@ -21,6 +21,10 @@ synthesized, see its own header comment and docs/design_decisions.md D10.
 `tb_frame_classifier.v` covers FR-4/FR-5 (T01, T02, T05, plus the FR-4 upper-bound case)
 against `rtl/frame_classifier.v`.
 `tb_md_parser.v` covers FR-4/FR-8/FR-9 (T01, T02, T06) against `rtl/md_parser.v`.
+`tb_parser_soak.v` is the S2 milestone's "1M-message parse, zero loss" gate: chains
+frame_classifier.v -> md_parser.v over 1,000,000 generated messages
+(sim/gen_soak_vectors.py), checking exact message-count conservation and
+spot-checked field correctness.
 
 The golden model in `sim/` still comes before the datapath modules proper (master spec §11.1:
 written from the spec, not the RTL), then the stimulus generator, then those per-module

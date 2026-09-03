@@ -24,4 +24,8 @@ implements 6 of S11.2's 7 scenarios; `adverse` is intentionally not implemented 
 the label definition (S5.2) frozen jointly with the ML collaborator first, which is itself
 part of S1's own gate.
 
+`gen_soak_vectors.py` exists (S2) -- generates tb/tb_parser_soak.v's
+1,000,000-message stimulus by reusing feed_gen.py's "normal" scenario
+unmodified.
+
 `ml_golden.py`, `train.py`, `order_rx.py`, `compare.py` are not written yet.
