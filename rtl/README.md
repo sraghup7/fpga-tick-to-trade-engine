@@ -6,7 +6,7 @@ stage, per master spec §13 and §3 (block diagram):
 ```
 tob_top.v              top-level integration (S0 skeleton in place; grows incrementally)
 eth_mac_if.v           adapts vendor/alinx_mac's byte-push/RAM boundary to a byte-stream
-frame_classifier.v     EtherType / IPv4 / UDP classification
+frame_classifier.v     frame-length accept/reject gate (FR-4/FR-5; no EtherType/IPv4 parse, D1)
 md_parser.v            byte-serial market-data parser
 symbol_filter.v        4-entry symbol CAM
 seq_monitor.v          sequence-gap detection, staleness
@@ -37,8 +37,9 @@ real IP cores need regenerating in Vivado before any synthesis that touches `ven
 `eth_mac_if.v` also exposes `frame_start`/`rx_len` (D11) so `frame_classifier.v` can gate a
 frame's byte stream before any of its bytes arrive.
 
-Not yet written: `frame_classifier.v` through `csr_block.v`. Before adding the next one:
+`frame_classifier.v` exists (S2) — see `tb/tb_frame_classifier.v`. Not yet written:
+`md_parser.v` through `csr_block.v`. Before adding the next one:
 define its interface (signals, widths, handshake, latency) per `fpga_project_flow.md` Stage 4,
 lint it, and write its testbench in `tb/` against the golden model in `sim/` before wiring it
-into `tob_top.v`. `docs/design_decisions.md` D1–D10 record the MAC-integration decisions
-already made.
+into `tob_top.v`. `docs/design_decisions.md` D1–D11 record the MAC-integration and
+frame-gating decisions already made.
