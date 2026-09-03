@@ -20,6 +20,7 @@ holds simulation-only stand-ins for Xilinx IP cores the vendored MAC depends on 
 synthesized, see its own header comment and docs/design_decisions.md D10.
 `tb_frame_classifier.v` covers FR-4/FR-5 (T01, T02, T05, plus the FR-4 upper-bound case)
 against `rtl/frame_classifier.v`.
+`tb_md_parser.v` covers FR-4/FR-8/FR-9 (T01, T02, T06) against `rtl/md_parser.v`.
 
 The golden model in `sim/` still comes before the datapath modules proper (master spec §11.1:
 written from the spec, not the RTL), then the stimulus generator, then those per-module

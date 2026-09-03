@@ -37,8 +37,8 @@ real IP cores need regenerating in Vivado before any synthesis that touches `ven
 `eth_mac_if.v` also exposes `frame_start`/`rx_len` (D11) so `frame_classifier.v` can gate a
 frame's byte stream before any of its bytes arrive.
 
-`frame_classifier.v` exists (S2) — see `tb/tb_frame_classifier.v`. Not yet written:
-`md_parser.v` through `csr_block.v`. Before adding the next one:
+`frame_classifier.v` and `md_parser.v` exist (S2). Not yet written:
+`symbol_filter.v` through `csr_block.v`. Before adding the next one:
 define its interface (signals, widths, handshake, latency) per `fpga_project_flow.md` Stage 4,
 lint it, and write its testbench in `tb/` against the golden model in `sim/` before wiring it
 into `tob_top.v`. `docs/design_decisions.md` D1–D11 record the MAC-integration and
