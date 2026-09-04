@@ -1309,6 +1309,120 @@ cycle accounting is exact, not just directionally plausible.
 
 ---
 
+## D26 — First real Vivado synthesis attempt (S11 prep): three fixed blockers, one open — `feature_extractor.v` fails timing at 125 MHz
+
+**Context:** starting S11 (hardware bring-up), attempted the first real
+`scripts/build.tcl` run against the current, post-S6/D25 `tob_top.v` —
+every synthesis-adjacent claim up to this point had only ever been
+exercised by Icarus simulation and CI's `iverilog` lint, never real
+Vivado synthesis/implementation. `results/build/tob_top.bit` already
+existed on disk from **2026-09-01**, but its own `timing_summary.rpt`
+showed only 25 timing endpoints and a single `sys_clk` clock — the S0
+skeleton (`sys_clk`/`rst_n`/`key_in`/`led` only), built before RGMII/MDIO
+ports or any engine RTL existed. Nobody had synthesized the real design
+before today.
+
+### Three real blockers found and fixed
+
+1. **`constraints/tob_pins.xdc` only constrained the S0 skeleton's four
+   ports.** All 15 RGMII/MDIO/PHY-reset pins `tob_top.v` has had since S2
+   were entirely unconstrained. Fixed using `docs/refs/AX7035B_pinout_notes.md`'s
+   pin table (independently confirmed against both the real
+   `AX7035B_UG.pdf` manual and the schematic) cross-checked pin-for-pin
+   against ALINX's own working reference design's XDC
+   (`docs/refs/AX7035/SRC/21_ethernet_test/.../top.xdc` — same board, same
+   JL2121(D) PHY). `constraints/tob_timing.xdc` was missing the RGMII RX
+   clock definition (`rx_clk`, 125 MHz on `rgmii_rxc`) entirely — added,
+   matching that same reference design's own `create_clock`. No RGMII
+   input/output delay budget is set (deliberately — see that reference
+   design's own equally minimal treatment, and `AX7035B_pinout_notes.md`'s
+   own "still open" note that the JL2121(D)'s real AC timing has never
+   been re-derived from Micrel-era KSZ9031RNX assumptions per D9).
+2. **`scripts/build.tcl` never globbed `rtl/vendor/alinx_mac/`.** Its
+   `add_files` glob only ever covered `rtl/*.v rtl/common/*.v` — the
+   vendor MAC/RGMII adapter `tob_top.v` has instantiated since S2 was
+   never part of any synthesis attempt. Fixed by extending the glob.
+3. **D8's already-flagged IP regeneration gap** (`rtl/vendor/alinx_mac/`
+   depends on four Xilinx `fifo_generator`/`blk_mem_gen` IP cores —
+   `udp_tx_data_fifo`, `udp_checksum_fifo`, `udp_rx_ram_8_2048`,
+   `icmp_rx_ram_8_256` — "tracked as an S2 checklist item," never actually
+   done). Fixed: copied the four `.xci` configs from ALINX's own working
+   reference design into `rtl/vendor/alinx_mac/ip/<name>/<name>.xci`
+   (2018-era XCI schema), `upgrade_ip` brought them to this Vivado
+   install's `fifo_generator`/`blk_mem_gen` versions cleanly. These
+   default to out-of-context (per-IP) synthesis, which needs a separate
+   `write_checkpoint`/`read_checkpoint -cell` merge step; simpler for a
+   design this size to set `GENERATE_SYNTH_CHECKPOINT false` on each
+   `.xci` so `synth_design` resolves them inline as part of the top-level
+   run instead ("Global Synthesis," Vivado's other supported IP flow).
+   **Verified, not assumed:** `synth_design` completed with zero
+   blackboxes and zero inferred latches (`get_cells -hierarchical -filter
+   {IS_BLACKBOX == 1}` / `{IS_LATCH == 1}`, both empty) — the design
+   genuinely elaborates and synthesizes end to end for the first time.
+   `icmp_rx_ram_8_256` is instantiated with an 11-bit address by
+   `icmp_reply.v` despite its `_256`-implying-8-bit name (already noted in
+   `tb/sim_models/xilinx_ip_sim_models.v`'s own header) — Vivado only
+   warns (`[Synth 8-689] width (11) of port connection 'addra' does not
+   match port width (8)`) and truncates/zero-extends rather than erroring;
+   worth a closer look before trusting ICMP reply behavior on real
+   traffic, not chased further here.
+
+### One real blocker found, not fixed: `feature_extractor.v` fails setup timing
+
+Post-placement timing: **WNS = −9.127 ns** against the 8 ns (125 MHz)
+`rx_clk` period — not a rounding-error violation, a real one. The worst
+path: `u_csr/cfg_symbol_en_reg[0]/C` → `u_feat/feat_f7_volatility_reg[*]/D`,
+36 logic levels, 8.146 ns of pure logic delay before routing is even
+added. Same shape across the ten worst paths (all landing on
+`feat_f7_volatility_reg[*]`), and a smaller **hold** violation
+(`WHS = −0.002 ns`) inside `mdio_ctrl.v`, not investigated yet given the
+setup violation dominates.
+
+**Root cause, read from the path, not guessed:** `cfg_symbol_en` feeds
+`symbol_filter.v`'s slot selection → `applied_slot`/`sidx` →
+`feature_extractor.v`'s per-slot window array indexing → the F5/F7
+window's fully-recomputed-every-cycle adder tree (`f7acc`, a 16-term
+sum over `WINDOW`, plus the F5 popcount, both combinational in one
+`always @(*)` block, per `feature_extractor.v`'s own header). The slot-
+select mux and the window sum apparently share/chain LUTs in Vivado's
+synthesis, producing a single long combinational cone from a CSR config
+register through to F7's output register.
+
+**This was a predicted risk, not a surprise:** master spec §16's risk
+table already named "feature adder tree" as a known timing-closure
+suspect. It has now materialized for real, confirming that risk entry
+was well-founded, not paranoia.
+
+**Not fixed here — needs its own contract, not a quick patch.**
+`feature_extractor.v`'s own header explicitly documents the full-recompute
+design as deliberate (D13's "never maintained as an incremental
+add-newest/subtract-oldest sum" pitfall) — reverting to incremental
+accumulation to shorten the combinational path would reintroduce exactly
+the correctness bug D13 avoided. The real fix is pipelining (splitting
+the F5/F7 computation across two registered cycles, or restructuring the
+16-term sum into an explicit balanced adder tree rather than relying on
+synthesis inference) — a genuine RTL redesign requiring re-verification
+against `sim/feature_golden.py`'s bit-exact semantics and the existing
+`tb_feature_extractor.v`/`tb_feature_tob_chain.v`/`tb_ml_chain.v`
+regressions, not a same-day fix.
+
+**Consequence for S11:** hardware bring-up cannot proceed on a bitstream
+that fails setup timing this badly — `scripts/build.tcl`'s own WNS gate
+already refuses to write one (`route_design` was not even attempted here;
+no point routing a design already known to fail its own gate). This
+blocks every physical S11 step until resolved.
+
+### What's committed vs. not
+
+`constraints/tob_pins.xdc`, `constraints/tob_timing.xdc`,
+`scripts/build.tcl`, and the four new `rtl/vendor/alinx_mac/ip/*/*.xci`
+files are committed — genuine, independently-verified progress (design
+elaborates, synthesizes, places with zero blackboxes/latches). No RTL
+fix for the timing violation is included; `results/build/` stays
+gitignored as before (no fresh bitstream was produced or committed).
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |
