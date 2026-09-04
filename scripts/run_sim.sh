@@ -64,6 +64,7 @@ run_tb() {
 echo "=== Python golden-model regressions ==="
 python sim/test_golden_model_handcase.py && pass "sim/test_golden_model_handcase.py" || fail "sim/test_golden_model_handcase.py"
 python sim/test_feature_golden_handcase.py && pass "sim/test_feature_golden_handcase.py" || fail "sim/test_feature_golden_handcase.py"
+python sim/test_ml_golden_handcase.py && pass "sim/test_ml_golden_handcase.py" || fail "sim/test_ml_golden_handcase.py"
 python sim/order_rx.py --selftest && pass "sim/order_rx.py --selftest" || fail "sim/order_rx.py --selftest"
 
 echo
@@ -83,6 +84,7 @@ echo "=== Per-module testbenches ==="
 run_tb tb_counter_sat rtl/common/counter_sat.v
 run_tb tb_sync_2ff rtl/common/sync_2ff.v
 run_tb tb_mdio_ctrl rtl/common/mdio_ctrl.v
+run_tb tb_delay_line rtl/common/delay_line.v
 run_tb tb_eth_mac_if_rx rtl/eth_mac_if.v
 run_tb tb_eth_mac_if_tx rtl/eth_mac_if.v tb/sim_models/xilinx_ip_sim_models.v \
     rtl/vendor/alinx_mac/mac_top.v rtl/vendor/alinx_mac/crc.v rtl/vendor/alinx_mac/dpram.v \
@@ -98,6 +100,9 @@ run_tb tb_feature_normalizer rtl/feature_normalizer.v
 run_tb tb_signal_engine rtl/signal_engine.v
 run_tb tb_signal_tob_chain rtl/tob_engine.v rtl/signal_engine.v
 run_tb tb_feature_tob_chain rtl/tob_engine.v rtl/feature_extractor.v
+run_tb tb_ml_classifier_wrap rtl/ml_classifier_wrap.v
+run_tb tb_ml_policy rtl/ml_policy.v
+run_tb tb_ml_chain rtl/tob_engine.v rtl/feature_extractor.v rtl/feature_normalizer.v rtl/ml_classifier_wrap.v rtl/ml_policy.v
 run_tb tb_risk_engine rtl/risk_engine.v
 run_tb tb_order_builder rtl/order_builder.v
 run_tb tb_csr_block rtl/csr_block.v
@@ -105,8 +110,9 @@ run_tb tb_latency_histogram rtl/latency_histogram.v
 run_tb tb_tob_top rtl/tob_top.v rtl/frame_classifier.v rtl/md_parser.v \
     rtl/symbol_filter.v rtl/seq_monitor.v rtl/tob_engine.v rtl/signal_engine.v \
     rtl/risk_engine.v rtl/order_builder.v rtl/csr_block.v rtl/latency_histogram.v \
-    rtl/eth_mac_if.v rtl/common/sync_2ff.v rtl/common/mdio_ctrl.v \
-    tb/sim_models/tob_top_sim_leaves.v
+    rtl/feature_extractor.v rtl/feature_normalizer.v rtl/ml_classifier_wrap.v \
+    rtl/ml_policy.v rtl/eth_mac_if.v rtl/common/sync_2ff.v rtl/common/mdio_ctrl.v \
+    rtl/common/delay_line.v tb/sim_models/tob_top_sim_leaves.v
 
 if [ "${RUN_SIM_FAST:-0}" != "1" ]; then
     echo

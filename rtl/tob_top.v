@@ -25,8 +25,11 @@
 //   * mdio_ctrl.v MUST be instantiated with .CLK_HZ(50_000_000) -- it runs
 //     off sys_clk here, and its default (125 MHz) would silently overrun
 //     IEEE 802.3 clause 22's 2.5 MHz MDC maximum (D22 point 2).
-//   * No ML path (D22 point 3): feature_extractor/feature_normalizer are
-//     not instantiated; risk_engine's adverse_risk is tied to 1'b0.
+//   * ML path (S6, contract docs/contracts/ml_integration.md): the full
+//     feature_extractor -> feature_normalizer -> ml_classifier_wrap ->
+//     ml_policy chain is wired; risk_engine's adverse_risk comes from
+//     ml_policy.v, and the signal branch is delayed ALIGN_DEPTH=3 cycles so
+//     the order intent and the ML verdict arrive at u_risk on the same cycle.
 //   * err_fcs/err_ip are wired from mac_top's D5 outputs
 //     (mac_rec_error / udp_checksum_error); err_ethertype/err_udp_port
 //     stay tied to 0 -- mac_top exposes no distinct signal for either.
@@ -420,6 +423,155 @@ module tob_top #(
         .err_signal_conflict (err_signal_conflict)
     );
 
+    // =====================================================================
+    // S6 ML branch -- feature_extractor -> feature_normalizer ->
+    // ml_classifier_wrap -> ml_policy, plus the signal-branch alignment
+    // delay line (contract docs/contracts/ml_integration.md S7). The ML
+    // branch is deeper than the signal branch, so the order intent is
+    // delayed by ALIGN_DEPTH cycles to arrive at u_risk on the same cycle
+    // the ML verdict's registered value reflects the SAME triggering event.
+    // =====================================================================
+    wire         feat_valid;
+    wire [1:0]   feat_slot;
+    wire [31:0]  feat_f0_spread, feat_f1_mid_delta, feat_f2_imbalance;
+    wire [31:0]  feat_f3_bid_chg, feat_f4_ask_chg, feat_f5_update_rate;
+    wire [31:0]  feat_f6_last_trade_dir, feat_f7_volatility;
+
+    wire         norm_valid;
+    wire [1:0]   norm_slot;
+    wire signed [7:0] norm_x0, norm_x1, norm_x2, norm_x3;
+    wire signed [7:0] norm_x4, norm_x5, norm_x6, norm_x7;
+
+    wire         ml_valid;
+    wire [1:0]   ml_slot;
+    wire signed [31:0] ml_z;
+
+    wire         adverse_risk;
+
+    wire [31:0] cfg_offset_0, cfg_shift_0, cfg_offset_1, cfg_shift_1;
+    wire [31:0] cfg_offset_2, cfg_shift_2, cfg_offset_3, cfg_shift_3;
+    wire [31:0] cfg_offset_4, cfg_shift_4, cfg_offset_5, cfg_shift_5;
+    wire [31:0] cfg_offset_6, cfg_shift_6, cfg_offset_7, cfg_shift_7;
+    wire signed [31:0] cfg_ml_th_high, cfg_ml_th_low;
+    wire [31:0] cfg_ml_score_offset, cfg_ml_score_shift;
+
+    // signal-branch alignment: delays sig_valid/sig_slot/sig_side/sig_price/
+    // sig_qty by ALIGN_DEPTH cycles so they reach u_risk on the same cycle
+    // adverse_risk's registered value reflects the SAME triggering event
+    // (docs/contracts/ml_integration.md S1.3). u_csr's own sig_valid/sig_side
+    // connections below stay on the RAW (unaligned) u_sig outputs -- they
+    // count signals as generated, not as risk-gated.
+    localparam ALIGN_DEPTH = 3;
+    wire        sig_valid_aligned;
+    wire [73:0] sig_data_aligned;
+    wire [1:0]  sig_slot_aligned  = sig_data_aligned[73:72];
+    wire [7:0]  sig_side_aligned  = sig_data_aligned[71:64];
+    wire [31:0] sig_price_aligned = sig_data_aligned[63:32];
+    wire [31:0] sig_qty_aligned   = sig_data_aligned[31:0];
+
+    wire        ml_event_valid, ml_adverse_pulse, ml_benign_pulse, ml_safe_forced_pulse;
+
+    feature_extractor #(
+        .NUM_SYMBOLS (4),
+        .WINDOW      (16)
+    ) u_feat (
+        .clk                    (gmii_rx_clk),
+        .rst_n                  (engine_rst_n),
+        .msg_type               (md_msg_type),
+        .msg_side               (md_msg_side),
+        .msg_applied            (msg_applied),
+        .book_upd_valid         (book_upd_valid),
+        .applied_slot           (applied_slot),
+        .next_bid_price         (next_bid_price),
+        .next_bid_qty           (next_bid_qty),
+        .next_ask_price         (next_ask_price),
+        .next_ask_qty           (next_ask_qty),
+        .feat_valid             (feat_valid),
+        .feat_slot              (feat_slot),
+        .feat_f0_spread         (feat_f0_spread),
+        .feat_f1_mid_delta      (feat_f1_mid_delta),
+        .feat_f2_imbalance      (feat_f2_imbalance),
+        .feat_f3_bid_chg        (feat_f3_bid_chg),
+        .feat_f4_ask_chg        (feat_f4_ask_chg),
+        .feat_f5_update_rate    (feat_f5_update_rate),
+        .feat_f6_last_trade_dir (feat_f6_last_trade_dir),
+        .feat_f7_volatility     (feat_f7_volatility)
+    );
+
+    feature_normalizer u_norm (
+        .clk                (gmii_rx_clk),
+        .rst_n              (engine_rst_n),
+        .feat_valid         (feat_valid),
+        .feat_slot          (feat_slot),
+        .feat_f0_spread         (feat_f0_spread),
+        .feat_f1_mid_delta      (feat_f1_mid_delta),
+        .feat_f2_imbalance      (feat_f2_imbalance),
+        .feat_f3_bid_chg        (feat_f3_bid_chg),
+        .feat_f4_ask_chg        (feat_f4_ask_chg),
+        .feat_f5_update_rate    (feat_f5_update_rate),
+        .feat_f6_last_trade_dir (feat_f6_last_trade_dir),
+        .feat_f7_volatility     (feat_f7_volatility),
+        .cfg_offset_0 (cfg_offset_0), .cfg_shift_0 (cfg_shift_0),
+        .cfg_offset_1 (cfg_offset_1), .cfg_shift_1 (cfg_shift_1),
+        .cfg_offset_2 (cfg_offset_2), .cfg_shift_2 (cfg_shift_2),
+        .cfg_offset_3 (cfg_offset_3), .cfg_shift_3 (cfg_shift_3),
+        .cfg_offset_4 (cfg_offset_4), .cfg_shift_4 (cfg_shift_4),
+        .cfg_offset_5 (cfg_offset_5), .cfg_shift_5 (cfg_shift_5),
+        .cfg_offset_6 (cfg_offset_6), .cfg_shift_6 (cfg_shift_6),
+        .cfg_offset_7 (cfg_offset_7), .cfg_shift_7 (cfg_shift_7),
+        .norm_valid  (norm_valid),
+        .norm_slot   (norm_slot),
+        .x0 (norm_x0), .x1 (norm_x1), .x2 (norm_x2), .x3 (norm_x3),
+        .x4 (norm_x4), .x5 (norm_x5), .x6 (norm_x6), .x7 (norm_x7)
+    );
+
+    ml_classifier_wrap u_ml (
+        .clk        (gmii_rx_clk),
+        .rst_n      (engine_rst_n),
+        .norm_valid (norm_valid),
+        .norm_slot  (norm_slot),
+        .x0 (norm_x0), .x1 (norm_x1), .x2 (norm_x2), .x3 (norm_x3),
+        .x4 (norm_x4), .x5 (norm_x5), .x6 (norm_x6), .x7 (norm_x7),
+        .ml_valid   (ml_valid),
+        .ml_slot    (ml_slot),
+        .z          (ml_z)
+    );
+
+    ml_policy u_policy (
+        .clk                  (gmii_rx_clk),
+        .rst_n                (engine_rst_n),
+        .ml_valid             (ml_valid),
+        .ml_slot              (ml_slot),
+        .z                    (ml_z),
+        .bid_valid            (bid_valid),
+        .ask_valid            (ask_valid),
+        .crossed              (crossed),
+        .seq_gap              (seq_gap),
+        .cfg_ml_th_high       (cfg_ml_th_high),
+        .cfg_ml_th_low        (cfg_ml_th_low),
+        .cfg_ml_score_offset  (cfg_ml_score_offset),
+        .cfg_ml_score_shift   (cfg_ml_score_shift),
+        .adverse_risk         (adverse_risk),
+        .score_raw            (),
+        .risk_level           (),
+        .ml_event_valid       (ml_event_valid),
+        .ml_adverse_pulse     (ml_adverse_pulse),
+        .ml_benign_pulse      (ml_benign_pulse),
+        .ml_safe_forced_pulse (ml_safe_forced_pulse)
+    );
+
+    delay_line #(
+        .WIDTH (74),   // sig_slot(2) + sig_side(8) + sig_price(32) + sig_qty(32)
+        .DEPTH (ALIGN_DEPTH)
+    ) u_align (
+        .clk       (gmii_rx_clk),
+        .rst_n     (engine_rst_n),
+        .in_valid  (sig_valid),
+        .in_data   ({sig_slot, sig_side, sig_price, sig_qty}),
+        .out_valid (sig_valid_aligned),
+        .out_data  (sig_data_aligned)
+    );
+
     wire [31:0] cfg_max_order_qty;
     wire [31:0] cfg_max_position;
     wire [31:0] cfg_price_band;
@@ -464,18 +616,18 @@ module tob_top #(
     risk_engine u_risk (
         .clk                    (gmii_rx_clk),
         .rst_n                  (engine_rst_n),
-        .sig_valid              (sig_valid),
-        .sig_slot               (sig_slot),
-        .sig_side               (sig_side),
-        .sig_price              (sig_price),
-        .sig_qty                (sig_qty),
+        .sig_valid              (sig_valid_aligned),
+        .sig_slot               (sig_slot_aligned),
+        .sig_side               (sig_side_aligned),
+        .sig_price              (sig_price_aligned),
+        .sig_qty                (sig_qty_aligned),
         .msg_applied            (msg_applied),
         .applied_slot           (applied_slot),
         .bid_price              (bid_price),
         .ask_price              (ask_price),
         .crossed                (crossed),
         .seq_gap                (seq_gap),
-        .adverse_risk           (1'b0),   // no ML path yet (S1.3/D22)
+        .adverse_risk           (adverse_risk),   // ml_policy.v (S6)
         .cur_cycle              (cur_cycle),
         .kill_sw_n              (kill_sw_n_sync),
         .cfg_max_order_qty      (cfg_max_order_qty),
@@ -585,19 +737,19 @@ module tob_top #(
         .cfg_enable             (),
         .cfg_udp_port           (),
         .cfg_stats_period       (),
-        .cfg_ml_th_high         (),
-        .cfg_ml_th_low          (),
-        .cfg_ml_score_offset    (),
-        .cfg_ml_score_shift     (),
-        .cfg_ml_window          (),
-        .cfg_offset_0           (), .cfg_shift_0 (),
-        .cfg_offset_1           (), .cfg_shift_1 (),
-        .cfg_offset_2           (), .cfg_shift_2 (),
-        .cfg_offset_3           (), .cfg_shift_3 (),
-        .cfg_offset_4           (), .cfg_shift_4 (),
-        .cfg_offset_5           (), .cfg_shift_5 (),
-        .cfg_offset_6           (), .cfg_shift_6 (),
-        .cfg_offset_7           (), .cfg_shift_7 (),
+        .cfg_ml_th_high         (cfg_ml_th_high),
+        .cfg_ml_th_low          (cfg_ml_th_low),
+        .cfg_ml_score_offset    (cfg_ml_score_offset),
+        .cfg_ml_score_shift     (cfg_ml_score_shift),
+        .cfg_ml_window          (),   // still no consumer (S1.4) -- tied off
+        .cfg_offset_0 (cfg_offset_0), .cfg_shift_0 (cfg_shift_0),
+        .cfg_offset_1 (cfg_offset_1), .cfg_shift_1 (cfg_shift_1),
+        .cfg_offset_2 (cfg_offset_2), .cfg_shift_2 (cfg_shift_2),
+        .cfg_offset_3 (cfg_offset_3), .cfg_shift_3 (cfg_shift_3),
+        .cfg_offset_4 (cfg_offset_4), .cfg_shift_4 (cfg_shift_4),
+        .cfg_offset_5 (cfg_offset_5), .cfg_shift_5 (cfg_shift_5),
+        .cfg_offset_6 (cfg_offset_6), .cfg_shift_6 (cfg_shift_6),
+        .cfg_offset_7 (cfg_offset_7), .cfg_shift_7 (cfg_shift_7),
         .ml_bypass              (),
         .kill_latched           (kill_latched),
         .seq_gap                (seq_gap),
@@ -622,10 +774,10 @@ module tob_top #(
         .sig_valid              (sig_valid),
         .sig_side               (sig_side),
         .err_signal_conflict    (err_signal_conflict),
-        .ml_event_valid         (1'b0),   // ml_policy.v is S6 (S1.3)
-        .ml_adverse_pulse       (1'b0),
-        .ml_benign_pulse        (1'b0),
-        .ml_safe_forced_pulse   (1'b0),
+        .ml_event_valid         (ml_event_valid),
+        .ml_adverse_pulse       (ml_adverse_pulse),
+        .ml_benign_pulse        (ml_benign_pulse),
+        .ml_safe_forced_pulse   (ml_safe_forced_pulse),
         .gate_kill_fired        (gate_kill_fired),
         .gate_size_fired        (gate_size_fired),
         .gate_position_fired    (gate_position_fired),

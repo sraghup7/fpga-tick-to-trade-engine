@@ -38,6 +38,10 @@
 //         counters increment (D5/S1.5)
 //   T5    kill switch + reset sanity: kill_sw via key_in[0] asserts
 //         kill_latched which shows on led[1]
+//   T6    ML gate 0x09 block mode: a tradeable-book quote whose z crosses
+//         ML_TH_HIGH emits a 0x11 reject frame with reject_reason = 0x09
+//   T7    ML gate 0x09 reduce mode (ML_CTRL action=reduce, shift=1): the
+//         same setup emits a 0x10 NEW order with qty reduced 100 >> 1 = 50
 //
 // The mdio_ctrl.v CLK_HZ override (D22 point 2) is a static source-level
 // check, verified by inspection/grep, not this testbench.
@@ -176,6 +180,16 @@ module tb_tob_top;
         end
     endfunction
 
+    // Write a CSR register (0x20) and let it settle.
+    task csr_write;
+        input [15:0] addr;
+        input [31:0] data;
+        begin
+            rx_frame(csr_frame_pack(8'h20, addr, data));
+            adv(60);
+        end
+    endtask
+
     // ---- wait until the mac stand-in has captured one more TX frame ----
     task wait_tx_after;
         input integer prev;
@@ -242,6 +256,11 @@ module tb_tob_top;
         bring_up;
 
         // ================= T1: one order end-to-end =================
+        // The ML gate is now live (S6) with default thresholds (th_high=0)
+        // that would block this order; neutralize them first so T1 exercises
+        // the order path, not the ML gate (T6/T7 cover the ML gate).
+        csr_write(16'h0048, 32'h7FFFFFFF);   // ML_TH_HIGH -> never adverse by z
+        csr_write(16'h004C, 32'h7FFFFFFE);   // ML_TH_LOW
         // Build a tradeable book with two QUOTEs on symbol 1 -- a bid, then
         // an ask that itself completes the tradeable condition. Post-D23,
         // signal_engine reads tob_engine's next_* (post-update) outputs for
@@ -366,6 +385,58 @@ module tb_tob_top;
         if (led[1] !== 1'b1) begin
             $display("FAIL: T5 kill_latched LED dropped without a kill-clear (must stay latched)");
             fail = 1'b1;
+        end
+
+        // ================= T6: ML gate 0x09 blocks (block mode) =================
+        // Clear the T5 kill latch (CTRL bit1) and turn on reject reporting
+        // (CTRL bit4) so the blocked order emits a 0x11 diagnostic frame. Then
+        // set ML thresholds so a completing quote's z crosses T_high.
+        csr_write(16'h0000, 32'h12);         // kill-clear (bit1) + reject report (bit4)
+        csr_write(16'h0048, 32'd100);        // ML_TH_HIGH = 100
+        csr_write(16'h004C, 32'hFFFFFF9C);   // ML_TH_LOW  = -100
+        csr_write(16'h0050, 32'd0);          // ML_CTRL: action=block, shift=0
+        // symbol 2 (slot 1), fresh book: bid 100/10 then ask 110/4. The ask
+        // completes a tradeable book (bid_qty 10 > ask_qty<<1 = 8 -> buy) AND
+        // its features sum to z = 10+55+6+0+4+2+0+55 = 132 >= 100 -> adverse.
+        // The SAME event fires the signal and the ML verdict; gate 0x09 blocks.
+        rx_frame(msg_frame(8'h01, 8'h02, 8'h00, 8'h00, 32'd100, 32'd10, 32'd3));
+        adv(60);
+        prev = dut.u_mac.tx_frame_cnt;
+        rx_frame(msg_frame(8'h01, 8'h02, 8'h01, 8'h00, 32'd110, 32'd4, 32'd4));
+        adv(60);
+        wait_tx_after(prev, ok);
+        if (!ok) begin
+            $display("FAIL: T6 no reject frame transmitted");
+            fail = 1'b1;
+        end else begin
+            get_tx_frame(frame);
+            $display("T6 tx frame: %032x", frame);
+            if (frame[127:120] !== 8'h11) begin
+                $display("FAIL: T6 frame type %02x, expected 11 (reject)", frame[127:120]);
+                fail = 1'b1;
+            end
+            chk(6000, frame[103:96], 8'h09);   // reject_reason = 0x09 (ML)
+        end
+
+        // ================= T7: ML gate 0x09 reduces (reduce mode) =================
+        // action=reduce (bit0) + reduce_shift=1 (bits 4:1 -> 1) => ML_CTRL=0x3.
+        // Same tradeable-book setup on a fresh symbol (slot 2 = symbol 3), so
+        // z=132 again. Gate 0x09 now reduces (100 >> 1 = 50) instead of blocking.
+        csr_write(16'h0050, 32'd3);
+        rx_frame(msg_frame(8'h01, 8'h03, 8'h00, 8'h00, 32'd100, 32'd10, 32'd5));
+        adv(60);
+        prev = dut.u_mac.tx_frame_cnt;
+        rx_frame(msg_frame(8'h01, 8'h03, 8'h01, 8'h00, 32'd110, 32'd4, 32'd6));
+        adv(60);
+        wait_tx_after(prev, ok);
+        if (!ok) begin
+            $display("FAIL: T7 no order transmitted");
+            fail = 1'b1;
+        end else begin
+            get_tx_frame(frame);
+            $display("T7 tx frame: %032x", frame);
+            chk(7000, frame[127:120], 8'h10);   // still a NEW order
+            chk(7001, frame[63:32], 32'd50);    // qty reduced: 100 >> 1
         end
 
         if (fail) begin

@@ -1193,6 +1193,103 @@ verified, since two messages (not three) should then suffice.
 
 ---
 
+## D24 — S6 ML integration: fallback classifier, and three deliberately deferred scope items
+
+`docs/contracts/ml_integration.md` wires the ML branch (`feature_extractor.v`
+→ `feature_normalizer.v` → `ml_classifier_wrap.v` → `ml_policy.v`) into
+`tob_top.v` for the first time, closing risk gate `0x09` (`adverse_risk`
+was tied to `1'b0` since D22). S4 (`model/`, `hls4ml/`) has not started, so
+per master spec §15's standing fallback, `ml_classifier_wrap.v` is a
+hand-written 8-MAC linear classifier (`z = bias + Σw_i·x_i`, weights/bias
+loaded via `$readmemh` from `model/weights.mem`/`bias.mem`) rather than an
+hls4ml-generated IP. The weights are an explicit, documented placeholder
+(`w_i=1` for all `i`, `b=0`) — not trained, chosen only so every test
+vector is hand-computable; `model/model_config.json` records this. When S4
+lands, only the two `.mem` files change — `ml_classifier_wrap.v`'s port
+list and every other module's wiring stay untouched by design.
+
+Because the classifier is small enough to close timing in one
+combinational cycle (vs. the master spec's own budget of 2–3 cycles for a
+pipelined hls4ml IP), the signal branch's order intent needs only a
+3-cycle alignment delay (`ALIGN_DEPTH`, a `tob_top.v` `localparam`, fed
+into the new reusable `rtl/common/delay_line.v`) to reach `risk_engine.v`
+on the same cycle `ml_policy.v`'s registered `adverse_risk` reflects the
+same triggering event — shallower than the master spec's estimate of
+4–5 cycles, purely because this fallback classifier is faster than the
+real IP will be. **This is a load-bearing consequence worth its own entry
+below (D25) — it silently breaks an invariant `order_builder.v` depends
+on.**
+
+Three scope items were deliberately deferred, not silently dropped:
+
+1. **Fail-safe forcing (FR-26/31) covers invalid side / crossed book /
+   sequence gap, but not per-event staleness.** `risk_engine.v`'s own gate
+   `0x05` already independently blocks any order built from a stale
+   message regardless of the ML verdict, so the safety property "no order
+   emitted from stale state" already holds. The gap: a stale event's
+   (possibly meaningless) `z` can still update the *persisting* hysteresis
+   state that carries into the next, fresh event. Fixing this properly
+   would mean duplicating `risk_engine.v`'s `pend_prev_cycle`/
+   `pend_msg_cycle` per-slot timestamp mechanism inside `ml_policy.v` for
+   every book event (today it only runs for events that also produce a
+   `signal_engine.v` intent) — real, separate work.
+2. **`score_raw`/`risk_level` (FR-33) are computed by `ml_policy.v` but
+   left unconnected in `tob_top.v`** — no CSR-readback register or
+   diagnostic-frame mechanism exists yet to consume them.
+3. **`cfg_ml_window` (CSR `0x5C`) still has no RTL consumer.**
+   `feature_extractor.v`'s window depth is the elaboration-time `WINDOW`
+   parameter (D13), not a runtime signal — this mismatch between the CSR
+   register's existence and its (lack of) effect predates S6 and is not
+   introduced or resolved by it.
+
+## D25 — S6's alignment delay breaks `order_builder.v`'s fixed-2-cycle `trigger_seq`/`latency_cyc` assumption
+
+**Found during S6 integration, not fixed — flagged for a dedicated
+follow-up.** D23 already named the exact invariant this breaks:
+`order_builder.v`'s `seq_d0`/`seq_d1` and `ingress_d0`/`ingress_d1` are an
+*unconditional* two-stage shift register (`docs/contracts/
+order_builder.md` §2.2) that blindly shifts every cycle, relying entirely
+on "the total registered latency from `md_parser`'s `msg_valid` to the
+matching `order_valid`/`reject_reason` is exactly two cycles" (its own
+header comment) to guarantee `seq_d1`/`ingress_d1` happen to hold the
+*triggering* message's sequence number and ingress cycle at the moment
+`order_valid` fires — no explicit tagging, just a matched-length delay
+line assumption.
+
+D24's `ALIGN_DEPTH=3` cycles added to the signal→risk path (D24) makes
+that latency five cycles, not two. `order_builder.v`'s shift register was
+not touched (out of scope for `docs/contracts/ml_integration.md`), so
+`seq_d1`/`ingress_d1` now hold whatever message arrived **three events
+after** the actual trigger, not the trigger itself. Concretely, for every
+order accepted since S6 landed: `trigger_seq` in the emitted order frame
+attributes the order to the wrong market-data message, and `latency_cyc`
+is computed against the wrong ingress timestamp — both wrong by a fixed
+but incorrect offset, not merely "off by 3" in a harmless sense.
+
+**Why the full regression, including the 1,000,000-message soak, did not
+catch this:** `latency_histogram.v` reads its `lat_value` from
+`order_builder.v`'s own (now-wrong) `latency_cyc` field
+(`docs/contracts/latency_histogram.md`), and NFR-2's soak-level check only
+asserts a *single occupied bucket* — i.e. that the reported latency is
+*consistent* across the run, not that it is *correct*. A fixed
+systematic misattribution produces one bucket at the wrong value, which
+passes that check. No existing testbench asserts `trigger_seq`'s or
+`latency_cyc`'s absolute value against the actual triggering message, so
+nothing was positioned to catch this.
+
+**Not fixed here** — deliberately out of `docs/contracts/
+ml_integration.md`'s scope (`order_builder.v` was explicitly listed as
+untouched). The fix belongs in `order_builder.v` itself: either widen the
+unconditional shift register to `ALIGN_DEPTH + 2` stages (making
+`ALIGN_DEPTH` a shared constant both modules reference, so this can't
+silently drift again), or replace the blind shift-register assumption
+with something that doesn't depend on a hand-matched constant at all. A
+dedicated follow-up contract is needed before this project's latency/
+`trigger_seq` claims (§12.1, the "host's order capture doubles as a
+latency log" claim in `CLAUDE.md`) can be trusted again.
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |
