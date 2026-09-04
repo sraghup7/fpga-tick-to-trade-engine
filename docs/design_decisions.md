@@ -586,6 +586,57 @@ contract-writing process surfaced, same as D11/D12/D13.
 
 ---
 
+## D15 — `signal_engine.v`'s imbalance shift must use wide-precision arithmetic, not a naive 32-bit shift
+
+**Decision:** `rtl/signal_engine.v` (contract:
+`docs/contracts/signal_engine.md`) must compute `ask_qty << cfg_imb_shift`
+and `bid_qty << cfg_imb_shift` in a wide (≥35-bit) intermediate — zero-pad
+`bid_qty`/`ask_qty` by `cfg_imb_shift`'s maximum width (3 bits, per the CSR
+map's `IMB_SHIFT: 0-3`) before shifting — rather than a plain 32-bit
+left-shift that silently drops bits off the top.
+
+**Why.** FR-37 states buy and sell firing simultaneously is "impossible by
+construction." That claim is only actually true under `sim/golden_model.py`'s
+arithmetic, which uses Python's unbounded integers — `book.ask_qty <<
+self.cfg.imb_shift` never overflows there, for any quantity. A plain 32-bit
+hardware shift is not equivalent: `bid_qty = ask_qty = 0x80000000,
+imb_shift = 1` makes both `ask_qty << 1` and `bid_qty << 1` wrap to `0` in
+32 bits, so `bid_qty > (ask_qty << 1)` and `ask_qty > (bid_qty << 1)` **both**
+read true — a spurious conflict the golden model would never produce for
+that same input, verified empirically (not just reasoned about) before
+writing this entry. Quantities anywhere near `2^31` are unrealistic for this
+project's synthetic feed, so a random-stimulus soak test is very unlikely to
+ever land exactly here — but "unlikely to be hit by random stimulus" is a
+worse standard than "actually bit-exact," which is this project's stated
+hard requirement (S11.1), and the fix (widen one intermediate by 3 bits)
+costs nothing. Found and fixed before any RTL existed, same as D12-D14.
+
+**Consequence:** under the wide-precision design, FR-37's "impossible by
+construction" is genuinely true in the RTL too — `err_signal_conflict` is
+correctly unreachable via any honest combination of `bid_qty`/`ask_qty`
+inputs, matching the golden model. §5's out-of-scope note in
+`docs/contracts/signal_engine.md` explains why this makes the conflict path
+untestable via ordinary black-box stimulus, and what to do about it (a
+`force`-based Icarus test targeting the internal `buy_ok`/`sell_ok` wires
+directly, isolated from the input-driven computation that can no longer
+produce that state).
+
+**A second, independent reason `crossed` must be its own explicit AND term
+(not implied by the spread comparison):** `ask_price - bid_price`, computed
+as a plain unsigned 32-bit subtraction, **underflows to a huge positive
+number** when the book is crossed (`bid_price >= ask_price`) — a crossed
+book can look like it has an enormous spread if nothing else guards against
+it. FR-35/36 already list "not crossed" as an independent required
+condition, not derivable from the spread check; `signal_engine.v` gets this
+for free by reading `tob_engine.v`'s already-computed `crossed[slot]` output
+directly rather than re-deriving anything from the (potentially misleading)
+raw price subtraction.
+
+Not a resolution of a numbered §17 open question — new information the S5
+contract-writing process surfaced, same as D11-D14.
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |
