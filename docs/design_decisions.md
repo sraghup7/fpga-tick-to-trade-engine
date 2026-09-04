@@ -786,6 +786,131 @@ already-shipped RTL rather than only `sim/golden_model.py`.
 
 ---
 
+## D19 — `csr_block.v`: CSR frame wire protocol, counter address map, and STATUS scope
+
+**Status: decided while writing `docs/contracts/csr_block.md` (S9), not yet
+implemented.** The master spec (§9) names the CSR frame `msg_type` values
+(`0x20` write / `0x21` read-request / `0x22` read-response) and the register
+map's addresses for `0x00`-`0x9C`, but leaves four things genuinely
+unspecified that the contract has to pin down before any RTL can be written
+against it.
+
+**1. CSR frames share `md_parser.v`'s existing byte stream — no new MAC or
+`frame_classifier.v` wiring.** Checked directly: nothing in `rtl/eth_mac_if.v`
+or the vendored MAC (`rtl/vendor/alinx_mac/`) filters by destination UDP
+port anywhere (`cfg_udp_port` / register `0x40` is not consumed by any
+existing signal path) — there is no second ingress port to tap even if the
+design wanted one. `csr_block.v` therefore taps the *same*
+`frame_classifier.v → md_parser.v` byte stream (`in_data`/`in_valid`) as a
+second, independent, purely-combinational-adjacent listener, running its own
+small byte-serial decode (mirroring `md_parser.v`'s `byte_cnt`/`complete_d`
+shape) that recognizes only `0x20`/`0x21` in byte 0 and ignores everything
+else. This costs nothing upstream: `md_parser.v` already silently discards
+`0x20`/`0x21` today as `err_msg_type` (harmless, pre-existing behavior,
+unchanged), and CSR frames are simply zero-effect noise to every
+market-data-consuming module the same way market-data frames are
+zero-effect noise to `csr_block.v`. CSR write/read-request frames are
+defined as the same 16-byte fixed-width envelope as every other frame type
+in this system (byte 0 = `msg_type`, big-endian): `addr`(2, offset 2) and
+`data`(4, offset 4), rest reserved/zero — see the contract §2.2 for the
+exact layout.
+
+**2. `0x22` read-response frames do not go through `eth_mac_if.v` directly
+in this contract.** `order_builder.v` already exclusively owns
+`tx_payload`/`tx_start`/`tx_busy` (S8). Two masters driving that single TX
+interface needs an arbiter that doesn't exist yet and isn't `csr_block.v`'s
+job to invent unilaterally — it's an S10 integration concern (`tob_top.v`
+wiring). `csr_block.v` instead exposes its own `resp_payload`/`resp_start`/
+`resp_busy` outputs, same shape as `order_builder.v`'s TX interface,
+independently testable now; a small priority mux combining the two onto the
+real `eth_mac_if.v` port is deferred to S10, noted as a follow-up.
+
+**3. Counter addresses (`0xA0`+) are assigned in this decision, spec only
+says "Counters — Read-only block, §10."** Assigned in §10's own listed
+order, ingress → errors → feed-health → signal → ML → risk → egress →
+latency, 4 bytes apart starting at `0xA0` (`cnt_frames_rx`) through `0x134`
+(`lat_last`). The 64-bucket histogram (`0x138`-`0x234`) is explicitly
+**not** part of this address range's implementation in `csr_block.v` —
+that data is owned and computed by `latency_histogram.v` (a separate S9
+module, not yet written); `csr_block.v` reserves the range and returns 0
+for it until a follow-up wires a real passthrough.
+
+**4. `STATUS` (`0x04`) bits 7:5 ("side-valid map") are a genuine spec gap,
+not solved here.** Four watched symbols need 8 bits (bid+ask validity each)
+but the register map allocates 3. Rather than silently guess a truncation
+scheme, `csr_block.v`'s contract ties bits 7:5 to `0` (reserved) and states
+the gap plainly. Bits 0-4 (kill/seq-gap/crossed/stale/ML-adverse) are
+defined as **sticky-until-counter-clear** flags (cleared together with the
+counters by `CTRL.bit2`), except bit0 (`kill latched`) which mirrors
+`risk_engine.v`'s own `kill_latched` level directly (already
+latch-until-`CTRL.bit1`-clear by FR-46/47 — re-latching it independently in
+`csr_block.v` would let the two disagree).
+
+**Also newly discovered while grounding this contract: `err_fcs`,
+`err_ethertype`, `err_ip`, `err_udp_port` have no source signal anywhere in
+the current RTL.** Per D1, the vendored MAC's `udp_rx.v` verifies
+EtherType/IPv4/UDP framing and the IPv4 checksum before `eth_mac_if.v` ever
+asserts anything, but none of those internal checks are currently exposed
+as named error pulses. `csr_block.v`'s contract declares input ports for
+all four (matching the established `cfg_*`/`err_*` stand-in-port pattern
+used throughout this project) but nothing drives them yet; wiring them to
+real vendored-MAC signals is future work, same category as `adverse_risk`
+standing in for `ml_policy.v` in `risk_engine.v`'s contract.
+
+---
+
+## D20 — `csr_block.v`: `STATUS` bit2 (`crossed`) must be level-sensed, not edge-triggered
+
+**Status: applied**, `rtl/csr_block.v` (a small, targeted patch to the
+implementation just delivered for S9, not yet committed) and
+`tb/tb_csr_block.v` (one new regression, `C11`). **Decision:** the sticky
+`crossed` flag in `STATUS` (bit2) now sets on the plain level `|crossed`
+every cycle it's true, not on a registered `crossed_or_d`-based 0→1 edge
+detector.
+
+**Why.** Found during independent verification of the delivered
+`csr_block.v` (the same discipline as every prior module this series —
+recompile, rerun, read the RTL, re-run mutations). The first implementation
+latched `status_crossed` only when `(|crossed) & ~crossed_or_d` — i.e. only
+on a rising edge. Verified empirically with a standalone testbench: hold
+`crossed` continuously asserted (a book that never un-crosses), issue
+`CTRL.bit2` (counter clear) while it's still asserted, and `STATUS` bit2
+reads back `0` and *stays* `0` for as long as `crossed` never actually
+drops to `0` first — because the edge that would re-arm the latch never
+occurs. A sticky "has this fault happened since the last clear" flag that
+goes permanently dark for an *ongoing* fault right after a routine clear is
+the opposite of what it's for.
+
+**Whose bug this is:** the contract's own (`docs/contracts/csr_block.md`
+§2.6), not a misreading by the implementer. The original wording — "set on
+`(|crossed)` going high" — reads as edge-triggered, and the implementation
+followed it faithfully. The mismatch is that `crossed` (`tob_engine.v`) is
+a *persisting level*, unlike `seq_gap_pulse`/`gate_stale_fired`/
+`ml_adverse_pulse` — the other three sticky triggers — which are genuine
+one-shot pulses where edge vs. level is not a meaningful distinction (a
+pulse only ever produces one "edge" per event by construction). Writing
+the same "goes high" phrasing for all four sticky bits papered over that
+one of the four inputs behaves fundamentally differently. Same category of
+mistake as the sign-extension error in `risk_engine.md` §2.5 (reusing a
+pattern that's correct in one context into a context where the underlying
+assumption doesn't hold) — see the general craft-lesson memory note from
+that finding.
+
+**The fix simplifies the RTL, not just corrects it:** the level check (`if
+(|crossed) status_crossed <= 1'b1;`) needs no `crossed_or_d` register at
+all — one line removed, one line changed. Contract §2.6 corrected in place
+to state the level-sensed rule explicitly and name the failure mode, so a
+future reader (or a future sticky-bit addition) doesn't repeat the mistake.
+
+**Practical impact:** real. Bits 1/3/4 (seq-gap/stale/ML-adverse) were
+never affected — their triggers are already one-shot pulses, so
+edge-vs-level was never an active distinction for them. Only bit2 was
+wrong, and only in the specific scenario of a persisting cross condition
+spanning a counter clear — plausible in a genuinely bad feed state, exactly
+the situation this diagnostic bit exists to surface.
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |
