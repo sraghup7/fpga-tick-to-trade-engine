@@ -18,7 +18,9 @@
 //   * Egress is a standalone resp_payload/resp_start/resp_busy interface --
 //     NOT eth_mac_if.v's -- to be arbitrated onto the real TX path at S10.
 //   * Counter addresses 0xA0..0x134 are assigned here in S10's listed
-//     order; the 0x138+ histogram range is reserved and reads 0.
+//     order; the 0x138-0x234 range is latency_histogram.v's bucket readout
+//     (D21/D22, docs/contracts/csr_block_patch.md): 64 buckets, 4 bytes
+//     apart, read via the hist_rd_addr/hist_rd_data ports.
 //   * STATUS bits 7:5 stay reserved (0) -- a documented master-spec gap.
 //
 // Semantics highlights (contract S2.3/S2.5/S2.6):
@@ -37,6 +39,17 @@
 //
 // cfg_* outputs are pin-compatible with every existing module's cfg_*
 // input ports; wiring them to the pipeline is tob_top.v (S10) work.
+//
+// Two additive patches on top of the original contract (docs/contracts/
+// csr_block_patch.md, D21/D22), both new ports / new read-mux coverage:
+//   * counter_clear_pulse is exported (was an internal wire) so CTRL bit2
+//     can drive latency_histogram.v's cfg_counter_clear at integration;
+//   * the 0x138-0x234 histogram range no longer reads 0 -- it reads
+//     latency_histogram.v's bucket data via hist_rd_data. hist_rd_addr is
+//     driven CONTINUOUSLY off csr_addr_r (never gated on csr_read_valid):
+//     csr_addr_r is latched at bytes 2-3 of every frame, >=12 cycles before
+//     csr_read_valid fires, so latency_histogram's registered (1-cycle lag)
+//     read has long since settled to the right bucket when rd32 runs.
 //
 // Verilog-2001 only.
 
@@ -79,6 +92,9 @@ module csr_block #(
     output wire        cfg_kill_clear,      // CTRL bit1, self-clearing pulse
     output reg         cfg_reject_report,   // CTRL bit4
     output wire        cfg_seq_gap_clear,   // CTRL bit3, self-clearing pulse
+    output wire        counter_clear_pulse, // CTRL bit2, one-cycle pulse
+                                            //   (D19/D21) -> latency_histogram.v
+                                            //   cfg_counter_clear at integration
     output reg  [31:0] cfg_offset_0, output reg [31:0] cfg_shift_0,
     output reg  [31:0] cfg_offset_1, output reg [31:0] cfg_shift_1,
     output reg  [31:0] cfg_offset_2, output reg [31:0] cfg_shift_2,
@@ -144,7 +160,12 @@ module csr_block #(
     input  wire [127:0] ob_tx_payload,       // byte 0 = msg_type (0x10 NEW)
     input  wire         cnt_order_overflow_pulse,  // order_builder.v
     input  wire         lat_valid,           // stand-in for latency_histogram.v
-    input  wire [15:0]  lat_value
+    input  wire [15:0]  lat_value,
+
+    // histogram readout (D21/D22, csr_block_patch): continuous address out,
+    // registered data in (latency_histogram.v's read lags one cycle)
+    output wire [5:0]   hist_rd_addr,        // -> latency_histogram.v hist_rd_addr
+    input  wire [31:0]  hist_rd_data         // <- latency_histogram.v hist_rd_data
 );
 
     // =====================================================================
@@ -194,7 +215,22 @@ module csr_block #(
     // =====================================================================
     assign cfg_kill_clear    = csr_write_valid & (csr_addr_r == 16'h0000) & csr_data_r[1];
     assign cfg_seq_gap_clear = csr_write_valid & (csr_addr_r == 16'h0000) & csr_data_r[3];
-    wire   counter_clear_pulse = csr_write_valid & (csr_addr_r == 16'h0000) & csr_data_r[2];
+    assign counter_clear_pulse = csr_write_valid & (csr_addr_r == 16'h0000) & csr_data_r[2];
+
+    // =====================================================================
+    // D21/D22 histogram readout address. Driven continuously off csr_addr_r
+    // -- NOT gated on csr_read_valid -- because latency_histogram.v's read
+    // port is registered (one cycle of lag): the address must have been
+    // stable long enough for hist_rd_data to settle before rd32 is ever
+    // evaluated. csr_addr_r is latched at bytes 2-3 of every CSR frame,
+    // at least 12 cycles before csr_complete_d/csr_read_valid fires, which
+    // is ample. (csr_addr_r - 0x138) >> 2 is the bucket index, not a raw
+    // bit-slice: 0x138 is not power-of-two aligned, so csr_addr_r[7:2]
+    // would give bucket 14 for address 0x138 instead of bucket 0. Addresses
+    // below 0x138 underflow this subtraction but nothing reads hist_rd_data
+    // for them, so the garbage index is harmless.
+    // =====================================================================
+    assign hist_rd_addr = (csr_addr_r - 16'h0138) >> 2;
 
     // =====================================================================
     // cfg register storage + write decode (all of S2.3's table; CTRL and
@@ -512,6 +548,13 @@ module csr_block #(
     function [31:0] rd32;
         input [15:0] a;
         begin
+            // 0x138-0x234, 4-byte aligned = latency_histogram.v's 64 buckets
+            // (D21/D22). hist_rd_addr is driven from the same csr_addr_r this
+            // function is keyed on and has been stable for >=12 cycles, so
+            // hist_rd_data is already the right bucket's value here.
+            if ((a >= 16'h0138) && (a <= 16'h0234) && (a[1:0] == 2'd0))
+                rd32 = hist_rd_data;
+            else begin
             case (a)
                 16'h0000: rd32 = {27'd0, cfg_reject_report, 3'b000, cfg_enable};
                 16'h0004: rd32 = {27'd0, status_ml_adv, status_stale,
@@ -594,8 +637,9 @@ module csr_block #(
                 16'h012C: rd32 = lat_min;
                 16'h0130: rd32 = lat_max;
                 16'h0134: rd32 = lat_last;
-                default: rd32 = 32'd0;   // unmapped + reserved histogram range
+                default: rd32 = 32'd0;   // genuinely unmapped addresses only now
             endcase
+            end
         end
     endfunction
 

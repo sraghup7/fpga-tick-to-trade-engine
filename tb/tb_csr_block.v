@@ -45,8 +45,23 @@
 //         no state corruption); a later read still works
 //   C9    market-data-shaped traffic (0x01/0x02/0x03/0xFF) on the shared
 //         stream never fires a CSR write/read and changes nothing
-//   C10   unmapped address (0x200, reserved histogram range): write is a
-//         silent no-op, read returns 0, nothing else disturbed
+//   C10   genuinely unmapped address (0x200): write is a silent no-op, read
+//         returns 0, nothing else disturbed (the 0x138 histogram base now
+//         reads bucket data, see C13/C15)
+//   C11   STATUS bit2 re-latches while `crossed` is held (D20)
+//
+// D21/D22 patch cases (docs/contracts/csr_block_patch.md), tested against a
+// behavioral stand-in for latency_histogram.v's registered read port (the
+// real latency_histogram.v is NOT instantiated here):
+//   C12   counter_clear_pulse is a real output port, one-cycle, matching C2
+//   C13   CSR reads of 0x138-0x234 return the histogram bucket the address
+//         maps to (hist_rd_addr translation + hist_rd_data wiring together)
+//   C14   two back-to-back histogram reads at different addresses each
+//         return their own bucket (catches hist_rd_addr gated on
+//         csr_read_valid instead of driven continuously); a market-data
+//         frame interleaved between the reads does not corrupt the second
+//   C15   boundary addresses: 0x134 (lat_last, below the range) unchanged,
+//         0x238 (above the range) still reads 0 via the default arm
 //
 // On any mismatch a FAIL line names the register/address and expected vs
 // actual; a final PASS/FAIL line summarizes. Verilog-2001 only.
@@ -145,6 +160,9 @@ module tb_csr_block;
     wire [31:0]  cfg_stats_period;
     wire signed [31:0] cfg_ml_th_high, cfg_ml_th_low;
     wire [31:0]  cfg_ml_score_offset, cfg_ml_score_shift, cfg_ml_window;
+    wire         counter_clear_pulse;
+    wire [5:0]   hist_rd_addr;
+    reg  [31:0]  hist_rd_data;
 
     csr_block #(.NUM_SYMBOLS(4)) dut (
         .clk                    (clk),
@@ -238,8 +256,30 @@ module tb_csr_block;
         .ob_tx_payload          (ob_tx_payload),
         .cnt_order_overflow_pulse (cnt_order_overflow_pulse),
         .lat_valid              (lat_valid),
-        .lat_value              (lat_value)
+        .lat_value              (lat_value),
+        .counter_clear_pulse    (counter_clear_pulse),
+        .hist_rd_addr           (hist_rd_addr),
+        .hist_rd_data           (hist_rd_data)
     );
+
+    // ---- behavioral stand-in for latency_histogram.v's registered read
+    //      port (one cycle of lag from hist_rd_addr to hist_rd_data -- the
+    //      same discipline as the resp_busy stand-in: an idealized
+    //      same-cycle model would hide the very timing bug this patch's
+    //      continuous hist_rd_addr drive exists to prevent).
+    reg [31:0] hist_mem_stub [0:63];
+    always @(posedge clk)
+        hist_rd_data <= hist_mem_stub[hist_rd_addr];
+
+    // Capture every 0x22 response for the back-to-back read case (C14).
+    reg [127:0] resp_queue [0:7];
+    integer     resp_n;
+    always @(posedge clk) begin
+        if (resp_start && resp_n < 8) begin
+            resp_queue[resp_n] = resp_payload;
+            resp_n = resp_n + 1;
+        end
+    end
 
     // ---- resp_busy behavioral stand-in: one-cycle lag after resp_start,
     //      like eth_mac_if.v's tx_busy after tx_start (order_builder S2.5
@@ -337,6 +377,34 @@ module tb_csr_block;
         end
     endtask
 
+    // Push one frame's 16 bytes but LEAVE in_valid high, returning right
+    // after byte 15 is set -- so the next push16/end_stream call continues
+    // the byte stream with NO gap between frames (C14's back-to-back case).
+    task push16;
+        input [7:0]  mt;
+        input [15:0] addr;
+        input [31:0] data;
+        reg [127:0] frame;
+        integer i;
+        begin
+            frame = {mt, 8'h00, addr, data, 64'd0};
+            for (i = 0; i < 16; i = i + 1) begin
+                @(negedge clk);
+                in_valid = 1'b1;
+                in_data  = frame[127 - 8*i -: 8];
+            end
+        end
+    endtask
+
+    // Drop in_valid after the final push16 (the last byte still gets one
+    // full cycle of in_valid before this runs).
+    task end_stream;
+        begin
+            @(negedge clk);
+            in_valid = 1'b0;
+        end
+    endtask
+
     // Close the write/read-valid cycle: cfg register writes commit and a
     // read response is presented (resp_start high right after this).
     task settle;
@@ -399,6 +467,7 @@ module tb_csr_block;
             sig_side        = 8'd0;
             ob_tx_payload   = 128'd0;
             resp_force_busy = 1'b0;
+            resp_n          = 0;
             rst_n = 1'b0;
             repeat (3) @(negedge clk);
             rst_n = 1'b1;
@@ -625,12 +694,16 @@ module tb_csr_block;
     endtask
 
     // ===================== driver =====================
-    integer i, j;
+    integer i, j, s_i;
     reg [31:0] rv;
     integer any;
 
     initial begin
         fill_table;
+        // initialize the histogram stand-in with a distinct pattern per
+        // bucket so a wrong bucket index is immediately visible
+        for (s_i = 0; s_i < 64; s_i = s_i + 1)
+            hist_mem_stub[s_i] = 32'hCAFE_0000 | s_i[5:0];
         release_reset;
 
         // ============ C1: T24 register round-trip + defaults + cfg outputs ============
@@ -811,16 +884,23 @@ module tb_csr_block;
         csr_read(16'h0008, rv);
         chk(9001, rv, 32'h00000077);
 
-        // ============ C10: unmapped address (reserved histogram range) ============
+        // ============ C10: genuinely unmapped address (0x300, above the
+        // histogram range) ============
+        // (0x200 used to be "unmapped" only because the whole 0x138-0x234
+        // range read 0; the D21/D22 patch wired that range to live histogram
+        // buckets, so 0x200 now reads bucket 50 -- a genuinely unmapped
+        // address above the range must be used here instead.)
         reset_dut;
         csr_write(16'h0028, 32'h0000_07D0);   // MAX_ORDER_QTY = 2000
-        csr_write(16'h0200, 32'hDEAD_BEEF);   // write to unmapped: silent no-op
-        csr_read(16'h0200, rv);
+        csr_write(16'h0300, 32'hDEAD_BEEF);   // write to unmapped: silent no-op
+        csr_read(16'h0300, rv);
         chk(10000, rv, 32'd0);
         csr_read(16'h0028, rv);
         chk(10001, rv, 32'h0000_07D0);
-        csr_read(16'h0138, rv);               // reserved histogram base reads 0
-        chk(10002, rv, 32'd0);
+        // 0x138 is no longer "reserved": the D21/D22 patch wired it to
+        // histogram bucket 0, so it now reads the stand-in's bucket-0 value
+        csr_read(16'h0138, rv);
+        chk(10002, rv, hist_mem_stub[0]);
 
         // ============ C11 (D20): STATUS bit2 re-asserts across a clear when
         // `crossed` is a persisting LEVEL, not just on a fresh 0->1 edge ============
@@ -840,6 +920,81 @@ module tb_csr_block;
         csr_read(16'h0004, rv);
         if (rv[2] !== 1'b1) begin $display("FAIL: C11 STATUS bit2 dropped on its own with crossed still held: %08x", rv); fail = 1'b1; end
         @(negedge clk); crossed = 4'd0; @(posedge clk); #1;
+
+        // ============ C12 (patch): counter_clear_pulse is a real output port ============
+        reset_dut;
+        csr_frame(8'h20, 16'h0000, 32'h0000_0004);   // CTRL bit2
+        #1;                                          // in the write-valid cycle
+        if (counter_clear_pulse !== 1'b1) begin
+            $display("FAIL: C12 counter_clear_pulse output not high during CTRL.bit2 write");
+            fail = 1'b1;
+        end
+        settle;
+        if (counter_clear_pulse !== 1'b0) begin
+            $display("FAIL: C12 counter_clear_pulse not a one-cycle pulse (still high after settle)");
+            fail = 1'b1;
+        end
+        @(posedge clk); #1;
+        if (counter_clear_pulse !== 1'b0) begin
+            $display("FAIL: C12 counter_clear_pulse lingering");
+            fail = 1'b1;
+        end
+
+        // ============ C13 (patch): histogram readback, exact addresses ============
+        reset_dut;
+        // scattered bucket indices 0,1,31,63 -> 0x138,0x13C,0x1B4,0x234
+        csr_read(16'h0138, rv); chk(13000, rv, hist_mem_stub[0]);
+        csr_read(16'h013C, rv); chk(13001, rv, hist_mem_stub[1]);
+        csr_read(16'h01B4, rv); chk(13002, rv, hist_mem_stub[31]);
+        csr_read(16'h0234, rv); chk(13003, rv, hist_mem_stub[63]);
+        // every 4-byte step through the range maps to its own bucket
+        for (i = 0; i < 64; i = i + 1) begin
+            csr_read(16'h0138 + (i << 2), rv);
+            chk(13100 + i, rv, hist_mem_stub[i]);
+        end
+
+        // ============ C14 (patch): continuous hist_rd_addr, back-to-back reads ============
+        // Two histogram reads at different addresses with NO gap between the
+        // frames: the second response must reflect the second address's own
+        // bucket, not the first's (catches hist_rd_addr gated on csr_read_valid).
+        reset_dut;
+        resp_n = 0;
+        push16(8'h21, 16'h014C, 32'd0);   // bucket 5
+        push16(8'h21, 16'h01D8, 32'd0);   // bucket 40, immediately after
+        end_stream;
+        repeat (10) @(posedge clk);
+        #1;
+        if (resp_n !== 2) begin
+            $display("FAIL: C14 expected 2 responses, got %0d", resp_n);
+            fail = 1'b1;
+        end else begin
+            chk(14000, resp_queue[0][95:64], hist_mem_stub[5]);
+            chk(14001, resp_queue[1][95:64], hist_mem_stub[40]);
+        end
+        // Same again but with a market-data frame interleaved between the two
+        // reads: hist_rd_addr tracking the interleaved frame's address bytes
+        // must not corrupt the second histogram read.
+        reset_dut;
+        resp_n = 0;
+        push16(8'h21, 16'h0188, 32'd0);   // bucket 20
+        push16(8'h01, 16'hFFFF, 32'hA5A5A5A5);   // market-data-shaped frame
+        push16(8'h21, 16'h01D8, 32'd0);   // bucket 40
+        end_stream;
+        repeat (10) @(posedge clk);
+        #1;
+        if (resp_n !== 2) begin
+            $display("FAIL: C14 (interleaved) expected 2 responses, got %0d", resp_n);
+            fail = 1'b1;
+        end else begin
+            chk(14100, resp_queue[0][95:64], hist_mem_stub[20]);
+            chk(14101, resp_queue[1][95:64], hist_mem_stub[40]);
+        end
+
+        // ============ C15 (patch): boundary addresses ============
+        reset_dut;
+        csr_read(16'h0134, rv); chk(15000, rv, 32'd0);   // lat_last, just below range
+        csr_read(16'h0238, rv); chk(15001, rv, 32'd0);   // just above range -> default 0
+        csr_read(16'h0234, rv); chk(15002, rv, hist_mem_stub[63]);   // last bucket still works
 
         if (fail) begin
             $display("FAIL");
