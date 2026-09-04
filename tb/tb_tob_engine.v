@@ -73,6 +73,8 @@ module tb_tob_engine;
     wire        cnt_crossed_pulse;
     wire [127:0] bid_price, bid_qty, ask_price, ask_qty;  // 4 x 32
     wire [3:0]   bid_valid, ask_valid, crossed;
+    wire [31:0]  next_bid_price, next_bid_qty, next_ask_price, next_ask_qty;
+    wire         next_bid_valid, next_ask_valid, next_crossed;
 
     localparam [7:0] QUOTE     = 8'h01;
     localparam [7:0] TRADE     = 8'h02;
@@ -104,7 +106,14 @@ module tb_tob_engine;
         .ask_price            (ask_price),
         .ask_qty              (ask_qty),
         .ask_valid            (ask_valid),
-        .crossed              (crossed)
+        .crossed              (crossed),
+        .next_bid_price       (next_bid_price),
+        .next_bid_qty         (next_bid_qty),
+        .next_bid_valid       (next_bid_valid),
+        .next_ask_price       (next_ask_price),
+        .next_ask_qty         (next_ask_qty),
+        .next_ask_valid       (next_ask_valid),
+        .next_crossed         (next_crossed)
     );
 
     reg     fail = 1'b0;
@@ -112,9 +121,13 @@ module tb_tob_engine;
 
     // Capture the combinational one-cycle verdicts at the posedge that ends
     // each cycle (blocking read sees pre-state-update values -- the message
-    // cycle's own verdicts, same convention as tb_seq_monitor.v).
+    // cycle's own verdicts, same convention as tb_seq_monitor.v). The next_*
+    // outputs are combinational off the applied message + current state, so
+    // they too are captured here at the message cycle's own posedge.
     reg        c_applied, c_bookupd, c_clear, c_trades, c_hb, c_crossed;
     reg [1:0]  c_slot;
+    reg [31:0] c_nbp, c_nbq, c_nap, c_naq;
+    reg        c_nbv, c_nav, c_ncr;
     always @(posedge clk) begin
         c_applied = msg_applied;
         c_bookupd = book_upd_valid;
@@ -123,6 +136,13 @@ module tb_tob_engine;
         c_hb      = cnt_heartbeats_pulse;
         c_crossed = cnt_crossed_pulse;
         c_slot    = applied_slot;
+        c_nbp = next_bid_price;
+        c_nbq = next_bid_qty;
+        c_nbv = next_bid_valid;
+        c_nap = next_ask_price;
+        c_naq = next_ask_qty;
+        c_nav = next_ask_valid;
+        c_ncr = next_crossed;
     end
 
     // Drive one message for exactly one clock cycle. Book state updates at
@@ -212,6 +232,47 @@ module tb_tob_engine;
             if (c_hb      !== e_hb)  begin $display("FAIL: M%0d cnt_heartbeats_pulse=%b, expected %b", tag, c_hb, e_hb); fail = 1'b1; end
             if (c_crossed !== e_cr)  begin $display("FAIL: M%0d cnt_crossed_pulse=%b, expected %b", tag, c_crossed, e_cr); fail = 1'b1; end
             if (e_app && (c_slot !== e_slot)) begin $display("FAIL: M%0d applied_slot=%0d, expected %0d", tag, c_slot, e_slot); fail = 1'b1; end
+        end
+    endtask
+
+    // Compare the last message cycle's next_* (post-update) outputs against
+    // expectations for the applied slot (contract S3.1 -- new in the D23
+    // patch contract). For a book-modifying message these hold the state the
+    // committed buses will read on the NEXT cycle; for TRADE/HEARTBEAT they
+    // equal the pre-existing state; when msg_applied is low they are
+    // don't-care and the caller should not use this task.
+    task expect_next;
+        input integer tag;
+        input [31:0] e_bp, e_bq;
+        input        e_bv;
+        input [31:0] e_ap, e_aq;
+        input        e_av;
+        input        e_cr;
+        begin
+            if (c_nbp !== e_bp) begin $display("FAIL: N%0d next_bid_price=%0d, expected %0d", tag, c_nbp, e_bp); fail = 1'b1; end
+            if (c_nbq !== e_bq) begin $display("FAIL: N%0d next_bid_qty=%0d, expected %0d",   tag, c_nbq, e_bq); fail = 1'b1; end
+            if (c_nbv !== e_bv) begin $display("FAIL: N%0d next_bid_valid=%b, expected %b",   tag, c_nbv, e_bv); fail = 1'b1; end
+            if (c_nap !== e_ap) begin $display("FAIL: N%0d next_ask_price=%0d, expected %0d", tag, c_nap, e_ap); fail = 1'b1; end
+            if (c_naq !== e_aq) begin $display("FAIL: N%0d next_ask_qty=%0d, expected %0d",   tag, c_naq, e_aq); fail = 1'b1; end
+            if (c_nav !== e_av) begin $display("FAIL: N%0d next_ask_valid=%b, expected %b",   tag, c_nav, e_av); fail = 1'b1; end
+            if (c_ncr !== e_cr) begin $display("FAIL: N%0d next_crossed=%b, expected %b",     tag, c_ncr, e_cr); fail = 1'b1; end
+        end
+    endtask
+
+    // Compare the last message cycle's captured next_* against the committed
+    // state read off the bus one cycle later (i.e. after the fire's own
+    // posedge has committed). slot i must have been snapped already.
+    task expect_next_matches_committed;
+        input integer tag;
+        input [1:0] i;
+        begin
+            if (c_nbp !== s_bp) begin $display("FAIL: N%0d next_bid_price=%0d, committed next-cycle=%0d", tag, c_nbp, s_bp); fail = 1'b1; end
+            if (c_nbq !== s_bq) begin $display("FAIL: N%0d next_bid_qty=%0d, committed next-cycle=%0d",   tag, c_nbq, s_bq); fail = 1'b1; end
+            if (c_nbv !== s_bv) begin $display("FAIL: N%0d next_bid_valid=%b, committed next-cycle=%b",   tag, c_nbv, s_bv); fail = 1'b1; end
+            if (c_nap !== s_ap) begin $display("FAIL: N%0d next_ask_price=%0d, committed next-cycle=%0d", tag, c_nap, s_ap); fail = 1'b1; end
+            if (c_naq !== s_aq) begin $display("FAIL: N%0d next_ask_qty=%0d, committed next-cycle=%0d",   tag, c_naq, s_aq); fail = 1'b1; end
+            if (c_nav !== s_av) begin $display("FAIL: N%0d next_ask_valid=%b, committed next-cycle=%b",   tag, c_nav, s_av); fail = 1'b1; end
+            if (c_ncr !== s_cr) begin $display("FAIL: N%0d next_crossed=%b, committed next-cycle=%b",     tag, c_ncr, s_cr); fail = 1'b1; end
         end
     endtask
 
@@ -415,6 +476,83 @@ module tb_tob_engine;
         expect_reset_slot(20, 2'd1);
         expect_reset_slot(20, 2'd2);
         expect_reset_slot(20, 2'd3);
+
+        // ---- N1: next_* on a bid QUOTE (contract S3.1). The book is fully
+        //      reset, so the bid-side next_* come entirely from this message
+        //      while the ask side mirrors its (empty) current state. ----
+        fire(QUOTE, SIDE_BID, 32'd5000, 32'd10, 1'b1, 2'd0, 1'b0);
+        expect_next(1, 32'd5000, 32'd10, 1'b1, 32'd0, 32'd0, 1'b0, 1'b0);
+        snap(2'd0);
+        expect_next_matches_committed(1, 2'd0);
+        expect_slot(1, 32'd5000, 32'd10, 32'd0, 32'd0, 1'b1, 1'b0, 1'b0);
+        end_msg;
+
+        // ---- N2: ask QUOTE lands on the same slot -- bid-side next_* now
+        //      mirror the committed bid state, ask-side comes from the msg. ----
+        fire(QUOTE, SIDE_ASK, 32'd5005, 32'd20, 1'b1, 2'd0, 1'b0);
+        expect_next(2, 32'd5000, 32'd10, 1'b1, 32'd5005, 32'd20, 1'b1, 1'b0);
+        snap(2'd0);
+        expect_next_matches_committed(2, 2'd0);
+        expect_slot(2, 32'd5000, 32'd10, 32'd5005, 32'd20, 1'b1, 1'b1, 1'b0);
+        end_msg;
+
+        // ---- N3: CLEAR -- both next_* valid bits must read 0 on the
+        //      book_upd_valid cycle ITSELF (not one cycle later); prices and
+        //      quantities are preserved (FR-16), so next_* prices still show
+        //      the retained values. ----
+        fire(CLEAR, SIDE_BID, 32'd0, 32'd0, 1'b1, 2'd0, 1'b0);
+        expect_next(3, 32'd5000, 32'd10, 1'b0, 32'd5005, 32'd20, 1'b0, 1'b0);
+        snap(2'd0);
+        expect_next_matches_committed(3, 2'd0);
+        expect_slot(3, 32'd5000, 32'd10, 32'd5005, 32'd20, 1'b0, 1'b0, 1'b0);
+        end_msg;
+
+        // ---- N4: TRADE -- nothing changes (FR-19). next_* must equal the
+        //      pre-existing committed state exactly, NOT the message's own
+        //      bogus price/quantity fields (the trap this case catches is an
+        //      unconditional pass-through of msg_price/msg_quantity). ----
+        fire(TRADE, SIDE_ASK, 32'h0BADF00D, 32'hDEADBEEF, 1'b1, 2'd0, 1'b0);
+        expect_next(4, 32'd5000, 32'd10, 1'b0, 32'd5005, 32'd20, 1'b0, 1'b0);
+        snap(2'd0);
+        expect_next_matches_committed(4, 2'd0);
+        expect_slot(4, 32'd5000, 32'd10, 32'd5005, 32'd20, 1'b0, 1'b0, 1'b0);
+        end_msg;
+
+        // ---- N5: HEARTBEAT -- same no-op contract, different bogus fields. ----
+        fire(HEARTBEAT, SIDE_BID, 32'hF00DCAFE, 32'h12345678, 1'b1, 2'd0, 1'b0);
+        expect_next(5, 32'd5000, 32'd10, 1'b0, 32'd5005, 32'd20, 1'b0, 1'b0);
+        snap(2'd0);
+        expect_next_matches_committed(5, 2'd0);
+        expect_slot(5, 32'd5000, 32'd10, 32'd5005, 32'd20, 1'b0, 1'b0, 1'b0);
+        end_msg;
+
+        // ---- N6: next_crossed -- the ask QUOTE that FIRST makes the slot
+        //      crossed must drive next_crossed=1 on its own cycle. Build bid
+        //      100/5 first (single side: not crossed), then ask 90/8. ----
+        fire(QUOTE, SIDE_BID, 32'd100, 32'd5, 1'b1, 2'd0, 1'b0);
+        expect_next(6, 32'd100, 32'd5, 1'b1, 32'd5005, 32'd20, 1'b0, 1'b0);
+        snap(2'd0);
+        expect_next_matches_committed(6, 2'd0);
+        expect_slot(6, 32'd100, 32'd5, 32'd5005, 32'd20, 1'b1, 1'b0, 1'b0);
+        end_msg;
+        fire(QUOTE, SIDE_ASK, 32'd90, 32'd8, 1'b1, 2'd0, 1'b0);    // bid 100 >= ask 90: crossed
+        expect_next(7, 32'd100, 32'd5, 1'b1, 32'd90, 32'd8, 1'b1, 1'b1);
+        snap(2'd0);
+        expect_next_matches_committed(7, 2'd0);
+        expect_slot(7, 32'd100, 32'd5, 32'd90, 32'd8, 1'b1, 1'b1, 1'b1);
+        end_msg;
+
+        // ---- N7: next_* track the APPLIED slot, not slot 0. While slot 0
+        //      holds a crossed book, a QUOTE applied to empty slot 2 must
+        //      present slot 2's own (empty) next_* -- never slot 0's state. ----
+        fire(QUOTE, SIDE_BID, 32'd200, 32'd2, 1'b1, 2'd2, 1'b0);
+        expect_next(8, 32'd200, 32'd2, 1'b1, 32'd0, 32'd0, 1'b0, 1'b0);
+        snap(2'd2);
+        expect_next_matches_committed(8, 2'd2);
+        expect_slot(8, 32'd200, 32'd2, 32'd0, 32'd0, 1'b1, 1'b0, 1'b0);
+        snap(2'd0);   // slot 0 untouched
+        expect_slot(8, 32'd100, 32'd5, 32'd90, 32'd8, 1'b1, 1'b1, 1'b1);
+        end_msg;
 
         if (fail) begin
             $display("FAIL");

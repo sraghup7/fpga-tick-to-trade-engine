@@ -973,6 +973,129 @@ here so they aren't forgotten before S10.
 
 ---
 
+## D23 — `signal_engine.v` read `tob_engine.v`'s book bus one message stale; the trigger for the biggest cross-module finding of this project
+
+**Status: found while independently verifying `tob_top.v`'s delivered
+implementation (S10), fixed and independently re-verified.** The single
+most consequential finding of this session — bigger in impact than D17,
+because it's in the core trading decision, not a diagnostic or CSR nuance.
+Fix delivered against `docs/contracts/tob_engine_signal_patch.md`,
+re-verified directly: recompiled/reran all three required testbenches
+(`tb_tob_engine.v`, `tb_signal_engine.v`, the new `tb_signal_tob_chain.v`)
+myself, read both diffs (clean — `tob_engine.v`'s seven new ports are pure
+`assign`s of already-computed wires; `signal_engine.v`'s change is
+contained to the seven `s_*` alias lines, everything downstream
+byte-identical), and reproduced the original bug myself as a mutation
+(reverted `tob_engine.v`'s `next_*` assigns to source from the *current*
+state instead of `nb_*`/`addr_crossed_next`) — the new chain testbench
+caught it immediately and specifically at the exact headline case (a bid
+QUOTE then an ask QUOTE failing to fire), confirming both the fix and the
+new regression's power to catch a regression of this exact bug in the
+future. Restored and reconfirmed `PASS` afterward.
+
+**The bug.** `signal_engine.v`'s own header comment states it reads
+"the tob_engine.v state buses (POST-update state of the applied slot)"
+gated on `book_upd_valid`. It does not. `tob_engine.v`'s `bid_price`/
+`ask_price`/`bid_qty`/`ask_qty`/`bid_valid`/`ask_valid` outputs are wired
+only to registered state (`assign bid_price = bid_price_r;`), and
+`book_upd_valid` is combinational, firing the *same* cycle the triggering
+message arrives. In synchronous Verilog, a register written with `<=` on a
+clock edge is not visible to another module reading it *on that same
+edge* — the new value is only visible starting the next cycle. So
+`signal_engine.v` evaluates `buy_ok`/`sell_ok` against the book as it
+stood **before** the triggering message's own effect, not after.
+
+**Verified two ways before concluding anything, per this project's own
+standing rule:**
+
+1. **Against `sim/golden_model.py`**, the authority this whole project is
+   bit-exact-verified against: `process_message` updates `book.bid_price`/
+   `book.ask_price`/etc. *first*, then evaluates `buy_ok`/`sell_ok` in the
+   same function call, using the just-updated state. The golden model's
+   semantics require post-update evaluation; the RTL delivers pre-update.
+2. **Empirically, in isolation** — a standalone testbench chaining only
+   `tob_engine.v` + `signal_engine.v` (no other module in the loop), fed a
+   bid QUOTE then an ask QUOTE that together satisfy every `buy_ok`
+   condition (spread 5 ≥ min 2, `bid_qty` 100 > `ask_qty`≪1). `sig_valid`
+   never fired from those two messages alone — only a third, redundant
+   re-quote triggered it, confirming the one-message lag directly.
+
+**Why neither module's own testbench caught this.** Every module in this
+project is tested standalone with hand-driven stimulus
+(`docs/contracts/*.md` §3 sections, uniformly). `tb_signal_engine.v` drives
+`bid_price`/`ask_price`/`book_upd_valid` as independent stimulus — the
+test-writer naturally sets up "the book already looks like X, *then* pulse
+`book_upd_valid`," which is exactly the shape that makes the bug invisible
+in isolation. Only chaining the two real modules together — which
+`tob_top.v` is the first thing in this project to actually do — could
+surface it. This is the precise justification for `docs/contracts/tob_top.md`
+§3's own connectivity-testing requirement, now doubly confirmed: **wiring
+mistakes and cross-module *timing* mistakes are a different bug class from
+anything a standalone unit test can find.**
+
+**How `tob_top.v`'s implementer (DeepSeek) actually encountered this and
+what they did with it, for the record:** they found the identical
+behavior, described it accurately in their own delivery report ("signal_engine
+reads the book bus on the book_upd_valid cycle, and tob_engine commits
+each QUOTE at the end of that cycle"), and worked around it in
+`tb_tob_top.v`'s T1 case by sequencing a bid, an ask, and a redundant
+re-quote before expecting a signal. That workaround is accurate
+engineering observation, correctly reported — but it papers over a real
+defect rather than fixing it, and would very likely make `tb/tb_top.v`'s
+eventual T26 byte-for-byte soak against `sim/golden_model.py` fail once
+built, since the golden model does not need three messages where the RTL
+does. Not a criticism of the implementation work itself — DeepSeek was not
+asked to modify already-committed S3/S5 modules as part of a wiring-only
+S10 contract, and flagging rather than silently "fixing" an out-of-scope
+defect was the right call within that contract's boundaries. The fix
+belongs in a dedicated patch contract instead — see
+`docs/contracts/tob_engine_signal_patch.md`.
+
+**The fix, in outline (full detail in the patch contract):**
+`tob_engine.v` already computes the post-update ("next") state of the
+applied slot combinationally, internally, for its own crossed-detection
+purposes (`nb_bp`/`nb_bq`/`nb_bv`/`nb_ap`/`nb_aq`/`nb_av`,
+`addr_crossed_next`) — it just never exposes them. The fix adds seven new
+output ports carrying exactly those already-computed wires, and rewires
+`signal_engine.v` to read them directly instead of indexing the registered,
+per-symbol flattened bus by `applied_slot`. This is lower-risk and smaller-
+blast-radius than the alternative (adding a pipeline stage inside
+`signal_engine.v` to wait for the registered state to catch up), which
+would change its latency and break the "exactly two registered cycles
+from `md_parser`'s `msg_valid` to `risk_engine`'s `order_valid`" invariant
+`order_builder.v`'s own `seq_d0`/`seq_d1` pipeline depends on
+(`docs/contracts/order_builder.md` §2.2).
+
+**Everything downstream of `signal_engine.v` is unaffected — confirmed,
+not assumed.** `risk_engine.v` reads `tob_engine.v`'s `crossed`/`bid_price`/
+`ask_price` buses at `sig_slot`, which is `signal_engine.v`'s own
+*registered* `applied_slot`, landing at least one full cycle after
+`book_upd_valid`. By then the triggering message's register write has
+already committed, so `risk_engine.v` sees genuinely post-update state.
+The bug is narrowly scoped to whatever reads `tob_engine.v`'s bus
+*combinationally, on `book_upd_valid`'s own cycle* — currently only
+`signal_engine.v`.
+
+**A second module has the identical latent defect, not yet exercised:**
+`feature_extractor.v`'s own header comment makes the exact same false
+claim ("post-update state") about the exact same bus, gated the same way
+on `book_upd_valid`. It is not wired into anything yet (S6 is blocked on
+S4), so this isn't currently observable, but it will reproduce this same
+bug the moment S6 wires it in. Flagged here, **not fixed as part of this
+patch** (no current consumer, out of scope) — whoever writes S6's
+integration contract needs to read this entry first and wire
+`feature_extractor.v` to the same new `tob_engine.v` "next" ports this
+patch adds, not the stale registered bus.
+
+**Consequence for the not-yet-committed `tob_top.v`:** its current
+delivered `rtl/tob_top.v` wires `signal_engine.v`'s *old* port list (the
+flattened bus). Once this patch changes that port list, `tob_top.v` needs
+a small follow-up edit to its `u_sig` instantiation — and its own T1 test
+case should be simplified to drop the re-quote workaround once the fix is
+verified, since two messages (not three) should then suffice.
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |

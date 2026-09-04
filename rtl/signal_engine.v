@@ -8,9 +8,12 @@
 // justifies a buy or sell order intent, using only comparisons, subtraction,
 // and shifts (FR-39 -- no multiplier, no DSP on this path).
 //
-// The decision reads the tob_engine.v state buses (POST-update state of the
-// applied slot) and is gated on book_upd_valid (FR-40: evaluated only on
-// book-modifying messages, not on a timer):
+// The decision reads tob_engine.v's post-update ("next") state of the
+// applied slot -- combinational scalar outputs carrying what the committed
+// buses will read on the next cycle (D23: the registered book bus, read on
+// book_upd_valid's own cycle, would be one message stale) -- and is gated
+// on book_upd_valid (FR-40: evaluated only on book-modifying messages, not
+// on a timer):
 //
 //   buy_ok  = bid_valid & ask_valid & ~crossed
 //             & (ask_price - bid_price) >= cfg_min_spread
@@ -68,23 +71,23 @@
 //
 // Verilog-2001 only.
 
-module signal_engine #(
-    parameter integer NUM_SYMBOLS = 4   // matches tob_engine.v
-) (
+module signal_engine (
     input  wire        clk,
     input  wire        rst_n,   // active-low, async-assert/sync-deassert
 
-    // from tob_engine.v -- post-update state of the applied slot
-    // (docs/contracts/tob_engine.md), gated on book_upd_valid (FR-40)
+    // from tob_engine.v -- POST-update state of the applied slot,
+    // combinational on the message's own cycle (D23: not the registered,
+    // per-slot bus, which would be one message stale), gated on
+    // book_upd_valid (FR-40)
     input  wire                       book_upd_valid,
     input  wire [1:0]                 applied_slot,
-    input  wire [NUM_SYMBOLS*32-1:0]  bid_price,
-    input  wire [NUM_SYMBOLS*32-1:0]  bid_qty,
-    input  wire [NUM_SYMBOLS-1:0]     bid_valid,
-    input  wire [NUM_SYMBOLS*32-1:0]  ask_price,
-    input  wire [NUM_SYMBOLS*32-1:0]  ask_qty,
-    input  wire [NUM_SYMBOLS-1:0]     ask_valid,
-    input  wire [NUM_SYMBOLS-1:0]     crossed,
+    input  wire [31:0]                next_bid_price,
+    input  wire [31:0]                next_bid_qty,
+    input  wire                       next_bid_valid,
+    input  wire [31:0]                next_ask_price,
+    input  wire [31:0]                next_ask_qty,
+    input  wire                       next_ask_valid,
+    input  wire                       next_crossed,
 
     // config (S9 CSR map), direct ports standing in for csr_block.v
     input  wire [31:0] cfg_min_spread,
@@ -105,14 +108,15 @@ module signal_engine #(
     localparam [7:0] SIDE_BID = 8'h00;   // buy at the ask (wire format)
     localparam [7:0] SIDE_ASK = 8'h01;   // sell at the bid
 
-    // ---- applied slot's post-update state ----
-    wire [31:0] s_bp = bid_price [applied_slot*32 +: 32];
-    wire [31:0] s_bq = bid_qty   [applied_slot*32 +: 32];
-    wire        s_bv = bid_valid [applied_slot];
-    wire [31:0] s_ap = ask_price [applied_slot*32 +: 32];
-    wire [31:0] s_aq = ask_qty   [applied_slot*32 +: 32];
-    wire        s_av = ask_valid [applied_slot];
-    wire        s_cr = crossed   [applied_slot];
+    // ---- applied slot's post-update state (D23: direct scalar ports from
+    //      tob_engine.v, not an indexed slice of the registered book bus) ----
+    wire [31:0] s_bp = next_bid_price;
+    wire [31:0] s_bq = next_bid_qty;
+    wire        s_bv = next_bid_valid;
+    wire [31:0] s_ap = next_ask_price;
+    wire [31:0] s_aq = next_ask_qty;
+    wire        s_av = next_ask_valid;
+    wire        s_cr = next_crossed;
 
     // ---- D15 (S2.4): wide-precision imbalance shift. Zero-extend each qty
     //      by cfg_imb_shift's maximum width (3 bits -- IMB_SHIFT is 0-3)

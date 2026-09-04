@@ -92,8 +92,11 @@ run_tb tb_tob_engine rtl/tob_engine.v
 run_tb tb_feature_extractor rtl/feature_extractor.v
 run_tb tb_feature_normalizer rtl/feature_normalizer.v
 run_tb tb_signal_engine rtl/signal_engine.v
+run_tb tb_signal_tob_chain rtl/tob_engine.v rtl/signal_engine.v
 run_tb tb_risk_engine rtl/risk_engine.v
 run_tb tb_order_builder rtl/order_builder.v
+run_tb tb_csr_block rtl/csr_block.v
+run_tb tb_latency_histogram rtl/latency_histogram.v
 
 if [ "${RUN_SIM_FAST:-0}" != "1" ]; then
     echo

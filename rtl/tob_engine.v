@@ -102,7 +102,24 @@ module tob_engine #(
     output wire [NUM_SYMBOLS*32-1:0] ask_price,
     output wire [NUM_SYMBOLS*32-1:0] ask_qty,
     output wire [NUM_SYMBOLS-1:0]    ask_valid,
-    output wire [NUM_SYMBOLS-1:0]    crossed
+    output wire [NUM_SYMBOLS-1:0]    crossed,
+
+    // post-update ("next") state of the APPLIED slot -- combinational,
+    // valid on the message's own cycle whenever msg_applied is high, i.e.
+    // the state the committed buses will read on the NEXT cycle (D23:
+    // consumers gated on book_upd_valid must read these, NOT the registered
+    // buses below, which only reflect the book as it stood before the
+    // triggering message's own effect). For TRADE/HEARTBEAT, where nothing
+    // changes, these equal the current committed state by construction; a
+    // consumer should gate on book_upd_valid (or msg_applied) before reading
+    // them, exactly as it already gates on the committed buses.
+    output wire [31:0] next_bid_price,
+    output wire [31:0] next_bid_qty,
+    output wire         next_bid_valid,
+    output wire [31:0] next_ask_price,
+    output wire [31:0] next_ask_qty,
+    output wire         next_ask_valid,
+    output wire         next_crossed
 );
 
     localparam [7:0] MSG_QUOTE     = 8'h01;
@@ -181,6 +198,17 @@ module tob_engine #(
     // the clock edge).
     wire addr_crossed_next = nb_bv & nb_av & (nb_bp >= nb_ap);
     assign cnt_crossed_pulse = msg_applied & addr_crossed_next;
+
+    // D23: expose the applied slot's post-update state to cycle-gated
+    // consumers (signal_engine.v) -- plain assigns of the wires already
+    // computed above, zero new logic.
+    assign next_bid_price = nb_bp;
+    assign next_bid_qty   = nb_bq;
+    assign next_bid_valid = nb_bv;
+    assign next_ask_price = nb_ap;
+    assign next_ask_qty   = nb_aq;
+    assign next_ask_valid = nb_av;
+    assign next_crossed   = addr_crossed_next;
 
     // ---- committed state latch ----
     always @(posedge clk or negedge rst_n) begin

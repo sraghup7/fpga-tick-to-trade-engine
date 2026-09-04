@@ -11,9 +11,14 @@
 // cycle's book-state inputs whenever book_upd_valid is high and registers the
 // order intent (sig_*) one cycle later (S2.3). err_signal_conflict is a
 // one-cycle combinational pulse, valid on the book_upd_valid cycle itself.
-// Book-state buses are driven directly to the slot's post-update values --
-// the same convention tb_feature_extractor.v uses: this module only reads the
-// buses it is given and never reconstructs tob_engine.v's update.
+//
+// DUT interface (docs/contracts/tob_engine_signal_patch.md S2.2): the
+// per-symbol flattened bus is gone; signal_engine reads the applied slot's
+// POST-update state from seven scalar next_* inputs (tob_engine.v's new
+// combinational outputs). The testbench therefore drives those scalars
+// directly -- whichever slot is currently applied, that is the state
+// presented. applied_slot remains an independent input (needed for
+// sig_slot), decoupled from the state values themselves.
 //
 // Clocking (same shape as tb_feature_extractor.v's `ev`): each `cycle` drives
 // the book inputs from a negedge for exactly one clock, drops book_upd_valid
@@ -58,8 +63,13 @@ module tb_signal_engine;
     reg        rst_n = 1'b0;
     reg        book_upd_valid = 1'b0;
     reg [1:0]  applied_slot = 2'd0;
-    reg [127:0] b_bid_price, b_bid_qty, b_ask_price, b_ask_qty;
-    reg [3:0]  b_bid_valid, b_ask_valid, b_crossed;
+    reg [31:0] n_bp = 32'd0;   // next_* scalars: post-update state of the
+    reg [31:0] n_bq = 32'd0;   // currently-applied slot
+    reg        n_bv = 1'b0;
+    reg [31:0] n_ap = 32'd0;
+    reg [31:0] n_aq = 32'd0;
+    reg        n_av = 1'b0;
+    reg        n_cr = 1'b0;
     reg [31:0] cfg_min_spread = 32'd2;   // S9 CSR defaults
     reg [1:0]  cfg_imb_shift  = 2'd1;
     reg [31:0] cfg_order_qty  = 32'd100;
@@ -80,13 +90,13 @@ module tb_signal_engine;
         .rst_n              (rst_n),
         .book_upd_valid     (book_upd_valid),
         .applied_slot       (applied_slot),
-        .bid_price          (b_bid_price),
-        .bid_qty            (b_bid_qty),
-        .bid_valid          (b_bid_valid),
-        .ask_price          (b_ask_price),
-        .ask_qty            (b_ask_qty),
-        .ask_valid          (b_ask_valid),
-        .crossed            (b_crossed),
+        .next_bid_price     (n_bp),
+        .next_bid_qty       (n_bq),
+        .next_bid_valid     (n_bv),
+        .next_ask_price     (n_ap),
+        .next_ask_qty       (n_aq),
+        .next_ask_valid     (n_av),
+        .next_crossed       (n_cr),
         .cfg_min_spread     (cfg_min_spread),
         .cfg_imb_shift      (cfg_imb_shift),
         .cfg_order_qty      (cfg_order_qty),
@@ -97,28 +107,6 @@ module tb_signal_engine;
         .sig_qty            (sig_qty),
         .err_signal_conflict (err_signal_conflict)
     );
-
-    // ---- per-slot book model (what we drive onto the buses) ----
-    reg [31:0] mbp [0:3];
-    reg [31:0] mbq [0:3];
-    reg [31:0] map [0:3];
-    reg [31:0] maq [0:3];
-    reg        m_bv [0:3];
-    reg        m_av [0:3];
-    reg        m_cr [0:3];
-    integer k;
-
-    task drive_bus;
-        begin
-            b_bid_price = {mbp[3], mbp[2], mbp[1], mbp[0]};
-            b_bid_qty   = {mbq[3], mbq[2], mbq[1], mbq[0]};
-            b_ask_price = {map[3], map[2], map[1], map[0]};
-            b_ask_qty   = {maq[3], maq[2], maq[1], maq[0]};
-            b_bid_valid = {m_bv[3], m_bv[2], m_bv[1], m_bv[0]};
-            b_ask_valid = {m_av[3], m_av[2], m_av[1], m_av[0]};
-            b_crossed   = {m_cr[3], m_cr[2], m_cr[1], m_cr[0]};
-        end
-    endtask
 
     // Capture the registered sig_* at each posedge (pre-edge), so the sample
     // taken at the idle posedge after a driven cycle holds that cycle's
@@ -139,8 +127,8 @@ module tb_signal_engine;
         c_qty   = sig_qty;
     end
 
-    // Assert + release reset, clear the book model, restore config defaults,
-    // align to a clean edge.
+    // Assert + release reset, clear the book-state scalars, restore config
+    // defaults, align to a clean edge.
     task do_reset;
         begin
             @(negedge clk);
@@ -149,12 +137,8 @@ module tb_signal_engine;
             @(negedge clk);
             @(negedge clk);
             rst_n = 1'b1;
-            for (k = 0; k < 4; k = k + 1) begin
-                mbp[k] = 32'd0; mbq[k] = 32'd0;
-                map[k] = 32'd0; maq[k] = 32'd0;
-                m_bv[k] = 1'b0; m_av[k] = 1'b0; m_cr[k] = 1'b0;
-            end
-            drive_bus;
+            n_bp = 32'd0; n_bq = 32'd0; n_bv = 1'b0;
+            n_ap = 32'd0; n_aq = 32'd0; n_av = 1'b0; n_cr = 1'b0;
             cfg_min_spread = 32'd2;
             cfg_imb_shift  = 2'd1;
             cfg_order_qty  = 32'd100;
@@ -164,7 +148,7 @@ module tb_signal_engine;
     endtask
 
     // Drive one book_upd_valid cycle for `slot` with the given post-update
-    // slot state (buv selects whether it is a book-modifying cycle at all).
+    // scalar state (buv selects whether it is a book-modifying cycle at all).
     // On return, c_* holds the registered verdict of that cycle (sampled at
     // the idle posedge) and c_err holds that cycle's combinational conflict.
     task cycle;
@@ -175,10 +159,8 @@ module tb_signal_engine;
         input [31:0] ap, aq;
         input        av, cr;
         begin
-            mbp[slot] = bp; mbq[slot] = bq;
-            map[slot] = ap; maq[slot] = aq;
-            m_bv[slot] = bv; m_av[slot] = av; m_cr[slot] = cr;
-            drive_bus;
+            n_bp = bp; n_bq = bq; n_bv = bv;
+            n_ap = ap; n_aq = aq; n_av = av; n_cr = cr;
             @(negedge clk);             // N0: present the event
             book_upd_valid = buv;
             applied_slot   = slot;
@@ -228,21 +210,16 @@ module tb_signal_engine;
         @(negedge clk);
         book_upd_valid = 1'b1;
         applied_slot   = 2'd0;
-        mbp[0] = 32'd100; mbq[0] = 32'd100; m_bv[0] = 1'b1;
-        map[0] = 32'd102; maq[0] = 32'd1;   m_av[0] = 1'b1; m_cr[0] = 1'b0;
-        drive_bus;
+        n_bp = 32'd100; n_bq = 32'd100; n_bv = 1'b1;
+        n_ap = 32'd102; n_aq = 32'd1;   n_av = 1'b1; n_cr = 1'b0;
         repeat (2) @(posedge clk);      // reset still low: nothing may latch
         @(negedge clk);
         book_upd_valid = 1'b0;          // benign inputs before release
         rst_n = 1'b1;
         @(posedge clk);
         #1;
-        for (k = 0; k < 4; k = k + 1) begin
-            mbp[k] = 32'd0; mbq[k] = 32'd0;
-            map[k] = 32'd0; maq[k] = 32'd0;
-            m_bv[k] = 1'b0; m_av[k] = 1'b0; m_cr[k] = 1'b0;
-        end
-        drive_bus;
+        n_bp = 32'd0; n_bq = 32'd0; n_bv = 1'b0;
+        n_ap = 32'd0; n_aq = 32'd0; n_av = 1'b0; n_cr = 1'b0;
         @(posedge clk);
         #1;
         if (sig_valid || err_signal_conflict) begin
@@ -313,9 +290,8 @@ module tb_signal_engine;
         //      internal wires is the ONLY way to exercise it. This tests the
         //      defensive logic in isolation; it is not a realistic stimulus.
         @(negedge clk);
-        mbp[0] = 32'd100; mbq[0] = 32'd100; m_bv[0] = 1'b1;
-        map[0] = 32'd102; maq[0] = 32'd1;   m_av[0] = 1'b1; m_cr[0] = 1'b0;
-        drive_bus;
+        n_bp = 32'd100; n_bq = 32'd100; n_bv = 1'b1;
+        n_ap = 32'd102; n_aq = 32'd1;   n_av = 1'b1; n_cr = 1'b0;
         @(negedge clk);
         book_upd_valid = 1'b1;
         applied_slot   = 2'd0;
@@ -341,7 +317,10 @@ module tb_signal_engine;
         cycle(2'd0, 1'b0, 32'd100, 32'd100, 1'b1, 32'd102, 32'd1, 1'b1, 1'b0);
         check(19, 1'b0, 2'd0, SIDE_BID, 32'd0, 32'd0, 1'b0);
 
-        // ---- I: independent slots, interleaved buy/sell events. ----
+        // ---- I: independent slots, interleaved buy/sell events. The state
+        //      scalars are whatever the currently-applied slot presents, so
+        //      this now just verifies sig_slot/sig_side follow the applied
+        //      slot each cycle. ----
         cycle(2'd2, 1'b1, 32'd200, 32'd60, 1'b1, 32'd205, 32'd1, 1'b1, 1'b0);   // buy on slot 2
         check(20, 1'b1, 2'd2, SIDE_BID, 32'd205, 32'd100, 1'b0);
         cycle(2'd3, 1'b1, 32'd300, 32'd1, 1'b1, 32'd302, 32'd40, 1'b1, 1'b0);   // sell on slot 3
