@@ -26,7 +26,10 @@ jobs:
             echo "No RTL yet — nothing to lint."
             exit 0
           fi
-          iverilog -g2001 -Wall -o /tmp/lint.vvp "${files[@]}"
+          # tob_top.v instantiates mac_top/util_gmii_to_rgmii (vendor RTL with
+          # Xilinx primitives, not compiled here) -- sub in the behavioral sim
+          # leaves so it still elaborates, matching scripts/run_sim.sh's lint step.
+          iverilog -g2001 -Wall -o /tmp/lint.vvp "${files[@]}" tb/sim_models/tob_top_sim_leaves.v
 
   golden-model-sim:
     runs-on: ubuntu-latest

@@ -92,7 +92,7 @@ module mac_top (
     input                udp_tx_req,
     input                arp_request_req,
     output               mac_data_valid,
-    output               mac_send_end,
+    output reg            mac_send_end,
     output [7:0]         mac_tx_data,
     input                rx_dv,
     input  [7:0]         mac_rx_datain,
@@ -141,7 +141,6 @@ module mac_top (
     reg [7:0] tx_ram [0:15];
     reg [4:0] tx_wr_cnt;
     reg       tx_run;
-    reg       mac_send_end;
     integer   tx_frame_cnt;
 
     always @(posedge gmii_rx_clk or negedge rst_n) begin
