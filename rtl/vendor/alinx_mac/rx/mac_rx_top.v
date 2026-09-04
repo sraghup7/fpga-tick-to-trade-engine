@@ -55,7 +55,10 @@ wire [31:0]      				ip_rec_source_ip_addr ;
        
 wire                    ip_addr_check_error  ;
 wire                    ip_checksum_error ;
-wire                    udp_checksum_error ;
+// udp_checksum_error: no separate wire decl -- it's already an ANSI output
+// port above (D5 patch); a leftover explicit `wire` here duplicate-declares
+// the same net, which some iverilog builds accept and others (correctly,
+// per LRM) reject as an error.
 
 wire [47:0]             mac_rx_destination_mac_addr ;
 wire [47:0]				mac_rx_source_mac_addr ;
