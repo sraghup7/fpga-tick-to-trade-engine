@@ -30,6 +30,7 @@ from golden_model import (
     GATE_BAND,
     GATE_KILL,
     GATE_SEQGAP,
+    GATE_STALE,
     FLAG_SNAPSHOT,
     Config,
     GoldenModel,
@@ -329,6 +330,80 @@ check(
     + m.counters["err_msg_type"]
     + m.counters["err_flags"],
 )
+
+# ============================================================================
+# D16 regression: gate 0x09's ml_action=1 (reduce) path. Separate model
+# instance/config (ml_action=1, ml_reduce_shift=1) -- not part of the
+# 25-message default-config narrative above. Before D16, `position` was
+# updated by the pre-reduction order_qty (100) even though the emitted
+# order and the ledger disagreed about how many shares actually traded;
+# fixed to use reduced_qty (order_qty >> ml_reduce_shift = 50) for the
+# position update specifically, while gate 0x03's own admission check still
+# uses the unreduced order_qty (FR-48: ML reduction is gate 0x09's own
+# action, independent of gates 0x01-0x08's evaluation -- this is
+# deliberately NOT "fixed" to also use reduced_qty).
+m2 = GoldenModel(Config(cfg_reject_report=True, ml_action=1, ml_reduce_shift=1))
+
+# n1: seq=1 QUOTE bid 1000/50 sym1 -> book1 bid=1000/50, ask invalid, no signal.
+m2.process_message(msg(1, 1, MSG_QUOTE, SIDE_BID, price=1000, qty=50))
+
+# n2: seq=2 QUOTE ask 1010/10 sym1, adverse_risk=True.
+#     book1: bid=1000/50, ask=1010/10. spread=10>=2. bid_qty(50)>ask_qty(10)<<1=20
+#     -> BUY. price=ask=1010, order_qty=100(cfg.order_qty).
+#     gates 0x01-0x08: none fire (kill=F, size 100<=500, position
+#       0+100=100<=1000 [checked against UNREDUCED 100, not 50], band
+#       mid=(1000+1010)>>1=1005 |1010-1005|=5<=50, stale ok, seqgap F,
+#       crossed F, throttle token 8>0). ml_action=1 -> reduced_qty =
+#       100>>1 = 50, GATE_ML does NOT fire (reduce, not block).
+#     -> ACCEPTED. Reported order.quantity = 50 (reduced). Position update
+#     uses the REDUCED signed qty (D16): position1 = 0 + 50 = 50, not 100.
+r = m2.process_message(msg(2, 1, MSG_QUOTE, SIDE_ASK, price=1010, qty=10), adverse_risk=True)
+check("n2 order.quantity (reduced)", r.order.quantity, 50)
+check("n2 order.reject_reason (accepted)", r.order.reject_reason, 0x00)
+check("n2 position1 (D16: reduced, not 100)", m2.position[1], 50)
+check("n2 cnt_ml_adverse", m2.counters["cnt_ml_adverse"], 1)
+check("n2 cnt_rej_ml (reduce, not a reject)", m2.counters["cnt_rej_ml"], 0)
+
+# ============================================================================
+# D17 regression: gate 0x05 (staleness) was UNREACHABLE via any normal
+# message flow before this fix. book.last_update_cycle was overwritten to
+# self.current_cycle at the top of every book-modifying message's
+# processing, BEFORE the staleness check ran later in that same call --
+# so "current_cycle - book.last_update_cycle" was always comparing a
+# just-refreshed timestamp against itself (always 0), and GATE_STALE could
+# never fire for any book-modifying message, ever, regardless of how long
+# the symbol had actually been silent. T18_gate_stale (a REQUIRED S7 gate
+# test) could not have passed against the unfixed model. Fixed by capturing
+# `prev_update_cycle` BEFORE the message's own refresh, and checking THAT
+# (not the just-overwritten book.last_update_cycle) against max_age.
+# Separate model instance, small max_age=50 to make the arithmetic legible.
+m3 = GoldenModel(Config(cfg_reject_report=True, max_age=50))
+
+# n3: seq=1 QUOTE bid 1000/50 sym1 @ cycle 10 -> bid valid, ask invalid,
+#     no signal (ask side still invalid). last_update_cycle1 = 10.
+r = m3.process_message(msg(1, 1, MSG_QUOTE, SIDE_BID, price=1000, qty=50), arrival_cycle=10)
+check("n3 signal", r.signal_fired, None)
+
+# n4: seq=2 QUOTE ask 1010/10 sym1 @ cycle 20. book1: bid=1000/50,
+#     ask=1010/10. spread=10>=2. bid_qty(50)>ask_qty(10)<<1=20 -> BUY.
+#     gap since n3's touch = 20-10=10, not > max_age(50) -> STALE not fired.
+#     -> ACCEPTED. last_update_cycle1 becomes 20.
+r = m3.process_message(msg(2, 1, MSG_QUOTE, SIDE_ASK, price=1010, qty=10), arrival_cycle=20)
+check("n4 order.reject_reason (fresh, accepted)", r.order.reject_reason, 0x00)
+
+# n5 ("silence past MAX_AGE"): seq=3, same QUOTE resent @ cycle 1000 --
+#     980 cycles since n4's touch (20), far past max_age=50. GATE_STALE
+#     fires (D17: this is the case that was unreachable before the fix).
+#     last_update_cycle1 becomes 1000 regardless of the reject (the
+#     timestamp always refreshes on a book-modifying touch, per FR-19).
+r = m3.process_message(msg(3, 1, MSG_QUOTE, SIDE_ASK, price=1010, qty=10), arrival_cycle=1000)
+check("n5 order.reject_reason (D17: STALE)", r.order.reject_reason, GATE_STALE)
+
+# n6 ("then fresh update"): seq=4, same QUOTE again @ cycle 1010 -- only 10
+#     cycles since n5's touch (1000), not > max_age(50) -> accepted again,
+#     confirming the block clears once the book is genuinely fresh.
+r = m3.process_message(msg(4, 1, MSG_QUOTE, SIDE_ASK, price=1010, qty=10), arrival_cycle=1010)
+check("n6 order.reject_reason (fresh again, accepted)", r.order.reject_reason, 0x00)
 
 if failures:
     print(f"FAIL ({len(failures)} mismatch(es)):")

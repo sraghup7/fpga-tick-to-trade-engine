@@ -637,6 +637,102 @@ contract-writing process surfaced, same as D11-D14.
 
 ---
 
+## D16 — Golden model: position tracking must use the reduced quantity, not the pre-reduction one
+
+**Status: applied**, `sim/golden_model.py`. **Decision:** the position
+ledger update on an accepted order now uses `reduced_qty`'s signed value
+(`+reduced_qty` for a buy, `-reduced_qty` for a sell), not the unreduced
+`order_qty`'s signed value the gate-`0x03` admission check used.
+
+**Why.** Found while designing `risk_engine.v`'s position-tracking
+interface for S7. Verified empirically (not just reasoned about) before
+writing this entry: with `cfg_ml_action=1` (reduce) and `cfg_ml_reduce_shift=1`,
+an accepted order correctly *reported* `quantity=50` (half of
+`cfg.order_qty=100`) in its `OrderRecord`, but the internal `position`
+ledger incremented by the full, unreduced `100` — the risk engine's own
+exposure tracking disagreed with what it had just told the world it traded.
+`sim/test_golden_model_handcase.py`'s original 25 messages never exercised
+`cfg_ml_action=1` at all (the default config leaves it at `0`, block), so
+this went uncaught the same way D14 did — added as a dedicated regression
+case (`n1`/`n2`) at the end of that file, using a separately-configured
+`GoldenModel` instance.
+
+**What deliberately did NOT change:** gate `0x03`'s own admission check
+(`abs(position + signed_qty) > cfg.max_position`) still uses the
+*unreduced* `order_qty` — per FR-48, "the ML verdict is advisory to the
+risk engine, not a substitute for gates 0x01-0x08," read as: gates 0x01-0x08
+evaluate the order as originally sized, and gate 0x09's reduction is an
+independent action layered on top, not something that retroactively changes
+what the other eight gates saw. Only the *final ledger update*, which
+should reflect what actually got sent, needed fixing.
+
+**Consequence for `risk_engine.v`:** its own position-update logic must use
+whatever quantity actually gets reported for the order (the ML-reduced one
+when that path applies), not the pre-reduction `sig_qty` gate 0x03's own
+check reads. See `docs/contracts/risk_engine.md` §2.6 for the exact wording
+handed to the implementer.
+
+Not a resolution of a numbered §17 open question — new information the S7
+contract-writing process surfaced, same as D12-D15.
+
+---
+
+## D17 — Golden model: gate `0x05` (staleness) was completely unreachable
+
+**Status: applied**, `sim/golden_model.py`. **The most consequential finding
+of the S3/S5/S7 contract-writing pass** — this one made a required gate
+provably non-functional, not just wrong in an edge case. **Decision:**
+`GATE_STALE`'s check now compares `self.current_cycle` against
+`prev_update_cycle` — a value captured **before** the triggering message's
+own `book.last_update_cycle = self.current_cycle` write — instead of
+against `book.last_update_cycle` read *after* that same write.
+
+**Why this was a real, total-unreachability bug, not a corner case.**
+Every book-modifying message (`QUOTE`/`CLEAR`) unconditionally set
+`book.last_update_cycle = self.current_cycle` near the top of
+`process_message`, *before* the signal/risk-gate section runs later in
+that same call. Only a book-modifying message can ever reach the risk-gate
+section at all (`if not book_modifying: return result`). So by construction,
+every single evaluation of `(self.current_cycle - book.last_update_cycle) >
+self.cfg.max_age` was comparing `self.current_cycle` against a timestamp
+*that message itself had just set to `self.current_cycle` moments earlier* —
+always exactly `0`, always `≤ max_age`, for every possible input, forever.
+`T18_gate_stale` — a **required** S7 gate test ("silence past `MAX_AGE`,
+then fresh update") — could never have passed against the unfixed model,
+because the model could never produce a `GATE_STALE` rejection through any
+sequence of messages. Verified empirically before writing this entry:
+100,000 cycles of silence on a symbol with `max_age=100` still produced
+`reject_reason=0` (accepted) under the old code.
+
+**The fix separates "what timestamp gates 0x05 checks against" from "when
+the timestamp gets refreshed."** `prev_update_cycle = book.last_update_cycle`
+is captured once, before the `msg_type` dispatch (which still refreshes
+`book.last_update_cycle` to `self.current_cycle` exactly as before, for
+every message type, matching FR-19's "heartbeat refreshes the staleness
+timer" language). The later gate-`0x05` check reads `prev_update_cycle`
+instead. This makes the test scenario T18 literally describes constructible
+for the first time: message A touches a symbol; a long silence follows
+(other symbols' traffic advances `current_cycle` past `max_age`); message B
+arrives for the silent symbol and is rejected with `GATE_STALE`, evaluated
+against A's timestamp; message C, arriving shortly after B, is accepted
+again, evaluated against B's (now-fresh) timestamp.
+`sim/test_golden_model_handcase.py`'s `n3`-`n6` is exactly this sequence,
+verified against the corrected model before being written into the test.
+
+**Consequence for `risk_engine.v`:** its own per-slot `last_update_cycle`
+register must be captured/compared **before** being overwritten by the
+triggering message's own touch — the same ordering pitfall applies
+identically in hardware (a naive "refresh then compare" `always` block
+would reproduce this exact bug in RTL). See `docs/contracts/risk_engine.md`
+§2.4 for the exact wording and the reasoning behind where the timestamp
+update happens relative to the gate evaluation.
+
+Not a resolution of a numbered §17 open question — new information the S7
+contract-writing process surfaced, same as D11-D16, but the largest-impact
+one so far: an entire gate would have shipped silently non-functional.
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |

@@ -472,6 +472,15 @@ class GoldenModel:
         book = self._book(msg.symbol_id)
         book_modifying = msg.msg_type in (MSG_QUOTE, MSG_CLEAR)
 
+        # D17: captured BEFORE this message refreshes book.last_update_cycle
+        # below, specifically so GATE_STALE's check (further down) measures
+        # the gap that existed BEFORE this message arrived, not the (always
+        # zero) gap between this message and itself. See D17's writeup in
+        # docs/design_decisions.md for why the original unconditional
+        # "update the timestamp, then check the gap against a value already
+        # equal to current_cycle" ordering made GATE_STALE unreachable.
+        prev_update_cycle = book.last_update_cycle
+
         if msg.msg_type == MSG_QUOTE:
             # FR-14: replace price+qty for the addressed side.
             # FR-15 (D14): qty=0 invalidates that side WITHOUT altering the
@@ -574,7 +583,11 @@ class GoldenModel:
             gates_fired.append(GATE_POSITION)
         if abs(order_price - book.mid) > self.cfg.price_band:
             gates_fired.append(GATE_BAND)
-        if (self.current_cycle - book.last_update_cycle) > self.cfg.max_age:
+        # D17: uses prev_update_cycle (captured before THIS message's own
+        # refresh above), not book.last_update_cycle -- the latter was
+        # already overwritten to self.current_cycle by this same message,
+        # which made the gap always read 0 and GATE_STALE unreachable.
+        if (self.current_cycle - prev_update_cycle) > self.cfg.max_age:
             gates_fired.append(GATE_STALE)
         if self.seq_gap:
             gates_fired.append(GATE_SEQGAP)
@@ -617,8 +630,15 @@ class GoldenModel:
             result.order_dropped_overflow = True
             return result
 
+        # D16: position tracks what was ACTUALLY filled -- reduced_qty when
+        # gate 0x09's ml_action=1 reduce path applied, not the pre-reduction
+        # order_qty signed_qty was computed from. Gate 0x03's own check
+        # above deliberately still used the unreduced order_qty (FR-48: the
+        # ML reduction is gate 0x09's own action, independent of gates
+        # 0x01-0x08's evaluation) -- only the final ledger update changes.
+        final_signed_qty = reduced_qty if order_side == SIDE_BID else -reduced_qty
         self.token_bucket -= 1
-        self.position[msg.symbol_id] = self.position[msg.symbol_id] + signed_qty
+        self.position[msg.symbol_id] = self.position[msg.symbol_id] + final_signed_qty
         self._tx_busy_until.append(self.current_cycle + ORDER_TX_CYCLES)
 
         self.counters.inc("cnt_orders_tx")
