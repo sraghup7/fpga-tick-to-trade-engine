@@ -1288,6 +1288,25 @@ dedicated follow-up contract is needed before this project's latency/
 `trigger_seq` claims (§12.1, the "host's order capture doubles as a
 latency log" claim in `CLAUDE.md`) can be trusted again.
 
+**Resolved** (`docs/contracts/order_builder_trigger_delay_patch.md`):
+`order_builder.v`'s hand-rolled shift register was replaced with an
+instance of `rtl/common/delay_line.v` (the same module `ALIGN_DEPTH`
+itself uses), its depth exposed as a new `TRIGGER_DELAY` parameter;
+`tob_top.v` supplies `2 + ALIGN_DEPTH` from the same `ALIGN_DEPTH`
+`localparam` the alignment delay line already defines — one source of
+truth, chosen over the shared-constant alternative above because it
+also eliminates the duplicate shift-register implementation, not just
+the drift risk. Independently verified: `git diff` on `risk_engine.v`/
+`signal_engine.v`/`delay_line.v`/`csr_block.v`/`latency_histogram.v`
+confirmed empty, `tb_order_builder.v`'s existing coverage passes
+unmodified (default `TRIGGER_DELAY=2`), the new `tb_order_builder_delay.v`
+passes at the real depth, T6/T7's order frames were hand-decoded and now
+show `trigger_seq=4`/`6` (matching their triggering messages) with
+`latency_cyc=6`, and a from-scratch mutation (forcing `TRIGGER_DELAY`
+back to the old hardcoded `2`) reproduced exactly a 3-cycle
+(`ALIGN_DEPTH`-sized) `latency_cyc` discrepancy, confirming the fix's
+cycle accounting is exact, not just directionally plausible.
+
 ---
 
 ## Summary — §17 open question disposition

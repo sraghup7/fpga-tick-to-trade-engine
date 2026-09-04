@@ -663,7 +663,12 @@ module tob_top #(
     wire         ob_tx_start;
     wire         cnt_order_overflow_pulse;
 
-    order_builder u_ob (
+    order_builder #(
+        .TRIGGER_DELAY (2 + ALIGN_DEPTH)   // signal_engine + risk_engine's own
+                                            // 1-cycle registers, plus S6's
+                                            // alignment delay (docs/design_
+                                            // decisions.md D25)
+    ) u_ob (
         .clk                  (gmii_rx_clk),
         .rst_n                (engine_rst_n),
         .msg_seq_num          (md_msg_seq_num),

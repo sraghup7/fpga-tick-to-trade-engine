@@ -104,7 +104,8 @@ run_tb tb_ml_classifier_wrap rtl/ml_classifier_wrap.v
 run_tb tb_ml_policy rtl/ml_policy.v
 run_tb tb_ml_chain rtl/tob_engine.v rtl/feature_extractor.v rtl/feature_normalizer.v rtl/ml_classifier_wrap.v rtl/ml_policy.v
 run_tb tb_risk_engine rtl/risk_engine.v
-run_tb tb_order_builder rtl/order_builder.v
+run_tb tb_order_builder rtl/order_builder.v rtl/common/delay_line.v
+run_tb tb_order_builder_delay rtl/order_builder.v rtl/common/delay_line.v
 run_tb tb_csr_block rtl/csr_block.v
 run_tb tb_latency_histogram rtl/latency_histogram.v
 run_tb tb_tob_top rtl/tob_top.v rtl/frame_classifier.v rtl/md_parser.v \

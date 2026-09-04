@@ -15,15 +15,15 @@
 //   * symbol_id is recovered from order_slot via the same cfg_symbol_0..3
 //     registers symbol_filter.v reads -- a combinational config lookup
 //     (S2.3), no pipelining.
-//   * trigger_seq rides an UNCONDITIONAL two-stage shift register off
-//     msg_seq_num (S2.2). msg_seq_num is a held register between updates,
-//     and the total registered latency from md_parser's msg_valid to the
-//     matching order_valid/reject_reason is exactly two cycles
-//     (signal_engine + risk_engine register once each; everything between is
-//     combinational), so after two cycles seq_d1 holds exactly the seq of the
-//     message now producing the decision -- alignment automatic by
-//     construction. A second stage of the same shape (ingress_d1) captures
-//     cur_cycle at the message's arrival for latency_cyc.
+//   * trigger_seq rides an UNCONDITIONAL delay line off msg_seq_num (S2.2,
+//     D25), built from rtl/common/delay_line.v with depth TRIGGER_DELAY. The
+//     total registered latency from md_parser's msg_valid to the matching
+//     order_valid/reject_reason is 2 + ALIGN_DEPTH cycles (signal_engine +
+//     risk_engine each register once, plus S6's alignment delay line), and
+//     tob_top.v supplies that total from the SAME ALIGN_DEPTH localparam the
+//     alignment delay line uses -- so seq_captured holds exactly the seq of
+//     the message now producing the decision, and ingress_captured holds
+//     cur_cycle at that message's arrival for latency_cyc.
 //
 // Queueing (S2.4): a record is never transmitted the instant a decision
 // fires -- eth_mac_if may still be draining a previous frame. Two explicit
@@ -50,7 +50,12 @@
 //
 // Verilog-2001 only.
 
-module order_builder (
+module order_builder #(
+    parameter integer TRIGGER_DELAY = 2   // cycles from md_parser's msg_valid
+                                           // to the matching order_valid/
+                                           // reject_reason; tob_top.v supplies
+                                           // the real value (2 + ALIGN_DEPTH)
+) (
     input  wire        clk,
     input  wire        rst_n,   // active-low, async-assert/sync-deassert
 
@@ -91,27 +96,35 @@ module order_builder (
     output wire         cnt_order_overflow_pulse
 );
 
-    // ---- S2.2: unconditional two-stage seq / ingress pipelines ----
-    // seq_d1 and ingress_d1 lag msg_seq_num/cur_cycle by exactly the two
-    // registered cycles between md_parser's msg_valid and the matching
-    // order_valid/reject_reason, so on any decision cycle they hold the
-    // triggering message's low seq and arrival cycle.
-    reg [15:0] seq_d0, seq_d1;
-    reg [31:0] ingress_d0, ingress_d1;
+    // ---- S2.2: trigger_seq / ingress-cycle alignment (D25) ----
+    // Replaces the former hand-rolled two-stage shift register with the same
+    // rtl/common/delay_line.v built for S6's alignment. seq_captured/
+    // ingress_captured lag msg_seq_num[15:0]/cur_cycle by exactly
+    // TRIGGER_DELAY cycles -- the total registered latency from md_parser's
+    // msg_valid to the matching order_valid/reject_reason (signal_engine +
+    // risk_engine's own registers plus S6's ALIGN_DEPTH alignment delay,
+    // 2 + ALIGN_DEPTH = 5 today). The depth is a parameter, so tob_top.v
+    // supplies the correct total from the SAME ALIGN_DEPTH localparam the
+    // alignment delay line uses -- one source of truth, no hand-matched
+    // constant to drift again (D25). The pipeline is unconditional (in_valid
+    // tied high), matching the old code's documented ungated behavior.
+    wire [47:0] trigger_delay_out;
+    wire        trigger_delay_valid_unused;   // unconditional; not consumed
 
-    always @(posedge clk or negedge rst_n) begin
-        if (!rst_n) begin
-            seq_d0     <= 16'd0;
-            seq_d1     <= 16'd0;
-            ingress_d0 <= 32'd0;
-            ingress_d1 <= 32'd0;
-        end else begin
-            seq_d0     <= msg_seq_num[15:0];
-            seq_d1     <= seq_d0;
-            ingress_d0 <= cur_cycle;
-            ingress_d1 <= ingress_d0;
-        end
-    end
+    delay_line #(
+        .WIDTH (48),   // msg_seq_num[15:0] (16) + cur_cycle (32)
+        .DEPTH (TRIGGER_DELAY)
+    ) u_trigger_delay (
+        .clk       (clk),
+        .rst_n     (rst_n),
+        .in_valid  (1'b1),
+        .in_data   ({msg_seq_num[15:0], cur_cycle}),
+        .out_valid (trigger_delay_valid_unused),
+        .out_data  (trigger_delay_out)
+    );
+
+    wire [15:0] seq_captured     = trigger_delay_out[47:32];
+    wire [31:0] ingress_captured = trigger_delay_out[31:0];
 
     // ---- S2.3: combinational slot -> symbol_id config lookup ----
     wire [7:0] sym_id_c =
@@ -148,8 +161,8 @@ module order_builder (
     // New record assembled from this cycle's decision plus the aligned
     // pipelines. Same field order as the stored 144-bit layout.
     wire [143:0] new_rec =
-        { push_msg_type, sym_id_c,  order_side, reject_reason,
-          order_price,   order_qty, seq_d1,     ingress_d1 };
+        { push_msg_type, sym_id_c,       order_side, reject_reason,
+          order_price,   order_qty,      seq_captured, ingress_captured };
 
     // Single next-state expression per register -- never two separate NBA
     // writes to the same reg (risk_engine.v S2.3 discipline). A same-cycle
