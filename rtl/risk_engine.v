@@ -287,7 +287,13 @@ module risk_engine #(
             order_slot    <= sig_slot;
             order_side    <= sig_side;
             order_price   <= sig_price;
-            order_qty     <= reduced_qty_c;
+            // D18: reduced_qty_c only reflects what was actually ORDERED
+            // when the order is accepted; a rejected intent reports the
+            // unreduced sig_qty (matching sim/golden_model.py's reject-path
+            // OrderRecord, which uses order_qty not reduced_qty -- gate
+            // 0x03's own check above already uses the unreduced qty too,
+            // for the same FR-48 reason).
+            order_qty     <= accepted_c ? reduced_qty_c : sig_qty;
             reject_reason <= reject_reason_c;
             gate_kill_fired     <= gate_kill_fired_c;
             gate_size_fired     <= gate_size_fired_c;

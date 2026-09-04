@@ -502,6 +502,18 @@ module tb_risk_engine;
         intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b1);
         ck(83, 1'b0, 2'd0, SIDE_BID, 32'd1010, 32'd100, 8'd3, 9'b000000100);   // gate saw 100, not 50
 
+        // D18 (docs/design_decisions.md): a REJECTED intent must report the
+        // UNREDUCED quantity, matching sim/golden_model.py's reject-path
+        // OrderRecord (which uses order_qty, not reduced_qty). ck()'s own
+        // e_ov-gated qty check (this task, above) only verifies order_qty
+        // on an ACCEPTED intent -- that blind spot is exactly how this bug
+        // shipped once already; check it directly here on test 83's
+        // rejected result (adverse_risk=1, ml_action=1, gate 0x03 fired).
+        if (c_qty !== 32'd100) begin
+            $display("FAIL: T83b (D18): rejected order_qty=%0d, expected unreduced 100", c_qty);
+            fail = 1'b1;
+        end
+
         // ================= J: ML block path =================
         cfg_ml_action = 1'b0;
         cfg_ml_reduce_shift = 4'd1;

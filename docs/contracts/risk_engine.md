@@ -130,8 +130,10 @@ module risk_engine #(
     output reg  [1:0]  order_slot,
     output reg  [7:0]  order_side,
     output reg  [31:0] order_price,
-    output reg  [31:0] order_qty,       // D16: reduced_qty when ML reduce
-                                         // applied, else sig_qty unchanged
+    output reg  [31:0] order_qty,       // D16/D18: reduced_qty ONLY when
+                                         // accepted; a rejected intent
+                                         // reports the unreduced sig_qty
+                                         // regardless of ML reduce (S2.6)
     output reg  [7:0]  reject_reason,   // 0x00 = accepted; else lowest-
                                          // numbered fired gate ID (1-9)
 
@@ -390,9 +392,31 @@ wire signed [32:0] final_signed_qty = (sig_side == 8'h00) ? {1'b0, reduced_qty_c
 ```
 
 `position[sig_slot]` updates by `final_signed_qty` on an `accepted_c`
-cycle, not `signed_qty`. `order_qty` (the registered output, §2.1) is
-`reduced_qty_c` as well, matching `sim/golden_model.py`'s
-`OrderRecord.quantity = reduced_qty`.
+cycle, not `signed_qty`.
+
+**D18 (`docs/design_decisions.md`) — `order_qty`'s own registered value
+must be conditional on `accepted_c`, not unconditionally `reduced_qty_c`:**
+
+```verilog
+order_qty <= accepted_c ? reduced_qty_c : sig_qty;
+```
+
+An **accepted** order reports `reduced_qty_c`, matching
+`sim/golden_model.py`'s `OrderRecord.quantity = reduced_qty` on the accept
+path. A **rejected** intent reports the unreduced `sig_qty` — this was a
+real bug in an earlier draft of this contract, caught while designing
+`order_builder.v`: `sim/golden_model.py`'s reject-path `OrderRecord` uses
+`order_qty` (unreduced), never `reduced_qty`, even when `adverse_risk=1`
+and `cfg_ml_action=1` both hold — the reduction only ever applies to an
+order that actually gets accepted. Writing `order_qty <= reduced_qty_c`
+unconditionally (accept or reject) would report the wrong quantity
+whenever a *different* gate rejects an intent that also happened to
+qualify for ML reduction. `tb/tb_risk_engine.v`'s `T83b` case is the
+regression test for this — it exercises exactly that combination
+(`adverse_risk=1`, `cfg_ml_action=1`, gate `0x03` also firing) and checks
+`order_qty` on the *rejected* result, which `ck()`'s own qty check
+deliberately skips (it only verifies `order_qty` when `order_valid=1`) —
+that gap is exactly how this bug went unnoticed the first time.
 
 ### 2.7 Committing state and registering the output
 

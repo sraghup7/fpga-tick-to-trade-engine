@@ -733,6 +733,59 @@ one so far: an entire gate would have shipped silently non-functional.
 
 ---
 
+## D18 — `risk_engine.v`: a rejected order must report its unreduced quantity
+
+**Status: applied**, `rtl/risk_engine.v` (a small, targeted patch to an
+already-committed S7 module — see below for why this one, unusually, was
+fixed at the RTL directly rather than only in a contract) and
+`tb/tb_risk_engine.v` (one new regression assertion). **Decision:**
+`order_qty`'s registered update is now `accepted_c ? reduced_qty_c :
+sig_qty` — a rejected intent reports the unreduced quantity; only an
+*accepted* order reports the ML-reduced one.
+
+**Why.** Found while designing `order_builder.v`'s interface for S8 — that
+module is the first thing that would actually consume a rejected order's
+`order_qty` field (via the opt-in `0x11` diagnostic frame, FR-44/D7).
+Checking what it should read led back to `risk_engine.v`'s own output.
+Verified empirically against `sim/golden_model.py` before concluding
+anything: with `adverse_risk=1`, `cfg_ml_action=1` (reduce), and a
+*different* gate (band, in the test) also firing on the same intent, the
+golden model's reject-path `OrderRecord` reports `quantity=100` (the
+original, unreduced `order_qty`) — never the reduced value, regardless of
+whether ML reduction would otherwise have applied. `docs/contracts/risk_engine.md`
+(and the RTL built from it) instead wrote `order_qty <= reduced_qty_c`
+unconditionally, on any `sig_valid` cycle, accept or reject — so a rejected
+intent under this exact combination would have reported the *reduced*
+quantity, disagreeing with the golden model.
+
+**Why this one warranted a direct RTL patch instead of just a contract
+note for later:** `order_qty` is a single, already-built, already-committed
+output register with no way to route around the bug from a downstream
+module without duplicating state that `risk_engine.v` already owns
+correctly for the accept case. The fix itself is a single ternary — no
+architectural change, low risk to re-verify (the existing testbench still
+passed unmodified; a new regression case was added and shown to fail
+against the pre-fix RTL before being accepted). Contrast with D12-D17,
+which were all `sim/golden_model.py` fixes with no committed RTL to touch;
+this is the first finding in the series to reach back into shipped RTL,
+and it was worth doing given how easy the fix was and how easy the bug
+would have been to miss forever (`cfg_reject_report` defaults to off,
+per FR-44/D7, so this field is never observed in the default
+configuration — but `order_builder.v`'s testbench, and any future
+diagnostic use of gate `0x09` reduce alongside another gate, would have
+silently carried the wrong value).
+
+**Practical impact, for context:** low. `cfg_reject_report=0` by design
+(FR-44), so this field was never on the wire in the default configuration.
+Still worth fixing at the source rather than documenting as a known
+limitation, given the fix's cost was essentially zero.
+
+Not a resolution of a numbered §17 open question — new information the S8
+contract-writing process surfaced, same as D11-D17, but the first to patch
+already-shipped RTL rather than only `sim/golden_model.py`.
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |
