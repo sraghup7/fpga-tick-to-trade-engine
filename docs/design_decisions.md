@@ -911,6 +911,68 @@ the situation this diagnostic bit exists to surface.
 
 ---
 
+## D21 — `latency_histogram.v`: bucket boundaries, latency source, and two deferred `csr_block.v` wiring gaps
+
+**Status: decided while writing `docs/contracts/latency_histogram.md` (S9's
+second and final file), not yet implemented.** Three things the master
+spec left open, plus two small gaps in already-committed `csr_block.v`
+(`b7e3e9a`) that this contract deliberately does not close.
+
+**1. Latency source: consume `order_builder.v`'s already-computed
+`latency_cyc`, don't re-derive it.** `order_builder.v` (S8) already
+computes ingress-to-egress `latency_cyc` per transmitted record and embeds
+it in the wire frame (`docs/contracts/order_builder.md` §2.3) — the exact
+same value the master spec's own README framing calls out ("the host's
+capture is simultaneously a latency log," §4.5). `latency_histogram.v`
+reads it straight off `ob_tx_start`/`ob_tx_payload[15:0]`, the same two
+signals `csr_block.v` already taps for `cnt_orders_tx` (including the same
+`msg_type==0x10` exclusion of `0x11` reject-diagnostic frames). No new
+`cur_cycle`/ingress-timestamp wiring is needed. Re-deriving the timestamp
+independently would duplicate state `order_builder.v` already owns
+correctly and risks the two silently disagreeing — same reasoning as D18's
+"no clean way to route around state a module already owns."
+
+**2. Bucket boundaries: exact 1-cycle resolution 0-62, bucket 63 as a
+saturating ≥63 catch-all — not a linear-shift bucket width.** NFR-2/T25's
+entire point is catching a **single-cycle** latency variance ("a second
+bucket is a functional bug, not a performance result," §7). A naive
+power-of-2 bucket width (e.g. 4 cycles/bucket, the cheap `>>2` shift)
+would silently merge a 1-cycle jitter bug into the same bucket and defeat
+the requirement it exists to test. With NFR-1's target ≤22 cycles and an
+observed nominal engine total of ~10-11 cycles (§12.1), the whole
+plausible nominal range fits inside buckets 0-62 at full precision; bucket
+63 absorbs any queueing-delayed outlier (an order held behind a busy TX,
+`docs/contracts/order_builder.md` §2.4) as an "off-nominal" catch-all
+without needing more buckets for a case that's expected to be rare and
+isn't what NFR-2 is testing.
+
+**3. `hist_rd_addr`/`hist_rd_data` is a standalone read interface, not
+wired into `csr_block.v`'s CSR read mux by this contract.** Same modular
+discipline as every S9/S8 contract: `latency_histogram.v` is built and
+tested standalone; wiring it to the rest of the pipeline is integration
+work. Two specific gaps this leaves in already-committed `csr_block.v`
+(`b7e3e9a`), left as explicit deferred follow-ups rather than silently
+assumed solved:
+
+- `csr_block.v`'s read mux (`rd32`) currently hard-codes the `0x138`+
+  histogram range to return `0` (its `default` case). Making FR-56's "on-
+  demand CSR read" of histogram data actually work needs a small patch
+  wiring `csr_block.v`'s CSR address decode to this module's
+  `hist_rd_addr`/`hist_rd_data`.
+- `csr_block.v`'s `counter_clear_pulse` (CTRL bit2) is currently an
+  internal `wire`, not exposed as a port. FR-56 groups "counters and
+  histogram" together, implying the histogram should clear alongside the
+  counters — this module takes a `cfg_counter_clear` input port for that
+  purpose, but wiring it from `csr_block.v` needs that pulse exported as a
+  new output port there too.
+
+Both are small, well-understood, low-risk patches to already-shipped RTL —
+same category as D18's direct `risk_engine.v` patch — deliberately not
+done as part of *this* contract to keep it scoped to one module. Flagged
+here so they aren't forgotten before S10.
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |
