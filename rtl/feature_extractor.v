@@ -51,6 +51,22 @@
 // produce no feature output; they only advance the window and, for TRADE,
 // update F6.
 //
+// Post-update inputs are the tob_engine.v next_* scalar ports (D23, commit
+// 3f30320; fix contract docs/contracts/feature_extractor_patch.md), NOT the
+// registered bid_price/ask_price/etc buses: a register written with <= on a
+// clock edge is not visible to another module reading it on that same edge,
+// so the registered buses only reflect the book as it stood BEFORE the
+// triggering message's own effect. next_* are the applied slot's
+// combinational post-update state, valid whenever msg_applied is high -- for
+// TRADE/HEARTBEAT (no book change) they equal current state, a no-op. These
+// four ports are the D23-twin of signal_engine.v's fix; applied_slot is
+// still needed to index the per-slot prev_*/window/last_trade_dir history.
+// Risk-appropriate valid/crossed fail-safe forcing stays downstream in
+// ml_policy.v (FR-26/31), which reads tob_engine.v's REGISTERED
+// bid_valid/ask_valid/crossed buses at a pipeline cycle far enough past the
+// triggering event's register commit that no staleness applies (same D23
+// reasoning as risk_engine.v).
+//
 // bid_valid/ask_valid are deliberately not consumed anywhere (S2.7): raw
 // features are computed mechanically from whatever price/qty tob_engine
 // presents. F0 saturates to 0 when ask < bid -- not a sentinel. FR-26
@@ -74,10 +90,12 @@ module feature_extractor #(
     input  wire                       msg_applied,     // any accepted msg
     input  wire                       book_upd_valid,  // QUOTE|CLEAR subset
     input  wire [1:0]                 applied_slot,
-    input  wire [NUM_SYMBOLS*32-1:0]  bid_price,       // post-update state
-    input  wire [NUM_SYMBOLS*32-1:0]  bid_qty,
-    input  wire [NUM_SYMBOLS*32-1:0]  ask_price,
-    input  wire [NUM_SYMBOLS*32-1:0]  ask_qty,
+    // post-update ("next") state of the APPLIED slot (tob_engine.v's next_*
+    // outputs, D23) -- consumed combinationally on the book_upd_valid cycle.
+    input  wire [31:0] next_bid_price,   // the four this module reads (S2.7:
+    input  wire [31:0] next_bid_qty,     // next_bid_valid/next_ask_valid/
+    input  wire [31:0] next_ask_price,   // next_crossed are deliberately NOT
+    input  wire [31:0] next_ask_qty,     // consumed -- see FR-26 note above)
 
     // one feature vector per book-modifying event, registered one cycle
     // after book_upd_valid (S2.5). F1..F4/F6 signed two's-complement,
@@ -148,10 +166,10 @@ module feature_extractor #(
     reg        e_upd;
     reg [31:0] e_abs;
     always @(*) begin
-        sbp = bid_price [sidx*32 +: 32];
-        sbq = bid_qty   [sidx*32 +: 32];
-        sap = ask_price [sidx*32 +: 32];
-        saq = ask_qty   [sidx*32 +: 32];
+        sbp = next_bid_price;
+        sbq = next_bid_qty;
+        sap = next_ask_price;
+        saq = next_ask_qty;
 
         // first-event rule: a CLEAR resets the slot first (so it is always a
         // first event); otherwise first until the slot's first book event.

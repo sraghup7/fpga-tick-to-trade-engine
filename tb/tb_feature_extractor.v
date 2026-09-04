@@ -17,10 +17,19 @@
 // (c_* regs capture pre-edge values each posedge, like the other S3 TBs).
 //
 // Each event is driven for exactly one cycle (inputs deasserted before the
-// sampling edge). Book-state buses are driven directly to the event's
-// post-update values for the applied slot -- this module reads the buses it
-// is given and never reconstructs tob_engine's update (S2.7), so the TB
-// presents exactly the post-update states the reference was handed.
+// sampling edge). The four next_* scalar inputs (post-update state of the
+// APPLIED slot) are driven directly to the event's post-update values --
+// this module reads exactly the inputs it is given and never reconstructs
+// tob_engine's update (S2.7), so the TB presents precisely the post-update
+// states the reference was handed. Port shape note: feature_extractor.v was
+// patched (docs/contracts/feature_extractor_patch.md, the D23-twin fix) to
+// consume tob_engine.v's next_* scalar outputs instead of the registered
+// per-symbol book buses it read before -- same one-cycle-post-update
+// semantics, but now on a combinational (same-cycle-valid) source. The TB's
+// per-slot book model (mbp/mbq/map/maq) is kept so each event can present
+// the applied slot's post-update state exactly as before; `applied_slot`
+// selects which slot's model entry drives the scalars, while prev_*/window/
+// last_trade_dir history stays inside the DUT per slot (FR-21).
 //
 // Blocks (each preceded by a reset so per-block state matches the reference
 // run it was generated from):
@@ -36,6 +45,11 @@
 //       early |delta| falls off -- proves aging, not coincidental match)
 //   D   build slot 0 history (incl. a crossed quote and a trade), assert
 //       rst_n, then a fresh first event must yield F1=F3=F4=0 / F6=0
+//   E   new for the next_* port shape: a price/qty-changing QUOTE on an
+//       already-established slot on each side (F0/F2 must reflect the
+//       presented next_* values, F1/F3/F4 the prior-event prev_* history),
+//       and a TRADE + HEARTBEAT cycle proving next_* is not consulted on
+//       non-book-modifying events (no feat_valid, window/book gating intact).
 //
 // On any mismatch: FAIL line naming the step, feature, and expected vs.
 // actual; final PASS/FAIL.
@@ -54,7 +68,7 @@ module tb_feature_extractor;
     reg        book_upd_valid = 1'b0;
     reg [1:0]  applied_slot = 2'd0;
 
-    reg [127:0] b_bid_price, b_bid_qty, b_ask_price, b_ask_qty;
+    reg [31:0] d_next_bid_price, d_next_bid_qty, d_next_ask_price, d_next_ask_qty;
 
     wire       feat_valid;
     wire [1:0] feat_slot;
@@ -80,10 +94,10 @@ module tb_feature_extractor;
         .msg_applied          (msg_applied),
         .book_upd_valid       (book_upd_valid),
         .applied_slot         (applied_slot),
-        .bid_price            (b_bid_price),
-        .bid_qty              (b_bid_qty),
-        .ask_price            (b_ask_price),
-        .ask_qty              (b_ask_qty),
+        .next_bid_price       (d_next_bid_price),
+        .next_bid_qty         (d_next_bid_qty),
+        .next_ask_price       (d_next_ask_price),
+        .next_ask_qty         (d_next_ask_qty),
         .feat_valid           (feat_valid),
         .feat_slot            (feat_slot),
         .feat_f0_spread       (feat_f0_spread),
@@ -99,7 +113,8 @@ module tb_feature_extractor;
     reg     fail = 1'b0;
     integer tc = 0;
 
-    // ---- per-slot book model (what we drive onto the buses) ----
+    // ---- per-slot book model: post-update state of each slot, the applied
+    //      slot's entry drives the next_* scalars on its own event cycles ----
     reg [31:0] mbp [0:3];
     reg [31:0] mbq [0:3];
     reg [31:0] map [0:3];
@@ -108,10 +123,10 @@ module tb_feature_extractor;
 
     task drive_bus;
         begin
-            b_bid_price = {mbp[3], mbp[2], mbp[1], mbp[0]};
-            b_bid_qty   = {mbq[3], mbq[2], mbq[1], mbq[0]};
-            b_ask_price = {map[3], map[2], map[1], map[0]};
-            b_ask_qty   = {maq[3], maq[2], maq[1], maq[0]};
+            d_next_bid_price = mbp[applied_slot];
+            d_next_bid_qty   = mbq[applied_slot];
+            d_next_ask_price = map[applied_slot];
+            d_next_ask_qty   = maq[applied_slot];
         end
     endtask
 
@@ -187,7 +202,7 @@ module tb_feature_extractor;
             ev(QUOTE, SIDE_BID, 1'b1, slot);
         end
     endtask
-    task cl;   // CLEAR (bus = post-clear state: stale prices/quantities kept)
+    task cl;   // CLEAR (next_* = post-clear state: stale prices/quantities kept)
         input [1:0]  slot;
         input [31:0] bp, bq, ap, aq;
         begin
@@ -326,6 +341,51 @@ module tb_feature_extractor;
         do_reset;
         q(2'd0, 32'd100, 32'd10, 32'd0, 32'd0);
         check_feat(55, 1'b1, 2'd0, 32'd0, 32'd0, 32'd10, 32'd0, 32'd0, 32'd1, 32'd0, 32'd0);
+
+        // ============== BLOCK E: next_* shape-specific new cases ==============
+        // E1-E3 (slot 0, ask side): a price/qty-CHANGING QUOTE on an
+        // already-established slot. E3 presents next_ask_price=1030 /
+        // next_ask_qty=60 -- what the old REGISTERED bus would have shown on
+        // that same cycle is the stale pre-E3 ask (1010/50). F0 must be
+        // 1030-1000=30 (not 1010-1000=10) and F2=100-60=40 (not 50): the
+        // feature reflects the presented next_* values, not stale ones. F4
+        // (60-50=10) and F1 (=10) still use the PRIOR event's prev_* history
+        // -- current-event post-update vs prior-event history stay distinct.
+        do_reset;
+        q(2'd0, 32'd1000, 32'd100, 32'd0,   32'd0);    // E1: bid only (first event)
+        check_feat(61, 1'b1, 2'd0, 32'd0, 32'd0, 32'd100, 32'd0, 32'd0, 32'd1, 32'd0, 32'd0);
+        q(2'd0, 32'd1000, 32'd100, 32'd1010, 32'd50);  // E2: ask established
+        check_feat(62, 1'b1, 2'd0, 32'd10, 32'd505, 32'd50, 32'd0, 32'd50, 32'd2, 32'd0, 32'd505);
+        q(2'd0, 32'd1000, 32'd100, 32'd1030, 32'd60);  // E3: ask price+qty change
+        check_feat(63, 1'b1, 2'd0, 32'd30, 32'd10, 32'd40, 32'd0, 32'd10, 32'd3, 32'd0, 32'd515);
+
+        // E4-E6 (slot 1, bid side, mirror): a bid price/qty-CHANGING QUOTE.
+        // E6 presents next_bid_price=1990 / next_bid_qty=80; the stale
+        // pre-E6 bid (2000/100) would give F0=2010-2000=10 and F2=50, but the
+        // presented next_* values demand F0=2010-1990=20 and F2=80-50=30.
+        // F3 = 80-100 = -20 (change vs prior bid qty) confirms the deltas
+        // still track the prior event's history, not the stale current state.
+        q(2'd1, 32'd0,   32'd0,  32'd2010, 32'd50);    // E4: ask only (first event)
+        check_feat(64, 1'b1, 2'd1, 32'd2010, 32'd0, -32'd50, 32'd0, 32'd0, 32'd1, 32'd0, 32'd0);
+        q(2'd1, 32'd2000, 32'd100, 32'd2010, 32'd50);  // E5: bid established
+        check_feat(65, 1'b1, 2'd1, 32'd10, 32'd1000, 32'd50, 32'd100, 32'd0, 32'd2, 32'd0, 32'd1000);
+        q(2'd1, 32'd1990, 32'd80, 32'd2010, 32'd50);   // E6: bid price+qty change
+        check_feat(66, 1'b1, 2'd1, 32'd20, -32'd5, 32'd30, -32'd20, 32'd0, 32'd3, 32'd0, 32'd1005);
+
+        // E7-E10 (slot 2): TRADE and HEARTBEAT between two QUOTEs -- next_*
+        // must simply NOT be consulted on non-book-modifying events: no
+        // feat_valid pulse from either, and the completing QUOTE still
+        // computes its vector from its own presented post-update state (the
+        // two intervening events correctly show up only as window pushes --
+        // F5=2, not 3 -- and the TRADE's F6=-1 persists into the quote).
+        q(2'd2, 32'd500, 32'd20, 32'd0,  32'd0);       // E7: bid only (first event)
+        check_feat(67, 1'b1, 2'd2, 32'd0, 32'd0, 32'd20, 32'd0, 32'd0, 32'd1, 32'd0, 32'd0);
+        tr(2'd2, SIDE_ASK);                            // E8: TRADE, no output
+        check_feat(68, 1'b0, 2'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0);
+        hb(2'd2);                                      // E9: HEARTBEAT, no output
+        check_feat(69, 1'b0, 2'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0);
+        q(2'd2, 32'd500, 32'd20, 32'd520, 32'd10);     // E10: completing ask QUOTE
+        check_feat(70, 1'b1, 2'd2, 32'd20, 32'd260, 32'd10, 32'd0, 32'd10, 32'd2, -32'd1, 32'd260);
 
         if (fail) begin
             $display("FAIL");
