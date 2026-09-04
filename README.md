@@ -141,33 +141,31 @@ The ML engineer's self-contained brief is `ml_engineer_brief.md`.
 ├── AGENTS.md                           # instructions for AI-assisted development
 ├── docs/                               # design_decisions.md (18 entries), contracts/ (per-module handoffs)
 ├── rtl/                                # Verilog-2001; parser/book/features/signal/risk/egress done, ML+instrumentation stages not yet
-├── sim/                                # golden_model.py, feature_golden.py + hand-case tests done; ml_golden.py/order_rx.py/compare.py not yet
+├── sim/                                # golden_model.py, feature_golden.py, order_rx.py + hand-case tests done; ml_golden.py/compare.py not yet
 ├── model/                              # (empty) ML collaborator's side — S4 hasn't started
 ├── tb/                                 # self-checking testbenches, one per landed module; tb_top.v (full integration) not yet
 ├── hls4ml/                             # (not yet — generated project, rebuilt by script once S4 lands)
-├── scripts/  constraints/  results/    # build.tcl + make_slides.py done; run_sim.sh/build_hls4ml.py/report.py not yet; results/ empty until S10+
+├── scripts/  constraints/  results/    # build.tcl, run_sim.sh, make_slides.py done; build_hls4ml.py/report.py not yet; results/ empty until S10+
 ```
 
 ---
 
 ## Reproducing results
 
-The datapath through egress (parser → book → features → signal → risk → order framing) is implemented and self-checking today. `make sim`/`make synth`/`make bit`/`make ml` are still stubs (no `scripts/run_sim.sh`/`build_hls4ml.py` yet — one-command reproduction is not there yet), so for now each module is verified directly:
+The datapath through egress (parser → book → features → signal → risk → order framing) is implemented and self-checking today:
 
 ```bash
-# any rtl/<module>.v against its tb/tb_<module>.v, e.g.:
-iverilog -g2001 -o /tmp/tb.vvp tb/tb_risk_engine.v rtl/risk_engine.v && vvp /tmp/tb.vvp
+make sim          # everything: golden models, RTL lint, every testbench, 1M-message soak
+RUN_SIM_FAST=1 make sim   # same, skipping the slow 1M-message soak
 
-# golden-model hand-case regressions
-python sim/test_golden_model_handcase.py
-python sim/test_feature_golden_handcase.py
-
-# 1,000,000-message parser soak (S2 gate)
-python sim/gen_soak_vectors.py   # regenerates tb/stimulus/s2_soak.mem
-iverilog -g2001 -o /tmp/soak.vvp tb/tb_parser_soak.v rtl/frame_classifier.v rtl/md_parser.v && vvp /tmp/soak.vvp
+# or decode an order capture directly:
+python sim/order_rx.py --in some_capture.hex
+python sim/order_rx.py --udp 5006   # live, once S11 hardware exists to send traffic
 ```
 
-Success criteria (defined in the master spec §1.6): line-rate processing of ≥ 1,000,000 messages with zero drops — **met** for the parser stage; a **single-occupancy latency histogram** (max == min) — not measurable yet, no histogram module (S9); every risk gate individually demonstrated blocking — **met** in simulation for gates `0x01`–`0x08`, gate `0x09` (ML) not built yet; bit-exact RTL vs. golden model on a randomized soak; WNS > 0 at 125 MHz; one-command reproduction from a clean clone — not yet (see above).
+`make synth`/`make bit`/`make ml` are still stubs — no timing/utilization/bitstream results exist yet (S10+), and the ML flow is S4/S6.
+
+Success criteria (defined in the master spec §1.6): line-rate processing of ≥ 1,000,000 messages with zero drops — **met** for the parser stage; a **single-occupancy latency histogram** (max == min) — not measurable yet, no histogram module (S9); every risk gate individually demonstrated blocking — **met** in simulation for gates `0x01`–`0x08`, gate `0x09` (ML) not built yet; bit-exact RTL vs. golden model on a randomized soak; WNS > 0 at 125 MHz; one-command reproduction from a clean clone — **met for simulation** (`make sim`), not yet for synthesis/bitstream.
 
 ## Honest limitations
 
@@ -191,7 +189,7 @@ Success criteria (defined in the master spec §1.6): line-rate processing of ≥
 | S2–S3 | Parser, filter, book, feature extraction | Done |
 | S5 | Signal engine | Done (built ahead of S4/S6 — doesn't depend on ML) |
 | S7 | Risk engine (9 gates) | Done |
-| S8 | Egress (`order_builder`, framing) | RTL + testbench done; `sim/order_rx.py` host-side decoder still open |
+| S8 | Egress (`order_builder`, framing) | Done — RTL, testbench, and `sim/order_rx.py` host-side decoder |
 | S4 | ML training, quantization, hls4ml export (parallel track) | Not started |
 | S6 | ML integration (`ml_classifier_wrap`, `ml_policy`, alignment register) | Not started |
 | S9 | Instrumentation (`latency_histogram`, `csr_block`, stats) | Not started |

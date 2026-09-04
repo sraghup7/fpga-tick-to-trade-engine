@@ -35,5 +35,11 @@ unmodified. Passing.
 `feature_normalizer.v` are checked against; `sim/test_feature_golden_handcase.py` is its
 hand-case gate, run with `python sim/test_feature_golden_handcase.py`.
 
-`ml_golden.py`, `train.py`, `order_rx.py`, `compare.py` are not written yet -- S4/S6 (ML)
-haven't started.
+`order_rx.py` exists -- decodes the order-record wire format (S4.5) via
+`golden_model.OrderRecord`, either from an offline hex capture (`--in`, same
+comment/hex-per-line format `feed_gen.py` writes) or a live UDP socket (`--udp`, unexercised
+until S11 hardware exists to send real traffic). `python sim/order_rx.py --selftest` is its
+own hand-case gate (round-trips accepted + all nine gate reject_reasons through encode/decode).
+This is also what satisfies S8's stated milestone gate, "order frames decoded by order_rx.py".
+
+`ml_golden.py`, `train.py`, `compare.py` are not written yet -- S4/S6 (ML) haven't started.
