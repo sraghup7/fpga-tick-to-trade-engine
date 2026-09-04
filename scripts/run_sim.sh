@@ -68,7 +68,11 @@ python sim/order_rx.py --selftest && pass "sim/order_rx.py --selftest" || fail "
 
 echo
 echo "=== RTL lint (Verilog-2001, hand-written rtl/ only -- not vendor/) ==="
-if iverilog -g2001 -Wall -o "$WORKDIR/lint.vvp" rtl/*.v rtl/common/*.v; then
+# tob_top.v instantiates mac_top/util_gmii_to_rgmii (vendor RTL with Xilinx
+# primitives); the sim leaves are provided so it still elaborates here, the
+# same substitution tb/tb_tob_top.v uses at runtime.
+if iverilog -g2001 -Wall -o "$WORKDIR/lint.vvp" rtl/*.v rtl/common/*.v \
+    tb/sim_models/tob_top_sim_leaves.v; then
     pass "rtl-lint"
 else
     fail "rtl-lint"
@@ -97,6 +101,11 @@ run_tb tb_risk_engine rtl/risk_engine.v
 run_tb tb_order_builder rtl/order_builder.v
 run_tb tb_csr_block rtl/csr_block.v
 run_tb tb_latency_histogram rtl/latency_histogram.v
+run_tb tb_tob_top rtl/tob_top.v rtl/frame_classifier.v rtl/md_parser.v \
+    rtl/symbol_filter.v rtl/seq_monitor.v rtl/tob_engine.v rtl/signal_engine.v \
+    rtl/risk_engine.v rtl/order_builder.v rtl/csr_block.v rtl/latency_histogram.v \
+    rtl/eth_mac_if.v rtl/common/sync_2ff.v rtl/common/mdio_ctrl.v \
+    tb/sim_models/tob_top_sim_leaves.v
 
 if [ "${RUN_SIM_FAST:-0}" != "1" ]; then
     echo

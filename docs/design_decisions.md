@@ -973,6 +973,103 @@ here so they aren't forgotten before S10.
 
 ---
 
+## D22 — `tob_top.v`: TX arbitration, two clock domains, and what this integration does *not* attempt yet
+
+**Status: decided while writing `docs/contracts/tob_top.md` (S10), not yet
+implemented.** This is the first contract to wire already-committed modules
+*together* rather than build a new standalone one, so most of what it has
+to pin down is arbitration and clocking, not new datapath logic.
+
+**1. TX arbitration: `order_builder.v` unconditionally wins.**
+`order_builder.v` (fast path) and `csr_block.v` (slow path, §3.3 of the
+master spec: "forbidden from asserting backpressure onto the fast path")
+both need `eth_mac_if.v`'s single `tx_payload`/`tx_start`/`tx_busy`
+interface. Neither module is modified — both were already built with an
+external-arbiter shape in mind (`docs/contracts/order_builder.md` §2.5's
+`~tx_start` self-gate; `docs/contracts/csr_block.md` §2.4's silent-drop
+policy for a busy response). The arbiter is a pure mux with no state of
+its own:
+
+```verilog
+assign eth_tx_payload   = ob_tx_start ? ob_tx_payload : csr_resp_payload;
+assign eth_tx_start     = ob_tx_start | (csr_resp_start & ~ob_tx_start);
+assign csr_resp_busy_in = eth_tx_busy | ob_tx_start;
+```
+
+`order_builder.v`'s own request always passes straight through, never
+delayed. `csr_block.v`'s `resp_busy` input is driven by the *shared* path's
+busy state OR'd with "`order_builder.v` wants this exact cycle" — so its
+own `~resp_busy & ~resp_start` self-gate (already built) correctly holds
+off whenever the fast path has priority, with zero new logic inside
+`csr_block.v` itself. On the vanishingly rare cycle both request
+simultaneously, `order_builder.v` wins and that CSR read is silently
+dropped — already an accepted, designed-for outcome per
+`docs/contracts/csr_block.md` §2.4 ("CSR traffic is diagnostic, not the
+fast path"), not a new failure mode this decision introduces.
+
+**2. Two clock domains, per D2 — this contract makes the split concrete.**
+The entire engine (`frame_classifier.v` through `csr_block.v`/
+`latency_histogram.v`) runs on the recovered `gmii_rx_clk` (D2). `sys_clk`
+(50 MHz board oscillator) is retained *only* for PHY reset sequencing and
+`mdio_ctrl.v` — a genuinely separate, slower domain with no signal
+exchange with the engine except the reset-release edge (synchronized into
+the engine's domain via `rtl/common/sync_2ff.v`, per D2's own "follow-on"
+note) and, indirectly, link readiness.
+
+**A concrete bug this decision catches before it ships:** `mdio_ctrl.v`'s
+`CLK_HZ` parameter **defaults to `125_000_000`**, but D2 says `mdio_ctrl.v`
+runs off `sys_clk` — 50 MHz, not 125 MHz. Instantiating it with the default
+would compute the wrong MDC divider (`MDC_PERIOD`), driving the PHY's MDIO
+clock at roughly 2.5x the intended rate — silently over IEEE 802.3 clause
+22's 2.5 MHz maximum, since `mdio_ctrl.v`'s own math would still produce a
+*self-consistent* (just wrong) waveform with no assertion to catch it.
+`docs/contracts/tob_top.md` §2.3 requires the instantiation to override
+`.CLK_HZ(50_000_000)` explicitly.
+
+**3. This contract does not attempt the ML path, the full T26 soak, or
+physical-layer timing closure.** Three deliberate scope boundaries:
+
+- `feature_extractor.v`/`feature_normalizer.v` are **not instantiated** —
+  they have no consumer until `ml_classifier_wrap.v`/`ml_policy.v` exist
+  (S6, blocked on S4). `adverse_risk` into `risk_engine.v` is a fixed tie-
+  off (`1'b0`), same stand-in-input principle `risk_engine.v`'s own
+  contract already established, just resolved at the integration level
+  now instead of at a testbench boundary.
+- **T26's 1,000,000-message soak (`tb/tb_top.v`, master spec §11.3) is not
+  this contract's testbench.** §11.3 says that testbench "drives the
+  GMII-side interface" — i.e. `mac_top.v`'s own RX/TX boundary
+  (`udp_rec_ram_rdata`/`udp_rec_data_valid`/... and
+  `ram_wr_data`/`udp_tx_req`/...), the same boundary
+  `tb/tb_eth_mac_if_rx.v`/`tb_eth_mac_if_tx.v` already drive standalone.
+  That means `tb_top.v` can instantiate the engine chain directly, without
+  `tob_top.v`, `mac_top.v`, `util_gmii_to_rgmii.v`, or `mdio_ctrl.v` in the
+  loop at all — matching how every other testbench in this project
+  exercises its DUT standalone. `docs/contracts/tob_top.md`'s own
+  testbench requirement is a smaller connectivity/smoke check (does the
+  wiring in *this* contract correctly connect what's already
+  independently verified), not a re-run of every module's own behavioral
+  coverage.
+- RGMII pin constraints, `create_clock` timing, IDELAY/pad-skew validation
+  on real hardware, and the PHY's exact minimum reset-pulse-width are S11
+  (Hardware) concerns — no board exists to measure any of this against yet
+  (`PREREQUISITES.md` has no such number recorded either), so this
+  contract specifies a conservative placeholder reset hold count rather
+  than inventing an unverified figure.
+
+**A gap this integration closes for free:** `mac_top.v` already carries
+D5's patch exposing `mac_rec_error` and `udp_checksum_error` — sources
+`docs/contracts/csr_block.md` §1.3 explicitly flagged as *not existing
+anywhere in the current RTL* when `csr_block.v` was contracted. Wiring
+`mac_rec_error` → `csr_block.v`'s `err_fcs` and `udp_checksum_error` →
+`err_ip` closes two of the four stand-in error inputs for real.
+`err_ethertype`/`err_udp_port` remain genuine stand-ins — `mac_top.v`
+doesn't expose a distinct failure signal for either (a wrong-EtherType or
+wrong-port frame is dispatched to neither `arp_rx.v` nor `ip_rx.v`/
+`udp_rx.v` and is simply never seen, D1/D3), so there is still nothing to
+wire there.
+
+---
+
 ## D23 — `signal_engine.v` read `tob_engine.v`'s book bus one message stale; the trigger for the biggest cross-module finding of this project
 
 **Status: found while independently verifying `tob_top.v`'s delivered
