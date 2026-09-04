@@ -387,5 +387,5 @@ Single 125MHz clock domain for engine; any CDC (UART, buttons/KEY[0] kill switch
 
 ---
 
-*Generated from `fpga_tick_to_trade_master_spec.md` v2.0 (single source of truth) and `ml_engineer_brief.md`. Spec-only, pre-implementation — no `rtl/`/`sim/` yet. Target: Artix-7 `XC7A35T-2FGG484I`, 125MHz single domain, Vivado/Vitis HLS 2023.x, Verilog-2001 (exception: hls4ml IP).*
+*Generated from `fpga_tick_to_trade_master_spec.md` v2.0 (single source of truth) and `ml_engineer_brief.md`. Implementation in progress — parser/book/features/signal/risk/egress (S0-S3, S5, S7-S8) done in `rtl/`+`sim/`; ML training/integration (S4/S6) and instrumentation (S9) not yet started. Target: Artix-7 `XC7A35T-2FGG484I`, 125MHz single domain, Vivado/Vitis HLS 2023.x, Verilog-2001 (exception: hls4ml IP).*
 

@@ -37,9 +37,16 @@ real IP cores need regenerating in Vivado before any synthesis that touches `ven
 `eth_mac_if.v` also exposes `frame_start`/`rx_len` (D11) so `frame_classifier.v` can gate a
 frame's byte stream before any of its bytes arrive.
 
-`frame_classifier.v` and `md_parser.v` exist (S2). Not yet written:
-`symbol_filter.v` through `csr_block.v`. Before adding the next one:
-define its interface (signals, widths, handshake, latency) per `fpga_project_flow.md` Stage 4,
-lint it, and write its testbench in `tb/` against the golden model in `sim/` before wiring it
-into `tob_top.v`. `docs/design_decisions.md` D1–D11 record the MAC-integration and
-frame-gating decisions already made.
+**Done and passing (S2/S3/S5/S7/S8):** `frame_classifier.v`, `md_parser.v`, `symbol_filter.v`,
+`seq_monitor.v`, `tob_engine.v`, `feature_extractor.v`, `feature_normalizer.v`,
+`signal_engine.v`, `risk_engine.v`, `order_builder.v` — each has a passing `tb/tb_<module>.v`
+under Icarus; the parser stage additionally passes a 1,000,000-message zero-loss soak
+(`tb/tb_parser_soak.v`). **Not yet written (S6/S9):** `ml_classifier_wrap.v`, `ml_policy.v`,
+`latency_histogram.v`, `csr_block.v`, and the `[ALIGN]` shift register — S4 (ML training/
+hls4ml export) hasn't started, so nothing downstream of the feature/signal split has an ML
+input to align against yet. Before adding the next one: define its interface (signals, widths,
+handshake, latency) per `fpga_project_flow.md` Stage 4, lint it, and write its testbench in
+`tb/` against the golden model in `sim/` before wiring it into `tob_top.v`.
+`docs/design_decisions.md` D1–D18 record every decision made so far, several of them (D12–D18)
+found by writing each module's contract before the RTL — read the newest few before starting
+the next module, they're the most likely to be relevant.

@@ -411,4 +411,4 @@ if failures:
         print(f"  - {f}")
     raise SystemExit(1)
 
-print("PASS: hand-computed 20-message case matches the golden model exactly")
+print("PASS: hand-computed 25-message case matches the golden model exactly")
