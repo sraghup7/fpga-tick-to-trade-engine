@@ -38,7 +38,11 @@ module eth_mac_if #(
     // ---------------------------------------------------------------
     output reg  [7:0] rx_data,
     output reg        rx_valid,
-    output reg        rx_last,   // high on the cycle rx_data carries the final byte
+    output reg        rx_last,        // high on the cycle rx_data carries the final byte
+    output wire       frame_start,    // one-cycle pulse: a new frame's rx_len is now
+                                      // valid, INCLUDING a zero-length frame
+    output wire [15:0] rx_len,        // this frame's declared byte length; stable
+                                      // from frame_start until the *next* frame_start
 
     // ---------------------------------------------------------------
     // TX: fixed-size payload in, from order_builder
@@ -81,11 +85,28 @@ module eth_mac_if #(
     // Stage 2 runs every cycle regardless of stage 1's branching, so the
     // final byte still drains correctly even though rx_reading itself
     // drops one cycle before that drain completes.
+    //
+    // frame_start/rx_len are plain taps on signals the RX walk already
+    // has: frame_start aliases valid_rise (the vendor boundary's own
+    // valid-rising edge -- NOT rx_valid's, which never fires for a
+    // genuinely empty (0-byte) UDP payload since there is no byte to walk
+    // the RAM for), and rx_len aliases udp_rec_data_length (the declared
+    // length, stable from frame_start until the *next* frame_start -- see
+    // below). Without frame_start, a 0-length frame (T05, FR-5) would be
+    // entirely invisible downstream: not even rx_last would fire, so
+    // md_parser/frame_classifier would have no way to count it toward
+    // err_frame_len. Exposing the authoritative length directly also means
+    // downstream never needs to infer "bad length" by counting bytes and
+    // reasoning about rx_last's position -- it can just check
+    // rx_len % 16 != 0 the same cycle frame_start pulses.
     // -----------------------------------------------------------------
     reg        valid_d;
     wire       valid_rise = udp_rec_data_valid & ~valid_d;
 
-    reg [15:0] rx_len;
+    assign frame_start = valid_rise;
+    assign rx_len      = udp_rec_data_length;
+
+    reg [15:0] rx_walk_len;  // snapshot of udp_rec_data_length for this walk
     reg        rx_reading;    // still have addresses left to present
     reg        addr_valid;    // stage 1: this cycle's address is meaningful
     reg        data_valid_d;  // stage 2: last cycle's address, data ready now
@@ -94,7 +115,7 @@ module eth_mac_if #(
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             valid_d               <= 1'b0;
-            rx_len                <= 16'd0;
+            rx_walk_len           <= 16'd0;
             rx_reading            <= 1'b0;
             addr_valid            <= 1'b0;
             data_valid_d          <= 1'b0;
@@ -111,16 +132,17 @@ module eth_mac_if #(
             addr_val_d   <= udp_rec_ram_read_addr;
             rx_valid     <= data_valid_d;
             rx_data      <= udp_rec_ram_rdata;
-            rx_last      <= data_valid_d && (addr_val_d == rx_len[10:0] - 11'd1);
+            rx_last      <= data_valid_d && (addr_val_d == rx_walk_len[10:0] - 11'd1);
 
-            // Stage 1: address generation.
+            // Stage 1: address generation (only meaningful when there's at
+            // least one byte to read).
             if (valid_rise && !rx_reading && udp_rec_data_length != 16'd0) begin
-                rx_len                <= udp_rec_data_length;
+                rx_walk_len           <= udp_rec_data_length;
                 rx_reading            <= 1'b1;
                 udp_rec_ram_read_addr <= 11'd0;
                 addr_valid            <= 1'b1;
             end else if (rx_reading) begin
-                if (addr_valid && udp_rec_ram_read_addr == rx_len[10:0] - 11'd1) begin
+                if (addr_valid && udp_rec_ram_read_addr == rx_walk_len[10:0] - 11'd1) begin
                     // Just presented the final address -- nothing more to
                     // issue. Stage 2 above still drains it next cycle.
                     addr_valid <= 1'b0;

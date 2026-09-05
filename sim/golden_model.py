@@ -163,15 +163,34 @@ class OrderRecord:
         )
 
 
-def parse_frame_payload(payload: bytes) -> list[bytes]:
-    """Split a frame's payload into 16-byte messages (S4.4, FR-4/FR-5).
+def parse_frame_payload(payload: bytes) -> tuple[list[bytes], bool]:
+    """Split a frame's payload into complete 16-byte messages (S4.4,
+    FR-4/FR-5). Returns (complete_messages, bad_length); on a bad length,
+    complete_messages is always [] -- discard the frame whole, per FR-5's
+    literal wording.
 
-    Returns the list of message slices, or [] if the payload length is not
-    a multiple of 16 (caller must count err_frame_len and discard whole).
+    A version of this briefly discarded only an incomplete *trailing*
+    remainder, on the reasoning that a streaming parser can't know a
+    frame's total length until it ends, so messages already forwarded
+    can't be retroactively un-forwarded. That reasoning is correct in
+    general but doesn't apply to this project's actual architecture: D1's
+    decision to reuse the vendor MAC means the whole frame is already
+    buffered, with its length known and exposed (eth_mac_if.v's
+    frame_start/rx_len) *before* a single payload byte streams
+    out. frame_classifier.v can and does check the length first and
+    decide whether to forward anything at all -- so "discard whole" is
+    both what FR-5 says and what the real RTL actually does here. Reverted
+    once this was noticed, before md_parser.v was designed against the
+    wrong assumption.
+
+    A 0-byte payload (below FR-4's 1-message minimum) counts as bad_length
+    too. A payload over the 88-message maximum is treated the same way
+    (nothing forwarded) rather than truncated at 88 -- that boundary isn't
+    covered by T05 and is a simplification, not a resolved decision.
     """
     if len(payload) == 0 or len(payload) % 16 != 0 or len(payload) > 88 * 16:
-        return []
-    return [payload[i : i + 16] for i in range(0, len(payload), 16)]
+        return [], True
+    return [payload[i : i + 16] for i in range(0, len(payload), 16)], False
 
 
 # ---------------------------------------------------------------------
@@ -404,19 +423,39 @@ class GoldenModel:
         if msg.flags & FLAG_SNAPSHOT:
             self.seq_gap = False  # FR-12
 
-        # FR-7: symbol filter.
-        if msg.symbol_id not in self.cfg.watched_symbols():
-            self.counters.inc("cnt_msgs_filtered")
-            return ProcessResult()
-
-        # FR-8: undefined msg_type.
+        # FR-8/FR-9: msg_type/flags validation, run BEFORE the symbol
+        # filter -- the mirror image of the seq/dup reordering just above,
+        # and for an architectural reason rather than a spec-priority one:
+        # md_parser.v (S2, already committed) is the module that checks
+        # msg_type/flags, and it sits upstream of symbol_filter.v in the
+        # pipeline (master spec S3.1's block diagram: md_parser ->
+        # symbol_filter -> seq_monitor -> tob_engine). By the time a
+        # message would reach a symbol filter in the real datapath, an
+        # undefined msg_type or a reserved flags bit has already dropped
+        # it -- md_parser never forwards msg_valid for it, and there is no
+        # symbol-filter-shaped module upstream of md_parser to have
+        # filtered it first. A message that is simultaneously on an
+        # unwatched symbol_id and has a bad msg_type therefore reports
+        # err_msg_type in the real RTL, never cnt_msgs_filtered, regardless
+        # of what its symbol_id is. This was a real ordering bug in this
+        # model (filter was checked first) caught by design-decision
+        # review while writing the S3 (symbol_filter/seq_monitor/tob_engine)
+        # contracts, before any S3 test exercised the combination --
+        # docs/design_decisions.md D12. See
+        # sim/test_golden_model_handcase.py messages 21-22 for the
+        # corner case this fixes.
         if msg.msg_type not in VALID_MSG_TYPES:
             self.counters.inc("err_msg_type")
             return ProcessResult()
 
-        # FR-9: reserved flag bits must be 0.
         if msg.flags & FLAG_RESERVED_MASK:
             self.counters.inc("err_flags")
+            return ProcessResult()
+
+        # FR-7: symbol filter. Only ever sees messages md_parser.v already
+        # validated (msg_type/flags both OK) -- see the comment above.
+        if msg.symbol_id not in self.cfg.watched_symbols():
+            self.counters.inc("cnt_msgs_filtered")
             return ProcessResult()
 
         # Counted as accepted here regardless of is_dup: a duplicate is
@@ -433,14 +472,32 @@ class GoldenModel:
         book = self._book(msg.symbol_id)
         book_modifying = msg.msg_type in (MSG_QUOTE, MSG_CLEAR)
 
+        # D17: captured BEFORE this message refreshes book.last_update_cycle
+        # below, specifically so GATE_STALE's check (further down) measures
+        # the gap that existed BEFORE this message arrived, not the (always
+        # zero) gap between this message and itself. See D17's writeup in
+        # docs/design_decisions.md for why the original unconditional
+        # "update the timestamp, then check the gap against a value already
+        # equal to current_cycle" ordering made GATE_STALE unreachable.
+        prev_update_cycle = book.last_update_cycle
+
         if msg.msg_type == MSG_QUOTE:
-            # FR-14/15: replace price+qty for the addressed side; qty=0 invalidates.
+            # FR-14: replace price+qty for the addressed side.
+            # FR-15 (D14): qty=0 invalidates that side WITHOUT altering the
+            # stored price -- the price write is conditional on quantity !=
+            # 0, not unconditional like FR-14's general case. Any side
+            # value other than SIDE_BID selects ask (golden_model.py's own
+            # convention throughout, not just 0/1 -- matches
+            # docs/contracts/md_parser.md's "msg_side: any value 0-255, no
+            # validation needed here").
             if msg.side == SIDE_BID:
-                book.bid_price = msg.price
+                if msg.quantity != 0:
+                    book.bid_price = msg.price
                 book.bid_qty = msg.quantity
                 book.bid_valid = msg.quantity != 0
             else:
-                book.ask_price = msg.price
+                if msg.quantity != 0:
+                    book.ask_price = msg.price
                 book.ask_qty = msg.quantity
                 book.ask_valid = msg.quantity != 0
             book.last_update_cycle = self.current_cycle
@@ -526,7 +583,11 @@ class GoldenModel:
             gates_fired.append(GATE_POSITION)
         if abs(order_price - book.mid) > self.cfg.price_band:
             gates_fired.append(GATE_BAND)
-        if (self.current_cycle - book.last_update_cycle) > self.cfg.max_age:
+        # D17: uses prev_update_cycle (captured before THIS message's own
+        # refresh above), not book.last_update_cycle -- the latter was
+        # already overwritten to self.current_cycle by this same message,
+        # which made the gap always read 0 and GATE_STALE unreachable.
+        if (self.current_cycle - prev_update_cycle) > self.cfg.max_age:
             gates_fired.append(GATE_STALE)
         if self.seq_gap:
             gates_fired.append(GATE_SEQGAP)
@@ -569,8 +630,15 @@ class GoldenModel:
             result.order_dropped_overflow = True
             return result
 
+        # D16: position tracks what was ACTUALLY filled -- reduced_qty when
+        # gate 0x09's ml_action=1 reduce path applied, not the pre-reduction
+        # order_qty signed_qty was computed from. Gate 0x03's own check
+        # above deliberately still used the unreduced order_qty (FR-48: the
+        # ML reduction is gate 0x09's own action, independent of gates
+        # 0x01-0x08's evaluation) -- only the final ledger update changes.
+        final_signed_qty = reduced_qty if order_side == SIDE_BID else -reduced_qty
         self.token_bucket -= 1
-        self.position[msg.symbol_id] = self.position[msg.symbol_id] + signed_qty
+        self.position[msg.symbol_id] = self.position[msg.symbol_id] + final_signed_qty
         self._tx_busy_until.append(self.current_cycle + ORDER_TX_CYCLES)
 
         self.counters.inc("cnt_orders_tx")
@@ -611,9 +679,10 @@ class GoldenModel:
             self.counters.inc("err_fcs")
             return []
 
-        messages = parse_frame_payload(payload)
-        if not messages:
+        messages, bad_length = parse_frame_payload(payload)
+        if bad_length:
             self.counters.inc("err_frame_len")
+        if not messages:
             return []
 
         results = []

@@ -1,11 +1,13 @@
 """sim/test_golden_model_handcase.py
 
 The S1 milestone gate (master spec S15): "golden models produce expected
-output for a hand-computed 20-message case." 20 messages plus 2 control-
-plane actions (kill switch assert/clear, not messages). Every expected
-value below is computed by hand in the comment above the assertion, not
-derived by running the model and copying its output -- that would just
-confirm the model agrees with itself.
+output for a hand-computed 20-message case." Now 25 messages (the original
+20, plus 3 for D12's filter-vs-type/flags ordering fix and 2 for D14's
+FR-15 price-preservation fix -- see docs/design_decisions.md) plus 2
+control-plane actions (kill switch assert/clear, not messages). Every
+expected value below is computed by hand in the comment above the
+assertion, not derived by running the model and copying its output --
+that would just confirm the model agrees with itself.
 
 This case did its job once already: the first version of golden_model.py
 ran the symbol filter before sequence-gap tracking, so message 3 (an
@@ -28,6 +30,7 @@ from golden_model import (
     GATE_BAND,
     GATE_KILL,
     GATE_SEQGAP,
+    GATE_STALE,
     FLAG_SNAPSHOT,
     Config,
     GoldenModel,
@@ -243,13 +246,71 @@ r = m.process_message(msg(119, 1, MSG_QUOTE, SIDE_BID, flags=0x80, price=1, qty=
 check("m20b err_flags", m.counters["err_flags"], 1)
 check("m20b order", r.order, None)
 
+# 21. seq=120 sym=99 (unwatched) AND msg_type=0x05 (undefined), both at once.
+#     D12: msg_type/flags is checked before the symbol filter (md_parser.v
+#     already drops this upstream of symbol_filter.v in the real pipeline)
+#     -> err_msg_type+=1, NOT cnt_msgs_filtered. Before D12's reorder this
+#     assertion would have failed (old code checked filter first and would
+#     have reported cnt_msgs_filtered instead).
+r = m.process_message(msg(120, 99, 0x05))
+check("m21 err_msg_type (not filtered)", m.counters["err_msg_type"], 2)
+check("m21 cnt_msgs_filtered unchanged", m.counters["cnt_msgs_filtered"], 1)
+check("m21 order", r.order, None)
+
+# 22. seq=121 sym=99 (unwatched) AND reserved flag bit7 set, both at once.
+#     Same reasoning as m21: err_flags+=1, NOT cnt_msgs_filtered.
+r = m.process_message(msg(121, 99, MSG_QUOTE, SIDE_BID, flags=0x80, price=1, qty=1))
+check("m22 err_flags (not filtered)", m.counters["err_flags"], 2)
+check("m22 cnt_msgs_filtered unchanged", m.counters["cnt_msgs_filtered"], 1)
+check("m22 order", r.order, None)
+
+# 23. seq=122 sym=99 (unwatched), well-formed type/flags -> filtered, as
+#     before -- confirms D12 only reorders the *simultaneous* bad case,
+#     not plain filtering.
+r = m.process_message(msg(122, 99, MSG_QUOTE, SIDE_BID, price=1, qty=1))
+check("m23 cnt_msgs_filtered", m.counters["cnt_msgs_filtered"], 2)
+check("m23 order", r.order, None)
+
+# 24. seq=123 sym2, QUOTE bid qty=0 with a garbage price (9999) -- D14:
+#     FR-15's "clears validity without altering stored price" means the
+#     price write itself is skipped when qty=0, not just that valid is
+#     cleared. book2.bid_price was set to 500 by message 19 and must still
+#     read 500 afterward, not 9999. bid_qty must read 0, bid_valid False.
+r = m.process_message(msg(123, 2, MSG_QUOTE, SIDE_BID, price=9999, qty=0))
+check("m24 bid_price unchanged (D14)", m.books[2].bid_price, 500)
+check("m24 bid_qty cleared", m.books[2].bid_qty, 0)
+check("m24 bid_valid cleared", m.books[2].bid_valid, False)
+check("m24 signal (bid invalid)", r.signal_fired, None)
+
+# 25. seq=124 sym2, QUOTE bid price=505/qty=7 (side revalidated normally --
+#     confirms D14's conditional-price-write didn't break the ordinary
+#     FR-14 path, only the qty=0 case).
+#     book2 now: bid=505/7, ask=520/3 (unchanged since m20). spread=15>=2.
+#     bid_qty(7)>ask_qty(3)<<1=6 -> BUY. price=ask=520, qty=100.
+#     gates: kill=F (cleared since m17). size 100<=500 ok.
+#       position2: 100(from m20)+100=200<=1000 ok.
+#       band: mid=(505+520)>>1=512, |520-512|=8<=50 ok.
+#       stale ok (fresh). seqgap F (cleared since m8, no gap since). crossed F.
+#       throttle: token=3 (after m2,m9,m12,m18,m20 each -1 from 8) >0 ok. ML F.
+#     -> ACCEPTED. position2=200, token=2, cnt_orders_tx=6.
+r = m.process_message(msg(124, 2, MSG_QUOTE, SIDE_BID, price=505, qty=7))
+check("m25 bid_price updated", m.books[2].bid_price, 505)
+check("m25 bid_qty updated", m.books[2].bid_qty, 7)
+check("m25 bid_valid set", m.books[2].bid_valid, True)
+check("m25 signal", r.signal_fired, "buy")
+check("m25 order.msg_type", r.order.msg_type, ORDER_MSG_NEW)
+check("m25 position2", m.position[2], 200)
+check("m25 token", m.token_bucket, 2)
+check("m25 cnt_orders_tx", m.counters["cnt_orders_tx"], 6)
+
 # -- final invariant check (master spec S10): --
 # cnt_signal_buy + cnt_signal_sell = cnt_orders_tx + sum(cnt_rej_*) + cnt_order_overflow
-# Signals fired: m2(buy) m6(sell) m9(buy) m12(buy) m13(buy) m16(buy) m18(sell) m20(buy) = 8
-# Orders_tx (accepted): m2,m9,m12,m18,m20 = 5
+# Signals fired: m2(buy) m6(sell) m9(buy) m12(buy) m13(buy) m16(buy) m18(sell)
+#                m20(buy) m25(buy) = 9
+# Orders_tx (accepted): m2,m9,m12,m18,m20,m25 = 6
 # Rejects: m6(seqgap) m13(band) m16(kill) = 3
 # Overflow: 0
-check("cnt_signal_buy", m.counters["cnt_signal_buy"], 6)
+check("cnt_signal_buy", m.counters["cnt_signal_buy"], 7)
 check("cnt_signal_sell", m.counters["cnt_signal_sell"], 2)
 check(
     "invariant: signals == orders + rejects + overflow",
@@ -260,7 +321,7 @@ check(
     + m.counters["cnt_rej_kill"]
     + m.counters["cnt_order_overflow"],
 )
-check("cnt_msgs_rx", m.counters["cnt_msgs_rx"], 20)
+check("cnt_msgs_rx", m.counters["cnt_msgs_rx"], 25)
 check(
     "invariant: msgs_rx == filtered + accepted + err_msg_type + err_flags",
     m.counters["cnt_msgs_rx"],
@@ -270,10 +331,84 @@ check(
     + m.counters["err_flags"],
 )
 
+# ============================================================================
+# D16 regression: gate 0x09's ml_action=1 (reduce) path. Separate model
+# instance/config (ml_action=1, ml_reduce_shift=1) -- not part of the
+# 25-message default-config narrative above. Before D16, `position` was
+# updated by the pre-reduction order_qty (100) even though the emitted
+# order and the ledger disagreed about how many shares actually traded;
+# fixed to use reduced_qty (order_qty >> ml_reduce_shift = 50) for the
+# position update specifically, while gate 0x03's own admission check still
+# uses the unreduced order_qty (FR-48: ML reduction is gate 0x09's own
+# action, independent of gates 0x01-0x08's evaluation -- this is
+# deliberately NOT "fixed" to also use reduced_qty).
+m2 = GoldenModel(Config(cfg_reject_report=True, ml_action=1, ml_reduce_shift=1))
+
+# n1: seq=1 QUOTE bid 1000/50 sym1 -> book1 bid=1000/50, ask invalid, no signal.
+m2.process_message(msg(1, 1, MSG_QUOTE, SIDE_BID, price=1000, qty=50))
+
+# n2: seq=2 QUOTE ask 1010/10 sym1, adverse_risk=True.
+#     book1: bid=1000/50, ask=1010/10. spread=10>=2. bid_qty(50)>ask_qty(10)<<1=20
+#     -> BUY. price=ask=1010, order_qty=100(cfg.order_qty).
+#     gates 0x01-0x08: none fire (kill=F, size 100<=500, position
+#       0+100=100<=1000 [checked against UNREDUCED 100, not 50], band
+#       mid=(1000+1010)>>1=1005 |1010-1005|=5<=50, stale ok, seqgap F,
+#       crossed F, throttle token 8>0). ml_action=1 -> reduced_qty =
+#       100>>1 = 50, GATE_ML does NOT fire (reduce, not block).
+#     -> ACCEPTED. Reported order.quantity = 50 (reduced). Position update
+#     uses the REDUCED signed qty (D16): position1 = 0 + 50 = 50, not 100.
+r = m2.process_message(msg(2, 1, MSG_QUOTE, SIDE_ASK, price=1010, qty=10), adverse_risk=True)
+check("n2 order.quantity (reduced)", r.order.quantity, 50)
+check("n2 order.reject_reason (accepted)", r.order.reject_reason, 0x00)
+check("n2 position1 (D16: reduced, not 100)", m2.position[1], 50)
+check("n2 cnt_ml_adverse", m2.counters["cnt_ml_adverse"], 1)
+check("n2 cnt_rej_ml (reduce, not a reject)", m2.counters["cnt_rej_ml"], 0)
+
+# ============================================================================
+# D17 regression: gate 0x05 (staleness) was UNREACHABLE via any normal
+# message flow before this fix. book.last_update_cycle was overwritten to
+# self.current_cycle at the top of every book-modifying message's
+# processing, BEFORE the staleness check ran later in that same call --
+# so "current_cycle - book.last_update_cycle" was always comparing a
+# just-refreshed timestamp against itself (always 0), and GATE_STALE could
+# never fire for any book-modifying message, ever, regardless of how long
+# the symbol had actually been silent. T18_gate_stale (a REQUIRED S7 gate
+# test) could not have passed against the unfixed model. Fixed by capturing
+# `prev_update_cycle` BEFORE the message's own refresh, and checking THAT
+# (not the just-overwritten book.last_update_cycle) against max_age.
+# Separate model instance, small max_age=50 to make the arithmetic legible.
+m3 = GoldenModel(Config(cfg_reject_report=True, max_age=50))
+
+# n3: seq=1 QUOTE bid 1000/50 sym1 @ cycle 10 -> bid valid, ask invalid,
+#     no signal (ask side still invalid). last_update_cycle1 = 10.
+r = m3.process_message(msg(1, 1, MSG_QUOTE, SIDE_BID, price=1000, qty=50), arrival_cycle=10)
+check("n3 signal", r.signal_fired, None)
+
+# n4: seq=2 QUOTE ask 1010/10 sym1 @ cycle 20. book1: bid=1000/50,
+#     ask=1010/10. spread=10>=2. bid_qty(50)>ask_qty(10)<<1=20 -> BUY.
+#     gap since n3's touch = 20-10=10, not > max_age(50) -> STALE not fired.
+#     -> ACCEPTED. last_update_cycle1 becomes 20.
+r = m3.process_message(msg(2, 1, MSG_QUOTE, SIDE_ASK, price=1010, qty=10), arrival_cycle=20)
+check("n4 order.reject_reason (fresh, accepted)", r.order.reject_reason, 0x00)
+
+# n5 ("silence past MAX_AGE"): seq=3, same QUOTE resent @ cycle 1000 --
+#     980 cycles since n4's touch (20), far past max_age=50. GATE_STALE
+#     fires (D17: this is the case that was unreachable before the fix).
+#     last_update_cycle1 becomes 1000 regardless of the reject (the
+#     timestamp always refreshes on a book-modifying touch, per FR-19).
+r = m3.process_message(msg(3, 1, MSG_QUOTE, SIDE_ASK, price=1010, qty=10), arrival_cycle=1000)
+check("n5 order.reject_reason (D17: STALE)", r.order.reject_reason, GATE_STALE)
+
+# n6 ("then fresh update"): seq=4, same QUOTE again @ cycle 1010 -- only 10
+#     cycles since n5's touch (1000), not > max_age(50) -> accepted again,
+#     confirming the block clears once the book is genuinely fresh.
+r = m3.process_message(msg(4, 1, MSG_QUOTE, SIDE_ASK, price=1010, qty=10), arrival_cycle=1010)
+check("n6 order.reject_reason (fresh again, accepted)", r.order.reject_reason, 0x00)
+
 if failures:
     print(f"FAIL ({len(failures)} mismatch(es)):")
     for f in failures:
         print(f"  - {f}")
     raise SystemExit(1)
 
-print("PASS: hand-computed 20-message case matches the golden model exactly")
+print("PASS: hand-computed 25-message case matches the golden model exactly")

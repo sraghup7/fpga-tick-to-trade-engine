@@ -4,7 +4,7 @@
 
 A pipelined FPGA that receives a synthetic Gigabit-Ethernet market-data feed, parses and filters it, maintains top-of-book state, extracts fixed-point features, runs a quantized ML classifier, gates the resulting order intent through deterministic risk checks (including the ML verdict), and emits a simulated order — at a **measured, fixed tick-to-trade latency**, verified bit-exact against a Python golden model.
 
-> **Status: spec-complete, pre-implementation.** The master specification (`docs/master_spec.md`) is finished and covers the full design, requirements traceability, and verification plan. RTL, simulation, and Python tooling land on the `develop` branch as the implementation proceeds. See [Roadmap](#roadmap).
+> **Status: implementation in progress — milestones S0–S3, S5, S7, S8 done** (2026-09-03). The parser, book/feature-extraction, signal, risk, and egress stages are built, each with a passing Icarus testbench; two Python golden models pass their hand-case regressions; the 1,000,000-message parser soak passes with zero loss. The ML stages (S4 training/hls4ml export, S6 integration) and instrumentation (S9: histogram, CSR) haven't started yet, so there's no bitstream or hardware result to report. See [Roadmap](#roadmap).
 
 ---
 
@@ -139,29 +139,33 @@ The ML engineer's self-contained brief is `ml_engineer_brief.md`.
 ├── fpga_tick_to_trade_master_spec.md   # single source of truth (design + traceability)
 ├── ml_engineer_brief.md                # ML collaborator handoff (Python/hls4ml only)
 ├── AGENTS.md                           # instructions for AI-assisted development
-├── docs/                               # (planned) block diagram, latency budget, decisions
-├── rtl/                                # (planned) Verilog-2001, one module per stage
-├── sim/                                # (planned) golden models, feed generator, comparer
-├── model/                              # (planned) training, quantization, exported weights
-├── tb/                                 # (planned) self-checking testbenches
-├── hls4ml/                             # (planned) generated project, rebuilt by script
-├── scripts/  constraints/  results/    # (planned) build, XDC, published measurements
+├── docs/                               # design_decisions.md (18 entries), contracts/ (per-module handoffs)
+├── rtl/                                # Verilog-2001; parser/book/features/signal/risk/egress done, ML+instrumentation stages not yet
+├── sim/                                # golden_model.py, feature_golden.py, order_rx.py + hand-case tests done; ml_golden.py/compare.py not yet
+├── model/                              # (empty) ML collaborator's side — S4 hasn't started
+├── tb/                                 # self-checking testbenches, one per landed module; tb_top.v (full integration) not yet
+├── hls4ml/                             # (not yet — generated project, rebuilt by script once S4 lands)
+├── scripts/  constraints/  results/    # build.tcl, run_sim.sh, make_slides.py done; build_hls4ml.py/report.py not yet; results/ empty until S10+
 ```
 
 ---
 
 ## Reproducing results
 
-No code yet — the design is fully specified but pre-implementation. The plan:
+The datapath through egress (parser → book → features → signal → risk → order framing) is implemented and self-checking today:
 
 ```bash
-make sim      # run all self-checking tests against the golden model
-make synth    # headless Vivado synthesis + timing closure at 125 MHz
-make bit      # place-and-route → bitstream
-make all      # full flow
+make sim          # everything: golden models, RTL lint, every testbench, 1M-message soak
+RUN_SIM_FAST=1 make sim   # same, skipping the slow 1M-message soak
+
+# or decode an order capture directly:
+python sim/order_rx.py --in some_capture.hex
+python sim/order_rx.py --udp 5006   # live, once S11 hardware exists to send traffic
 ```
 
-Success criteria (defined in the master spec §1.6): line-rate processing of ≥ 1,000,000 messages with zero drops; a **single-occupancy latency histogram** (max == min); every risk gate individually demonstrated blocking; bit-exact RTL vs. golden model on a randomized soak; WNS > 0 at 125 MHz; one-command reproduction from a clean clone.
+`make synth`/`make bit`/`make ml` are still stubs — no timing/utilization/bitstream results exist yet (S10+), and the ML flow is S4/S6.
+
+Success criteria (defined in the master spec §1.6): line-rate processing of ≥ 1,000,000 messages with zero drops — **met** for the parser stage; a **single-occupancy latency histogram** (max == min) — not measurable yet, no histogram module (S9); every risk gate individually demonstrated blocking — **met** in simulation for gates `0x01`–`0x08`, gate `0x09` (ML) not built yet; bit-exact RTL vs. golden model on a randomized soak; WNS > 0 at 125 MHz; one-command reproduction from a clean clone — **met for simulation** (`make sim`), not yet for synthesis/bitstream.
 
 ## Honest limitations
 
@@ -179,14 +183,18 @@ Success criteria (defined in the master spec §1.6): line-rate processing of ≥
 
 ## Roadmap
 
-| Stage | Milestone |
-| :-- | :-- |
-| S0–S1 | Repo scaffold, message format, golden models |
-| S2–S3 | Parser, filter, book, feature extraction |
-| S4 | ML training, quantization, hls4ml export (parallel track) |
-| S5–S9 | Signal, ML integration, risk, egress, instrumentation |
-| S10–S11 | Integration, timing closure, hardware bring-up |
-| S12 | Publish: README, results tables, demo video |
+| Stage | Milestone | Status |
+| :-- | :-- | :-- |
+| S0–S1 | Repo scaffold, message format, golden models | Done |
+| S2–S3 | Parser, filter, book, feature extraction | Done |
+| S5 | Signal engine | Done (built ahead of S4/S6 — doesn't depend on ML) |
+| S7 | Risk engine (9 gates) | Done |
+| S8 | Egress (`order_builder`, framing) | Done — RTL, testbench, and `sim/order_rx.py` host-side decoder |
+| S4 | ML training, quantization, hls4ml export (parallel track) | Not started |
+| S6 | ML integration (`ml_classifier_wrap`, `ml_policy`, alignment register) | Not started |
+| S9 | Instrumentation (`latency_histogram`, `csr_block`, stats) | Not started |
+| S10–S11 | Integration, timing closure, hardware bring-up | Not started |
+| S12 | Publish: README, results tables, demo video | Not started |
 
 ## License
 

@@ -1,0 +1,7 @@
+{
+  "status": "PLACEHOLDER - not trained. S4 has not run. This is the master spec Section 15 fallback classifier, wired in for S6 so the datapath and risk gate 0x09 close out in simulation without blocking on the ML collaborator. Replace weights.mem/bias.mem with S4's trained, quantized output when available -- no RTL or wiring change required elsewhere.",
+  "features": ["F0_spread", "F1_mid_delta", "F2_imbalance", "F3_bid_chg", "F4_ask_chg", "F5_update_rate", "F6_last_trade_dir", "F7_volatility"],
+  "weights": [1, 1, 1, 1, 1, 1, 1, 1],
+  "bias": 0,
+  "formula": "z = bias + sum(w_i * x_i), int8 features/weights, int16 exact products, int32 accumulator"
+}

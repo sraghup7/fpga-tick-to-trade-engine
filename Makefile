@@ -11,7 +11,7 @@ synth bit:
 	"$(VIVADO)" -mode batch -source scripts/build.tcl
 
 sim:
-	@echo "No golden model / testbenches yet (lands at S1) -- nothing to run."
+	bash scripts/run_sim.sh
 
 ml:
 	@echo "Owned by the ML collaborator -- see ml_engineer_brief.md."

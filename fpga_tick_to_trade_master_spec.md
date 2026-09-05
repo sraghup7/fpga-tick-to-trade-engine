@@ -218,9 +218,9 @@ Keeping the threshold and hysteresis *outside* the hls4ml IP is deliberate: the 
 
 `LINK_MODE` parameter selects ingress framing.
 
-**Mode 0 — Raw Ethernet (`LINK_MODE = 0`), default for bring-up.** EtherType `0x88B5` (local-experimental). No IP/UDP/ARP; payload begins at byte 14. Host uses a raw socket.
+**Mode 0 — Raw Ethernet (`LINK_MODE = 0`).** EtherType `0x88B5` (local-experimental). No IP/UDP/ARP; payload begins at byte 14. Host uses a raw socket. **Deferred, not the bring-up default** — see `docs/design_decisions.md` D3: the vendored MAC (D1) only dispatches ARP/IPv4/UDP, so a raw-EtherType frame would need a hand-modified vendor dispatch path. Sim-only for now (the Verilog testbench can drive whatever framing it likes) or a later v1.x addition if a real need shows up; FR-2 stays in the spec but does not gate S11.
 
-**Mode 1 — UDP/IPv4 (`LINK_MODE = 1`), the realistic mode.** EtherType `0x0800`, IPv4 (version 4, IHL 5, no options — IHL ≠ 5 discarded), protocol 17, destination UDP port matched against `cfg_udp_port` (default 60000). IPv4 header checksum verified; UDP checksum not verified (optional under IPv4; verifying it would require buffering the whole datagram and destroy the latency property — a real, defensible trade-off, stated in the README).
+**Mode 1 — UDP/IPv4 (`LINK_MODE = 1`), the bring-up default.** EtherType `0x0800`, IPv4 (version 4, IHL 5, no options — IHL ≠ 5 discarded), protocol 17, destination UDP port matched against `cfg_udp_port` (default 60000). IPv4 header checksum verified; UDP checksum not verified (optional under IPv4; verifying it would require buffering the whole datagram and destroy the latency property — a real, defensible trade-off, stated in the README). Hardware bring-up (S11) targets this mode from the start — reversed from this document's original raw-Ethernet-first lean once D1 fixed the MAC's actual boundary; see D3.
 
 For Mode 1 the host sets a static ARP entry (no ARP responder in v1):
 

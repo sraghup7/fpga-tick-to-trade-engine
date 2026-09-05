@@ -365,6 +365,1064 @@ cycle-locked checksum engine).
 
 ---
 
+## D11 — Bad-length frames: discard whole, not just the trailing remainder
+
+**Decision:** `eth_mac_if.v` gained two new outputs, `frame_start` (pulses
+once per frame, including a genuinely empty one) and `rx_len` (the
+authoritative length, valid the same cycle) — both available *before* any
+payload byte streams out on `rx_data`. `frame_classifier.v` uses them to
+check `rx_len` up front and decide whether to forward anything for
+that frame at all. `golden_model.py`'s `parse_frame_payload` discards the
+whole frame on a bad length (`[], True`), matching FR-5's literal wording.
+
+**Why this needed two passes to get right.** The first version of
+`parse_frame_payload` also discarded the whole frame, but while designing
+`md_parser.v`'s interface a real objection came up: a genuinely streaming
+parser can't know a frame's *total* length until it ends, and FR-53 times
+each message at "the last byte of a message entering the parser" — implying
+complete 16-byte groups are forwarded as they complete, not held back
+pending the frame's fate. Under that reasoning, "discard whole" isn't
+physically realizable — messages already forwarded three groups ago can't be
+un-forwarded — so `parse_frame_payload` was changed to discard only a
+trailing incomplete remainder, keeping whatever complete messages came
+before it.
+
+That reasoning is correct in general and wrong for this project specifically,
+which is what makes it worth recording rather than just quietly fixing:
+D1 already committed this project to reusing a vendor MAC that buffers the
+*entire* frame and computes its length before `udp_rec_data_valid` ever
+asserts. `eth_mac_if.v` was already sitting on that length — it just wasn't
+exposed yet. Once `frame_start`/`rx_len` were added to surface it,
+`frame_classifier.v` genuinely can decide before forwarding a single byte,
+so the "can't know the length in time" premise doesn't hold here. Reverted
+back to whole-frame discard before `md_parser.v` got designed against the
+wrong assumption, which would have made the two disagree with each other.
+
+**Consequence for `md_parser.v`'s design:** it doesn't need to infer a bad
+length by counting bytes and reasoning about where `rx_last` fell — it can
+just read `rx_len` directly at `frame_start` and know immediately
+whether to expect a byte stream at all.
+
+Also fixes a real gap `frame_start`/`rx_len` incidentally closes: a
+0-byte UDP payload (T05's third case) previously produced *no signal
+whatsoever* from `eth_mac_if.v` — not even `rx_last` — since there was no
+byte to walk the RAM for. Without a length-independent "a frame happened"
+pulse, that case would have been invisible downstream. `tb_eth_mac_if_rx.v`
+now covers it directly.
+
+---
+
+## D12 — Golden model: check `msg_type`/`flags` before the symbol filter, not after
+
+**Status: applied**, `sim/golden_model.py`. **Decision:** `GoldenModel.process_message`
+now validates `msg_type`/`flags` (FR-8/FR-9) *before* the symbol filter
+(FR-7), reversing their previous order. Sequence gap/dup tracking (FR-10/11/12)
+is unaffected — it still runs first, before either check (that part of the
+ordering was already correct and already tested; see the comment above it in
+`golden_model.py`).
+
+**Why.** Found while defining the exact interfaces for the S3 contracts
+(`symbol_filter.v`, `seq_monitor.v`) — before any S3 test exercised the
+combination that exposes it. `md_parser.v` (S2, already committed,
+`docs/contracts/md_parser.md`) is the module that checks `msg_type`/`flags`,
+and it sits *upstream* of `symbol_filter.v` in the pipeline (master spec
+§3.1's block diagram: `md_parser → symbol_filter → seq_monitor →
+tob_engine`). By construction, a message with an undefined `msg_type` or a
+reserved `flags` bit never gets a `msg_valid` pulse out of `md_parser.v` — it
+never reaches anything downstream, including a symbol filter. There is no
+way to build a `symbol_filter.v` that sees such a message first; `md_parser.v`
+already dropped it. The old golden-model order (filter, then type/flags)
+was therefore not realizable by the actual chosen architecture — it only
+produces a different result than the RTL for one specific corner case (a
+message that is simultaneously on an unwatched `symbol_id` **and** has a bad
+`msg_type`/reserved `flags` bit), which is exactly why no S1/S2 test caught
+it: `sim/test_golden_model_handcase.py`'s original 20 messages never combined
+those two conditions on one message.
+
+**Consequence:** for that corner case, `err_msg_type`/`err_flags` now
+increments and `cnt_msgs_filtered` does not — matching what `md_parser.v`
+actually does. §10's invariant (`cnt_msgs_rx = filtered + accepted +
+Σerr_*`) still holds; only which bucket a doubly-bad message lands in
+changed. `sim/test_golden_model_handcase.py` messages 21–23 cover the
+corner case directly (both combinations, plus a control case confirming
+plain filtering is unaffected) — 23 messages total now, was 20.
+
+**Consequence for S3 contracts:** `symbol_filter.v` only ever needs to
+handle `md_parser.v`'s `msg_valid`-gated output (type/flags already clean by
+construction) — it does not need any special-case interaction with
+`err_msg_type`/`err_flags`. `seq_monitor.v` is the one exception: FR-10's
+"per feed" sequence tracking must still run on every completed message
+regardless of `msg_valid`, so it consumes `msg_valid | err_msg_type |
+err_flags` from `md_parser.v` as its "a message completed, `msg_seq_num` is
+valid" trigger (all three are registered fields in `md_parser.v`,
+unconditionally latched every message regardless of type/flags validity —
+confirmed by reading `rtl/md_parser.v` directly, not assumed). See
+`docs/contracts/seq_monitor.md` §1 for the exact reasoning as handed to the
+implementer.
+
+Not a resolution of a numbered §17 open question — new information the S3
+contract-writing process surfaced, the same way D11 was surfaced by
+designing `md_parser.v`'s interface.
+
+---
+
+## D13 — F5/F7 window semantics, pinned for the FPGA side
+
+**Status: applied**, `sim/feature_golden.py` (new file) +
+`sim/test_feature_golden_handcase.py` (new file). **Decision:** F5 (update
+rate) and F7 (short-term volatility) share **one** W-deep sliding window per
+symbol, which advances on **every accepted event of any `msg_type`**
+(QUOTE/CLEAR/TRADE/HEARTBEAT), not only book-modifying ones. Each slot
+records `(is_update, abs_mid_delta)` for the event that produced it —
+`is_update` true only for QUOTE/CLEAR (FR-19); `abs_mid_delta` is that
+event's `|F1|`, which is 0 for TRADE/HEARTBEAT (mid does not change then)
+and 0 for the first event after a reset/clear. F5 = count of `is_update`
+slots in the window; F7 = sum of `abs_mid_delta` over the window. The
+*current* event's own contribution is included in that same event's output
+(window read as "as of and including now").
+
+**Why this needed a decision at all:** `ml_engineer_brief.md` §4 states
+outright that window inclusion is unresolved and must be pinned by whoever
+builds against it ("Decide whether the current event is included in the
+window or not, and write it down") — the master spec's own feature table
+(§5.3) doesn't fix it either. This blocks writing a correct
+`feature_extractor.v` contract (T27 needs a bit-exact reference to check
+against), so it had to be resolved before, not during, S3 contract writing.
+
+**Why "every event", not "only book-modifying events":** F5 is described as
+"update rate... in the last W events." If the window only ever held
+book-modifying events, F5 would trivially equal `min(events-seen, W)` —
+saturated almost immediately and constant thereafter, which makes "clipped"
+a pointless thing for the spec to call out. Reading "events" as *all*
+accepted traffic (with F5 counting the book-modifying fraction of it) is the
+only reading that makes F5 a real, varying signal — heavier trade/heartbeat
+traffic relative to quotes correctly lowers it.
+
+**A book-clear (FR-16) resets `prev_bid`/`prev_ask`/the window to the same
+all-zero state as power-on, then is itself treated as exactly "the first
+event after reset"** (same F1=F3=F4=0 rule `ml_engineer_brief.md` §4 already
+states for post-reset). This was the simplest self-consistent reading of
+"clear resets the feature history to the initial state" and needed no
+separate special case.
+
+**FR-26 (forcing the classifier input to a safe state on an invalid/crossed
+book) is explicitly not this module's job** — `feature_extractor.v` computes
+raw features mechanically from whatever `tob_engine` state it's given, no
+masking. This keeps the S3 contract's scope exactly matching T27's covered
+FRs (FR-20/21); FR-26's forcing belongs to a later ML-path stage
+(`ml_policy.v` or similar, not built yet).
+
+**Raw feature width: 32-bit** (unsigned for F0/F5/F7, signed two's-complement
+for F1/F2/F3/F4/F6) for every feature, uniformly. Not an arbitrary choice —
+it's the one piece of concrete width evidence already in the spec: §9's
+`ML_OFFSET_0..7`/`ML_SHIFT_0..7` registers, which subtract from and shift a
+raw feature before normalization, are already declared 32-bit.
+
+**Window depth `W` is an elaboration-time parameter for this contract, not
+the runtime `ML_WINDOW` CSR register (§9) yet.** FR-32 does list window `W`
+among the parameters required to eventually be runtime-configurable, but
+that requirement sits in §6.5 (ML classifier), not §6.4/T27's scope, and no
+S3 test exercises changing `W` mid-stream. Building true runtime
+reconfigurability now — a window whose *size*, not just contents, changes
+live — would mean either re-deriving F5/F7 from scratch on every possible
+configured depth simultaneously or an incremental running sum that goes
+stale the instant `W` changes; real complexity with no test yet demanding
+it. Deferred to whichever milestone first wires `csr_block.v`'s `ML_WINDOW`
+register into this module (S6), matching this project's own "don't build
+ahead of a gating test" convention. `sim/feature_golden.py`'s
+`FeatureTracker` already takes `window` as a fixed constructor argument, not
+a runtime-mutable field, so no rework was needed there.
+
+**A real RTL pitfall this decision sidesteps, worth recording anyway since
+it's the reason recompute-from-scratch was chosen over the more "obvious"
+efficient design:** a sliding-window sum's natural efficient implementation
+is *incremental* — add the newest value, subtract the value falling out of
+the window — which breaks under per-cycle saturation: once a contribution
+has been clamped on the way in, its original value is gone and can't be
+correctly subtracted back out later. With `W` fixed at elaboration time,
+`docs/contracts/feature_extractor.md` sidesteps this class of bug entirely
+rather than working around it: F5 (popcount) and F7 (sum, saturated only at
+its own 32-bit output, nowhere internally) are both **recomputed from
+scratch** over the full `W`-deep window on every accepted event, via a plain
+adder/popcount tree (`W` ≤ 32, so ≤5 tree levels — cheap, and FR-23-legal
+since a tree is still only adds). No subtraction, so no stale-saturation
+bug to avoid. See `docs/contracts/feature_extractor.md` §2.6 for the full
+reasoning as handed to the implementer.
+
+Not a resolution of a numbered §17 open question — new information the S3
+contract-writing process surfaced, same as D11/D12.
+
+---
+
+## D14 — Golden model: FR-15's price-preservation was not actually implemented
+
+**Status: applied**, `sim/golden_model.py`. **Decision:** `GoldenModel.process_message`'s
+`MSG_QUOTE` handling now writes `bid_price`/`ask_price` only when the
+message's `quantity != 0`; the `quantity`/`valid` writes stay unconditional.
+
+**Why.** Found the same way as D12/D13 — while pinning down the exact
+per-field behavior `tob_engine.v` needs for T10 (`FR-15`'s explicit S3 gate).
+FR-15's text is explicit: quantity=0 "clears that side's `valid` **without
+altering stored price**." The golden model's code, before this fix,
+unconditionally overwrote `bid_price`/`ask_price` with `msg.price` on every
+`QUOTE`, regardless of quantity — i.e. it did not actually implement the
+"without altering stored price" half of FR-15 at all. No existing test
+caught it because no S1/S2 hand-case ever sent a `quantity=0` `QUOTE`.
+`sim/test_golden_model_handcase.py` messages 24–25 now cover it directly: a
+`qty=0` quote carrying a deliberately wrong price (`9999`) must leave the
+side's stored price unchanged, and a subsequent normal (non-zero-quantity)
+quote on the same side must still update price normally (confirming the fix
+didn't break FR-14's ordinary case).
+
+**Consequence for `tob_engine.v`:** the price register write for a side must
+be gated on `msg_quantity != 0`, not written every `QUOTE` cycle — an easy
+detail to drop since "replace price+qty for the addressed side" (FR-14) reads
+like an unconditional pair-write until FR-15's exception is read carefully.
+See `docs/contracts/tob_engine.md` §2.2 for the exact wording handed to the
+implementer.
+
+Not a resolution of a numbered §17 open question — new information the S3
+contract-writing process surfaced, same as D11/D12/D13.
+
+---
+
+## D15 — `signal_engine.v`'s imbalance shift must use wide-precision arithmetic, not a naive 32-bit shift
+
+**Decision:** `rtl/signal_engine.v` (contract:
+`docs/contracts/signal_engine.md`) must compute `ask_qty << cfg_imb_shift`
+and `bid_qty << cfg_imb_shift` in a wide (≥35-bit) intermediate — zero-pad
+`bid_qty`/`ask_qty` by `cfg_imb_shift`'s maximum width (3 bits, per the CSR
+map's `IMB_SHIFT: 0-3`) before shifting — rather than a plain 32-bit
+left-shift that silently drops bits off the top.
+
+**Why.** FR-37 states buy and sell firing simultaneously is "impossible by
+construction." That claim is only actually true under `sim/golden_model.py`'s
+arithmetic, which uses Python's unbounded integers — `book.ask_qty <<
+self.cfg.imb_shift` never overflows there, for any quantity. A plain 32-bit
+hardware shift is not equivalent: `bid_qty = ask_qty = 0x80000000,
+imb_shift = 1` makes both `ask_qty << 1` and `bid_qty << 1` wrap to `0` in
+32 bits, so `bid_qty > (ask_qty << 1)` and `ask_qty > (bid_qty << 1)` **both**
+read true — a spurious conflict the golden model would never produce for
+that same input, verified empirically (not just reasoned about) before
+writing this entry. Quantities anywhere near `2^31` are unrealistic for this
+project's synthetic feed, so a random-stimulus soak test is very unlikely to
+ever land exactly here — but "unlikely to be hit by random stimulus" is a
+worse standard than "actually bit-exact," which is this project's stated
+hard requirement (S11.1), and the fix (widen one intermediate by 3 bits)
+costs nothing. Found and fixed before any RTL existed, same as D12-D14.
+
+**Consequence:** under the wide-precision design, FR-37's "impossible by
+construction" is genuinely true in the RTL too — `err_signal_conflict` is
+correctly unreachable via any honest combination of `bid_qty`/`ask_qty`
+inputs, matching the golden model. §5's out-of-scope note in
+`docs/contracts/signal_engine.md` explains why this makes the conflict path
+untestable via ordinary black-box stimulus, and what to do about it (a
+`force`-based Icarus test targeting the internal `buy_ok`/`sell_ok` wires
+directly, isolated from the input-driven computation that can no longer
+produce that state).
+
+**A second, independent reason `crossed` must be its own explicit AND term
+(not implied by the spread comparison):** `ask_price - bid_price`, computed
+as a plain unsigned 32-bit subtraction, **underflows to a huge positive
+number** when the book is crossed (`bid_price >= ask_price`) — a crossed
+book can look like it has an enormous spread if nothing else guards against
+it. FR-35/36 already list "not crossed" as an independent required
+condition, not derivable from the spread check; `signal_engine.v` gets this
+for free by reading `tob_engine.v`'s already-computed `crossed[slot]` output
+directly rather than re-deriving anything from the (potentially misleading)
+raw price subtraction.
+
+Not a resolution of a numbered §17 open question — new information the S5
+contract-writing process surfaced, same as D11-D14.
+
+---
+
+## D16 — Golden model: position tracking must use the reduced quantity, not the pre-reduction one
+
+**Status: applied**, `sim/golden_model.py`. **Decision:** the position
+ledger update on an accepted order now uses `reduced_qty`'s signed value
+(`+reduced_qty` for a buy, `-reduced_qty` for a sell), not the unreduced
+`order_qty`'s signed value the gate-`0x03` admission check used.
+
+**Why.** Found while designing `risk_engine.v`'s position-tracking
+interface for S7. Verified empirically (not just reasoned about) before
+writing this entry: with `cfg_ml_action=1` (reduce) and `cfg_ml_reduce_shift=1`,
+an accepted order correctly *reported* `quantity=50` (half of
+`cfg.order_qty=100`) in its `OrderRecord`, but the internal `position`
+ledger incremented by the full, unreduced `100` — the risk engine's own
+exposure tracking disagreed with what it had just told the world it traded.
+`sim/test_golden_model_handcase.py`'s original 25 messages never exercised
+`cfg_ml_action=1` at all (the default config leaves it at `0`, block), so
+this went uncaught the same way D14 did — added as a dedicated regression
+case (`n1`/`n2`) at the end of that file, using a separately-configured
+`GoldenModel` instance.
+
+**What deliberately did NOT change:** gate `0x03`'s own admission check
+(`abs(position + signed_qty) > cfg.max_position`) still uses the
+*unreduced* `order_qty` — per FR-48, "the ML verdict is advisory to the
+risk engine, not a substitute for gates 0x01-0x08," read as: gates 0x01-0x08
+evaluate the order as originally sized, and gate 0x09's reduction is an
+independent action layered on top, not something that retroactively changes
+what the other eight gates saw. Only the *final ledger update*, which
+should reflect what actually got sent, needed fixing.
+
+**Consequence for `risk_engine.v`:** its own position-update logic must use
+whatever quantity actually gets reported for the order (the ML-reduced one
+when that path applies), not the pre-reduction `sig_qty` gate 0x03's own
+check reads. See `docs/contracts/risk_engine.md` §2.6 for the exact wording
+handed to the implementer.
+
+Not a resolution of a numbered §17 open question — new information the S7
+contract-writing process surfaced, same as D12-D15.
+
+---
+
+## D17 — Golden model: gate `0x05` (staleness) was completely unreachable
+
+**Status: applied**, `sim/golden_model.py`. **The most consequential finding
+of the S3/S5/S7 contract-writing pass** — this one made a required gate
+provably non-functional, not just wrong in an edge case. **Decision:**
+`GATE_STALE`'s check now compares `self.current_cycle` against
+`prev_update_cycle` — a value captured **before** the triggering message's
+own `book.last_update_cycle = self.current_cycle` write — instead of
+against `book.last_update_cycle` read *after* that same write.
+
+**Why this was a real, total-unreachability bug, not a corner case.**
+Every book-modifying message (`QUOTE`/`CLEAR`) unconditionally set
+`book.last_update_cycle = self.current_cycle` near the top of
+`process_message`, *before* the signal/risk-gate section runs later in
+that same call. Only a book-modifying message can ever reach the risk-gate
+section at all (`if not book_modifying: return result`). So by construction,
+every single evaluation of `(self.current_cycle - book.last_update_cycle) >
+self.cfg.max_age` was comparing `self.current_cycle` against a timestamp
+*that message itself had just set to `self.current_cycle` moments earlier* —
+always exactly `0`, always `≤ max_age`, for every possible input, forever.
+`T18_gate_stale` — a **required** S7 gate test ("silence past `MAX_AGE`,
+then fresh update") — could never have passed against the unfixed model,
+because the model could never produce a `GATE_STALE` rejection through any
+sequence of messages. Verified empirically before writing this entry:
+100,000 cycles of silence on a symbol with `max_age=100` still produced
+`reject_reason=0` (accepted) under the old code.
+
+**The fix separates "what timestamp gates 0x05 checks against" from "when
+the timestamp gets refreshed."** `prev_update_cycle = book.last_update_cycle`
+is captured once, before the `msg_type` dispatch (which still refreshes
+`book.last_update_cycle` to `self.current_cycle` exactly as before, for
+every message type, matching FR-19's "heartbeat refreshes the staleness
+timer" language). The later gate-`0x05` check reads `prev_update_cycle`
+instead. This makes the test scenario T18 literally describes constructible
+for the first time: message A touches a symbol; a long silence follows
+(other symbols' traffic advances `current_cycle` past `max_age`); message B
+arrives for the silent symbol and is rejected with `GATE_STALE`, evaluated
+against A's timestamp; message C, arriving shortly after B, is accepted
+again, evaluated against B's (now-fresh) timestamp.
+`sim/test_golden_model_handcase.py`'s `n3`-`n6` is exactly this sequence,
+verified against the corrected model before being written into the test.
+
+**Consequence for `risk_engine.v`:** its own per-slot `last_update_cycle`
+register must be captured/compared **before** being overwritten by the
+triggering message's own touch — the same ordering pitfall applies
+identically in hardware (a naive "refresh then compare" `always` block
+would reproduce this exact bug in RTL). See `docs/contracts/risk_engine.md`
+§2.4 for the exact wording and the reasoning behind where the timestamp
+update happens relative to the gate evaluation.
+
+Not a resolution of a numbered §17 open question — new information the S7
+contract-writing process surfaced, same as D11-D16, but the largest-impact
+one so far: an entire gate would have shipped silently non-functional.
+
+---
+
+## D18 — `risk_engine.v`: a rejected order must report its unreduced quantity
+
+**Status: applied**, `rtl/risk_engine.v` (a small, targeted patch to an
+already-committed S7 module — see below for why this one, unusually, was
+fixed at the RTL directly rather than only in a contract) and
+`tb/tb_risk_engine.v` (one new regression assertion). **Decision:**
+`order_qty`'s registered update is now `accepted_c ? reduced_qty_c :
+sig_qty` — a rejected intent reports the unreduced quantity; only an
+*accepted* order reports the ML-reduced one.
+
+**Why.** Found while designing `order_builder.v`'s interface for S8 — that
+module is the first thing that would actually consume a rejected order's
+`order_qty` field (via the opt-in `0x11` diagnostic frame, FR-44/D7).
+Checking what it should read led back to `risk_engine.v`'s own output.
+Verified empirically against `sim/golden_model.py` before concluding
+anything: with `adverse_risk=1`, `cfg_ml_action=1` (reduce), and a
+*different* gate (band, in the test) also firing on the same intent, the
+golden model's reject-path `OrderRecord` reports `quantity=100` (the
+original, unreduced `order_qty`) — never the reduced value, regardless of
+whether ML reduction would otherwise have applied. `docs/contracts/risk_engine.md`
+(and the RTL built from it) instead wrote `order_qty <= reduced_qty_c`
+unconditionally, on any `sig_valid` cycle, accept or reject — so a rejected
+intent under this exact combination would have reported the *reduced*
+quantity, disagreeing with the golden model.
+
+**Why this one warranted a direct RTL patch instead of just a contract
+note for later:** `order_qty` is a single, already-built, already-committed
+output register with no way to route around the bug from a downstream
+module without duplicating state that `risk_engine.v` already owns
+correctly for the accept case. The fix itself is a single ternary — no
+architectural change, low risk to re-verify (the existing testbench still
+passed unmodified; a new regression case was added and shown to fail
+against the pre-fix RTL before being accepted). Contrast with D12-D17,
+which were all `sim/golden_model.py` fixes with no committed RTL to touch;
+this is the first finding in the series to reach back into shipped RTL,
+and it was worth doing given how easy the fix was and how easy the bug
+would have been to miss forever (`cfg_reject_report` defaults to off,
+per FR-44/D7, so this field is never observed in the default
+configuration — but `order_builder.v`'s testbench, and any future
+diagnostic use of gate `0x09` reduce alongside another gate, would have
+silently carried the wrong value).
+
+**Practical impact, for context:** low. `cfg_reject_report=0` by design
+(FR-44), so this field was never on the wire in the default configuration.
+Still worth fixing at the source rather than documenting as a known
+limitation, given the fix's cost was essentially zero.
+
+Not a resolution of a numbered §17 open question — new information the S8
+contract-writing process surfaced, same as D11-D17, but the first to patch
+already-shipped RTL rather than only `sim/golden_model.py`.
+
+---
+
+## D19 — `csr_block.v`: CSR frame wire protocol, counter address map, and STATUS scope
+
+**Status: decided while writing `docs/contracts/csr_block.md` (S9), not yet
+implemented.** The master spec (§9) names the CSR frame `msg_type` values
+(`0x20` write / `0x21` read-request / `0x22` read-response) and the register
+map's addresses for `0x00`-`0x9C`, but leaves four things genuinely
+unspecified that the contract has to pin down before any RTL can be written
+against it.
+
+**1. CSR frames share `md_parser.v`'s existing byte stream — no new MAC or
+`frame_classifier.v` wiring.** Checked directly: nothing in `rtl/eth_mac_if.v`
+or the vendored MAC (`rtl/vendor/alinx_mac/`) filters by destination UDP
+port anywhere (`cfg_udp_port` / register `0x40` is not consumed by any
+existing signal path) — there is no second ingress port to tap even if the
+design wanted one. `csr_block.v` therefore taps the *same*
+`frame_classifier.v → md_parser.v` byte stream (`in_data`/`in_valid`) as a
+second, independent, purely-combinational-adjacent listener, running its own
+small byte-serial decode (mirroring `md_parser.v`'s `byte_cnt`/`complete_d`
+shape) that recognizes only `0x20`/`0x21` in byte 0 and ignores everything
+else. This costs nothing upstream: `md_parser.v` already silently discards
+`0x20`/`0x21` today as `err_msg_type` (harmless, pre-existing behavior,
+unchanged), and CSR frames are simply zero-effect noise to every
+market-data-consuming module the same way market-data frames are
+zero-effect noise to `csr_block.v`. CSR write/read-request frames are
+defined as the same 16-byte fixed-width envelope as every other frame type
+in this system (byte 0 = `msg_type`, big-endian): `addr`(2, offset 2) and
+`data`(4, offset 4), rest reserved/zero — see the contract §2.2 for the
+exact layout.
+
+**2. `0x22` read-response frames do not go through `eth_mac_if.v` directly
+in this contract.** `order_builder.v` already exclusively owns
+`tx_payload`/`tx_start`/`tx_busy` (S8). Two masters driving that single TX
+interface needs an arbiter that doesn't exist yet and isn't `csr_block.v`'s
+job to invent unilaterally — it's an S10 integration concern (`tob_top.v`
+wiring). `csr_block.v` instead exposes its own `resp_payload`/`resp_start`/
+`resp_busy` outputs, same shape as `order_builder.v`'s TX interface,
+independently testable now; a small priority mux combining the two onto the
+real `eth_mac_if.v` port is deferred to S10, noted as a follow-up.
+
+**3. Counter addresses (`0xA0`+) are assigned in this decision, spec only
+says "Counters — Read-only block, §10."** Assigned in §10's own listed
+order, ingress → errors → feed-health → signal → ML → risk → egress →
+latency, 4 bytes apart starting at `0xA0` (`cnt_frames_rx`) through `0x134`
+(`lat_last`). The 64-bucket histogram (`0x138`-`0x234`) is explicitly
+**not** part of this address range's implementation in `csr_block.v` —
+that data is owned and computed by `latency_histogram.v` (a separate S9
+module, not yet written); `csr_block.v` reserves the range and returns 0
+for it until a follow-up wires a real passthrough.
+
+**4. `STATUS` (`0x04`) bits 7:5 ("side-valid map") are a genuine spec gap,
+not solved here.** Four watched symbols need 8 bits (bid+ask validity each)
+but the register map allocates 3. Rather than silently guess a truncation
+scheme, `csr_block.v`'s contract ties bits 7:5 to `0` (reserved) and states
+the gap plainly. Bits 0-4 (kill/seq-gap/crossed/stale/ML-adverse) are
+defined as **sticky-until-counter-clear** flags (cleared together with the
+counters by `CTRL.bit2`), except bit0 (`kill latched`) which mirrors
+`risk_engine.v`'s own `kill_latched` level directly (already
+latch-until-`CTRL.bit1`-clear by FR-46/47 — re-latching it independently in
+`csr_block.v` would let the two disagree).
+
+**Also newly discovered while grounding this contract: `err_fcs`,
+`err_ethertype`, `err_ip`, `err_udp_port` have no source signal anywhere in
+the current RTL.** Per D1, the vendored MAC's `udp_rx.v` verifies
+EtherType/IPv4/UDP framing and the IPv4 checksum before `eth_mac_if.v` ever
+asserts anything, but none of those internal checks are currently exposed
+as named error pulses. `csr_block.v`'s contract declares input ports for
+all four (matching the established `cfg_*`/`err_*` stand-in-port pattern
+used throughout this project) but nothing drives them yet; wiring them to
+real vendored-MAC signals is future work, same category as `adverse_risk`
+standing in for `ml_policy.v` in `risk_engine.v`'s contract.
+
+---
+
+## D20 — `csr_block.v`: `STATUS` bit2 (`crossed`) must be level-sensed, not edge-triggered
+
+**Status: applied**, `rtl/csr_block.v` (a small, targeted patch to the
+implementation just delivered for S9, not yet committed) and
+`tb/tb_csr_block.v` (one new regression, `C11`). **Decision:** the sticky
+`crossed` flag in `STATUS` (bit2) now sets on the plain level `|crossed`
+every cycle it's true, not on a registered `crossed_or_d`-based 0→1 edge
+detector.
+
+**Why.** Found during independent verification of the delivered
+`csr_block.v` (the same discipline as every prior module this series —
+recompile, rerun, read the RTL, re-run mutations). The first implementation
+latched `status_crossed` only when `(|crossed) & ~crossed_or_d` — i.e. only
+on a rising edge. Verified empirically with a standalone testbench: hold
+`crossed` continuously asserted (a book that never un-crosses), issue
+`CTRL.bit2` (counter clear) while it's still asserted, and `STATUS` bit2
+reads back `0` and *stays* `0` for as long as `crossed` never actually
+drops to `0` first — because the edge that would re-arm the latch never
+occurs. A sticky "has this fault happened since the last clear" flag that
+goes permanently dark for an *ongoing* fault right after a routine clear is
+the opposite of what it's for.
+
+**Whose bug this is:** the contract's own (`docs/contracts/csr_block.md`
+§2.6), not a misreading by the implementer. The original wording — "set on
+`(|crossed)` going high" — reads as edge-triggered, and the implementation
+followed it faithfully. The mismatch is that `crossed` (`tob_engine.v`) is
+a *persisting level*, unlike `seq_gap_pulse`/`gate_stale_fired`/
+`ml_adverse_pulse` — the other three sticky triggers — which are genuine
+one-shot pulses where edge vs. level is not a meaningful distinction (a
+pulse only ever produces one "edge" per event by construction). Writing
+the same "goes high" phrasing for all four sticky bits papered over that
+one of the four inputs behaves fundamentally differently. Same category of
+mistake as the sign-extension error in `risk_engine.md` §2.5 (reusing a
+pattern that's correct in one context into a context where the underlying
+assumption doesn't hold) — see the general craft-lesson memory note from
+that finding.
+
+**The fix simplifies the RTL, not just corrects it:** the level check (`if
+(|crossed) status_crossed <= 1'b1;`) needs no `crossed_or_d` register at
+all — one line removed, one line changed. Contract §2.6 corrected in place
+to state the level-sensed rule explicitly and name the failure mode, so a
+future reader (or a future sticky-bit addition) doesn't repeat the mistake.
+
+**Practical impact:** real. Bits 1/3/4 (seq-gap/stale/ML-adverse) were
+never affected — their triggers are already one-shot pulses, so
+edge-vs-level was never an active distinction for them. Only bit2 was
+wrong, and only in the specific scenario of a persisting cross condition
+spanning a counter clear — plausible in a genuinely bad feed state, exactly
+the situation this diagnostic bit exists to surface.
+
+---
+
+## D21 — `latency_histogram.v`: bucket boundaries, latency source, and two deferred `csr_block.v` wiring gaps
+
+**Status: decided while writing `docs/contracts/latency_histogram.md` (S9's
+second and final file), not yet implemented.** Three things the master
+spec left open, plus two small gaps in already-committed `csr_block.v`
+(`b7e3e9a`) that this contract deliberately does not close.
+
+**1. Latency source: consume `order_builder.v`'s already-computed
+`latency_cyc`, don't re-derive it.** `order_builder.v` (S8) already
+computes ingress-to-egress `latency_cyc` per transmitted record and embeds
+it in the wire frame (`docs/contracts/order_builder.md` §2.3) — the exact
+same value the master spec's own README framing calls out ("the host's
+capture is simultaneously a latency log," §4.5). `latency_histogram.v`
+reads it straight off `ob_tx_start`/`ob_tx_payload[15:0]`, the same two
+signals `csr_block.v` already taps for `cnt_orders_tx` (including the same
+`msg_type==0x10` exclusion of `0x11` reject-diagnostic frames). No new
+`cur_cycle`/ingress-timestamp wiring is needed. Re-deriving the timestamp
+independently would duplicate state `order_builder.v` already owns
+correctly and risks the two silently disagreeing — same reasoning as D18's
+"no clean way to route around state a module already owns."
+
+**2. Bucket boundaries: exact 1-cycle resolution 0-62, bucket 63 as a
+saturating ≥63 catch-all — not a linear-shift bucket width.** NFR-2/T25's
+entire point is catching a **single-cycle** latency variance ("a second
+bucket is a functional bug, not a performance result," §7). A naive
+power-of-2 bucket width (e.g. 4 cycles/bucket, the cheap `>>2` shift)
+would silently merge a 1-cycle jitter bug into the same bucket and defeat
+the requirement it exists to test. With NFR-1's target ≤22 cycles and an
+observed nominal engine total of ~10-11 cycles (§12.1), the whole
+plausible nominal range fits inside buckets 0-62 at full precision; bucket
+63 absorbs any queueing-delayed outlier (an order held behind a busy TX,
+`docs/contracts/order_builder.md` §2.4) as an "off-nominal" catch-all
+without needing more buckets for a case that's expected to be rare and
+isn't what NFR-2 is testing.
+
+**3. `hist_rd_addr`/`hist_rd_data` is a standalone read interface, not
+wired into `csr_block.v`'s CSR read mux by this contract.** Same modular
+discipline as every S9/S8 contract: `latency_histogram.v` is built and
+tested standalone; wiring it to the rest of the pipeline is integration
+work. Two specific gaps this leaves in already-committed `csr_block.v`
+(`b7e3e9a`), left as explicit deferred follow-ups rather than silently
+assumed solved:
+
+- `csr_block.v`'s read mux (`rd32`) currently hard-codes the `0x138`+
+  histogram range to return `0` (its `default` case). Making FR-56's "on-
+  demand CSR read" of histogram data actually work needs a small patch
+  wiring `csr_block.v`'s CSR address decode to this module's
+  `hist_rd_addr`/`hist_rd_data`.
+- `csr_block.v`'s `counter_clear_pulse` (CTRL bit2) is currently an
+  internal `wire`, not exposed as a port. FR-56 groups "counters and
+  histogram" together, implying the histogram should clear alongside the
+  counters — this module takes a `cfg_counter_clear` input port for that
+  purpose, but wiring it from `csr_block.v` needs that pulse exported as a
+  new output port there too.
+
+Both are small, well-understood, low-risk patches to already-shipped RTL —
+same category as D18's direct `risk_engine.v` patch — deliberately not
+done as part of *this* contract to keep it scoped to one module. Flagged
+here so they aren't forgotten before S10.
+
+---
+
+## D22 — `tob_top.v`: TX arbitration, two clock domains, and what this integration does *not* attempt yet
+
+**Status: decided while writing `docs/contracts/tob_top.md` (S10), not yet
+implemented.** This is the first contract to wire already-committed modules
+*together* rather than build a new standalone one, so most of what it has
+to pin down is arbitration and clocking, not new datapath logic.
+
+**1. TX arbitration: `order_builder.v` unconditionally wins.**
+`order_builder.v` (fast path) and `csr_block.v` (slow path, §3.3 of the
+master spec: "forbidden from asserting backpressure onto the fast path")
+both need `eth_mac_if.v`'s single `tx_payload`/`tx_start`/`tx_busy`
+interface. Neither module is modified — both were already built with an
+external-arbiter shape in mind (`docs/contracts/order_builder.md` §2.5's
+`~tx_start` self-gate; `docs/contracts/csr_block.md` §2.4's silent-drop
+policy for a busy response). The arbiter is a pure mux with no state of
+its own:
+
+```verilog
+assign eth_tx_payload   = ob_tx_start ? ob_tx_payload : csr_resp_payload;
+assign eth_tx_start     = ob_tx_start | (csr_resp_start & ~ob_tx_start);
+assign csr_resp_busy_in = eth_tx_busy | ob_tx_start;
+```
+
+`order_builder.v`'s own request always passes straight through, never
+delayed. `csr_block.v`'s `resp_busy` input is driven by the *shared* path's
+busy state OR'd with "`order_builder.v` wants this exact cycle" — so its
+own `~resp_busy & ~resp_start` self-gate (already built) correctly holds
+off whenever the fast path has priority, with zero new logic inside
+`csr_block.v` itself. On the vanishingly rare cycle both request
+simultaneously, `order_builder.v` wins and that CSR read is silently
+dropped — already an accepted, designed-for outcome per
+`docs/contracts/csr_block.md` §2.4 ("CSR traffic is diagnostic, not the
+fast path"), not a new failure mode this decision introduces.
+
+**2. Two clock domains, per D2 — this contract makes the split concrete.**
+The entire engine (`frame_classifier.v` through `csr_block.v`/
+`latency_histogram.v`) runs on the recovered `gmii_rx_clk` (D2). `sys_clk`
+(50 MHz board oscillator) is retained *only* for PHY reset sequencing and
+`mdio_ctrl.v` — a genuinely separate, slower domain with no signal
+exchange with the engine except the reset-release edge (synchronized into
+the engine's domain via `rtl/common/sync_2ff.v`, per D2's own "follow-on"
+note) and, indirectly, link readiness.
+
+**A concrete bug this decision catches before it ships:** `mdio_ctrl.v`'s
+`CLK_HZ` parameter **defaults to `125_000_000`**, but D2 says `mdio_ctrl.v`
+runs off `sys_clk` — 50 MHz, not 125 MHz. Instantiating it with the default
+would compute the wrong MDC divider (`MDC_PERIOD`), driving the PHY's MDIO
+clock at roughly 2.5x the intended rate — silently over IEEE 802.3 clause
+22's 2.5 MHz maximum, since `mdio_ctrl.v`'s own math would still produce a
+*self-consistent* (just wrong) waveform with no assertion to catch it.
+`docs/contracts/tob_top.md` §2.3 requires the instantiation to override
+`.CLK_HZ(50_000_000)` explicitly.
+
+**3. This contract does not attempt the ML path, the full T26 soak, or
+physical-layer timing closure.** Three deliberate scope boundaries:
+
+- `feature_extractor.v`/`feature_normalizer.v` are **not instantiated** —
+  they have no consumer until `ml_classifier_wrap.v`/`ml_policy.v` exist
+  (S6, blocked on S4). `adverse_risk` into `risk_engine.v` is a fixed tie-
+  off (`1'b0`), same stand-in-input principle `risk_engine.v`'s own
+  contract already established, just resolved at the integration level
+  now instead of at a testbench boundary.
+- **T26's 1,000,000-message soak (`tb/tb_top.v`, master spec §11.3) is not
+  this contract's testbench.** §11.3 says that testbench "drives the
+  GMII-side interface" — i.e. `mac_top.v`'s own RX/TX boundary
+  (`udp_rec_ram_rdata`/`udp_rec_data_valid`/... and
+  `ram_wr_data`/`udp_tx_req`/...), the same boundary
+  `tb/tb_eth_mac_if_rx.v`/`tb_eth_mac_if_tx.v` already drive standalone.
+  That means `tb_top.v` can instantiate the engine chain directly, without
+  `tob_top.v`, `mac_top.v`, `util_gmii_to_rgmii.v`, or `mdio_ctrl.v` in the
+  loop at all — matching how every other testbench in this project
+  exercises its DUT standalone. `docs/contracts/tob_top.md`'s own
+  testbench requirement is a smaller connectivity/smoke check (does the
+  wiring in *this* contract correctly connect what's already
+  independently verified), not a re-run of every module's own behavioral
+  coverage.
+- RGMII pin constraints, `create_clock` timing, IDELAY/pad-skew validation
+  on real hardware, and the PHY's exact minimum reset-pulse-width are S11
+  (Hardware) concerns — no board exists to measure any of this against yet
+  (`PREREQUISITES.md` has no such number recorded either), so this
+  contract specifies a conservative placeholder reset hold count rather
+  than inventing an unverified figure.
+
+**A gap this integration closes for free:** `mac_top.v` already carries
+D5's patch exposing `mac_rec_error` and `udp_checksum_error` — sources
+`docs/contracts/csr_block.md` §1.3 explicitly flagged as *not existing
+anywhere in the current RTL* when `csr_block.v` was contracted. Wiring
+`mac_rec_error` → `csr_block.v`'s `err_fcs` and `udp_checksum_error` →
+`err_ip` closes two of the four stand-in error inputs for real.
+`err_ethertype`/`err_udp_port` remain genuine stand-ins — `mac_top.v`
+doesn't expose a distinct failure signal for either (a wrong-EtherType or
+wrong-port frame is dispatched to neither `arp_rx.v` nor `ip_rx.v`/
+`udp_rx.v` and is simply never seen, D1/D3), so there is still nothing to
+wire there.
+
+---
+
+## D23 — `signal_engine.v` read `tob_engine.v`'s book bus one message stale; the trigger for the biggest cross-module finding of this project
+
+**Status: found while independently verifying `tob_top.v`'s delivered
+implementation (S10), fixed and independently re-verified.** The single
+most consequential finding of this session — bigger in impact than D17,
+because it's in the core trading decision, not a diagnostic or CSR nuance.
+Fix delivered against `docs/contracts/tob_engine_signal_patch.md`,
+re-verified directly: recompiled/reran all three required testbenches
+(`tb_tob_engine.v`, `tb_signal_engine.v`, the new `tb_signal_tob_chain.v`)
+myself, read both diffs (clean — `tob_engine.v`'s seven new ports are pure
+`assign`s of already-computed wires; `signal_engine.v`'s change is
+contained to the seven `s_*` alias lines, everything downstream
+byte-identical), and reproduced the original bug myself as a mutation
+(reverted `tob_engine.v`'s `next_*` assigns to source from the *current*
+state instead of `nb_*`/`addr_crossed_next`) — the new chain testbench
+caught it immediately and specifically at the exact headline case (a bid
+QUOTE then an ask QUOTE failing to fire), confirming both the fix and the
+new regression's power to catch a regression of this exact bug in the
+future. Restored and reconfirmed `PASS` afterward.
+
+**The bug.** `signal_engine.v`'s own header comment states it reads
+"the tob_engine.v state buses (POST-update state of the applied slot)"
+gated on `book_upd_valid`. It does not. `tob_engine.v`'s `bid_price`/
+`ask_price`/`bid_qty`/`ask_qty`/`bid_valid`/`ask_valid` outputs are wired
+only to registered state (`assign bid_price = bid_price_r;`), and
+`book_upd_valid` is combinational, firing the *same* cycle the triggering
+message arrives. In synchronous Verilog, a register written with `<=` on a
+clock edge is not visible to another module reading it *on that same
+edge* — the new value is only visible starting the next cycle. So
+`signal_engine.v` evaluates `buy_ok`/`sell_ok` against the book as it
+stood **before** the triggering message's own effect, not after.
+
+**Verified two ways before concluding anything, per this project's own
+standing rule:**
+
+1. **Against `sim/golden_model.py`**, the authority this whole project is
+   bit-exact-verified against: `process_message` updates `book.bid_price`/
+   `book.ask_price`/etc. *first*, then evaluates `buy_ok`/`sell_ok` in the
+   same function call, using the just-updated state. The golden model's
+   semantics require post-update evaluation; the RTL delivers pre-update.
+2. **Empirically, in isolation** — a standalone testbench chaining only
+   `tob_engine.v` + `signal_engine.v` (no other module in the loop), fed a
+   bid QUOTE then an ask QUOTE that together satisfy every `buy_ok`
+   condition (spread 5 ≥ min 2, `bid_qty` 100 > `ask_qty`≪1). `sig_valid`
+   never fired from those two messages alone — only a third, redundant
+   re-quote triggered it, confirming the one-message lag directly.
+
+**Why neither module's own testbench caught this.** Every module in this
+project is tested standalone with hand-driven stimulus
+(`docs/contracts/*.md` §3 sections, uniformly). `tb_signal_engine.v` drives
+`bid_price`/`ask_price`/`book_upd_valid` as independent stimulus — the
+test-writer naturally sets up "the book already looks like X, *then* pulse
+`book_upd_valid`," which is exactly the shape that makes the bug invisible
+in isolation. Only chaining the two real modules together — which
+`tob_top.v` is the first thing in this project to actually do — could
+surface it. This is the precise justification for `docs/contracts/tob_top.md`
+§3's own connectivity-testing requirement, now doubly confirmed: **wiring
+mistakes and cross-module *timing* mistakes are a different bug class from
+anything a standalone unit test can find.**
+
+**How `tob_top.v`'s implementer (DeepSeek) actually encountered this and
+what they did with it, for the record:** they found the identical
+behavior, described it accurately in their own delivery report ("signal_engine
+reads the book bus on the book_upd_valid cycle, and tob_engine commits
+each QUOTE at the end of that cycle"), and worked around it in
+`tb_tob_top.v`'s T1 case by sequencing a bid, an ask, and a redundant
+re-quote before expecting a signal. That workaround is accurate
+engineering observation, correctly reported — but it papers over a real
+defect rather than fixing it, and would very likely make `tb/tb_top.v`'s
+eventual T26 byte-for-byte soak against `sim/golden_model.py` fail once
+built, since the golden model does not need three messages where the RTL
+does. Not a criticism of the implementation work itself — DeepSeek was not
+asked to modify already-committed S3/S5 modules as part of a wiring-only
+S10 contract, and flagging rather than silently "fixing" an out-of-scope
+defect was the right call within that contract's boundaries. The fix
+belongs in a dedicated patch contract instead — see
+`docs/contracts/tob_engine_signal_patch.md`.
+
+**The fix, in outline (full detail in the patch contract):**
+`tob_engine.v` already computes the post-update ("next") state of the
+applied slot combinationally, internally, for its own crossed-detection
+purposes (`nb_bp`/`nb_bq`/`nb_bv`/`nb_ap`/`nb_aq`/`nb_av`,
+`addr_crossed_next`) — it just never exposes them. The fix adds seven new
+output ports carrying exactly those already-computed wires, and rewires
+`signal_engine.v` to read them directly instead of indexing the registered,
+per-symbol flattened bus by `applied_slot`. This is lower-risk and smaller-
+blast-radius than the alternative (adding a pipeline stage inside
+`signal_engine.v` to wait for the registered state to catch up), which
+would change its latency and break the "exactly two registered cycles
+from `md_parser`'s `msg_valid` to `risk_engine`'s `order_valid`" invariant
+`order_builder.v`'s own `seq_d0`/`seq_d1` pipeline depends on
+(`docs/contracts/order_builder.md` §2.2).
+
+**Everything downstream of `signal_engine.v` is unaffected — confirmed,
+not assumed.** `risk_engine.v` reads `tob_engine.v`'s `crossed`/`bid_price`/
+`ask_price` buses at `sig_slot`, which is `signal_engine.v`'s own
+*registered* `applied_slot`, landing at least one full cycle after
+`book_upd_valid`. By then the triggering message's register write has
+already committed, so `risk_engine.v` sees genuinely post-update state.
+The bug is narrowly scoped to whatever reads `tob_engine.v`'s bus
+*combinationally, on `book_upd_valid`'s own cycle* — currently only
+`signal_engine.v`.
+
+**A second module has the identical latent defect, not yet exercised:**
+`feature_extractor.v`'s own header comment makes the exact same false
+claim ("post-update state") about the exact same bus, gated the same way
+on `book_upd_valid`. It is not wired into anything yet (S6 is blocked on
+S4), so this isn't currently observable, but it will reproduce this same
+bug the moment S6 wires it in. Flagged here, **not fixed as part of this
+patch** (no current consumer, out of scope) — whoever writes S6's
+integration contract needs to read this entry first and wire
+`feature_extractor.v` to the same new `tob_engine.v` "next" ports this
+patch adds, not the stale registered bus.
+
+**Consequence for the not-yet-committed `tob_top.v`:** its current
+delivered `rtl/tob_top.v` wires `signal_engine.v`'s *old* port list (the
+flattened bus). Once this patch changes that port list, `tob_top.v` needs
+a small follow-up edit to its `u_sig` instantiation — and its own T1 test
+case should be simplified to drop the re-quote workaround once the fix is
+verified, since two messages (not three) should then suffice.
+
+---
+
+## D24 — S6 ML integration: fallback classifier, and three deliberately deferred scope items
+
+`docs/contracts/ml_integration.md` wires the ML branch (`feature_extractor.v`
+→ `feature_normalizer.v` → `ml_classifier_wrap.v` → `ml_policy.v`) into
+`tob_top.v` for the first time, closing risk gate `0x09` (`adverse_risk`
+was tied to `1'b0` since D22). S4 (`model/`, `hls4ml/`) has not started, so
+per master spec §15's standing fallback, `ml_classifier_wrap.v` is a
+hand-written 8-MAC linear classifier (`z = bias + Σw_i·x_i`, weights/bias
+loaded via `$readmemh` from `model/weights.mem`/`bias.mem`) rather than an
+hls4ml-generated IP. The weights are an explicit, documented placeholder
+(`w_i=1` for all `i`, `b=0`) — not trained, chosen only so every test
+vector is hand-computable; `model/model_config.json` records this. When S4
+lands, only the two `.mem` files change — `ml_classifier_wrap.v`'s port
+list and every other module's wiring stay untouched by design.
+
+Because the classifier is small enough to close timing in one
+combinational cycle (vs. the master spec's own budget of 2–3 cycles for a
+pipelined hls4ml IP), the signal branch's order intent needs only a
+3-cycle alignment delay (`ALIGN_DEPTH`, a `tob_top.v` `localparam`, fed
+into the new reusable `rtl/common/delay_line.v`) to reach `risk_engine.v`
+on the same cycle `ml_policy.v`'s registered `adverse_risk` reflects the
+same triggering event — shallower than the master spec's estimate of
+4–5 cycles, purely because this fallback classifier is faster than the
+real IP will be. **This is a load-bearing consequence worth its own entry
+below (D25) — it silently breaks an invariant `order_builder.v` depends
+on.**
+
+Three scope items were deliberately deferred, not silently dropped:
+
+1. **Fail-safe forcing (FR-26/31) covers invalid side / crossed book /
+   sequence gap, but not per-event staleness.** `risk_engine.v`'s own gate
+   `0x05` already independently blocks any order built from a stale
+   message regardless of the ML verdict, so the safety property "no order
+   emitted from stale state" already holds. The gap: a stale event's
+   (possibly meaningless) `z` can still update the *persisting* hysteresis
+   state that carries into the next, fresh event. Fixing this properly
+   would mean duplicating `risk_engine.v`'s `pend_prev_cycle`/
+   `pend_msg_cycle` per-slot timestamp mechanism inside `ml_policy.v` for
+   every book event (today it only runs for events that also produce a
+   `signal_engine.v` intent) — real, separate work.
+2. **`score_raw`/`risk_level` (FR-33) are computed by `ml_policy.v` but
+   left unconnected in `tob_top.v`** — no CSR-readback register or
+   diagnostic-frame mechanism exists yet to consume them.
+3. **`cfg_ml_window` (CSR `0x5C`) still has no RTL consumer.**
+   `feature_extractor.v`'s window depth is the elaboration-time `WINDOW`
+   parameter (D13), not a runtime signal — this mismatch between the CSR
+   register's existence and its (lack of) effect predates S6 and is not
+   introduced or resolved by it.
+
+## D25 — S6's alignment delay breaks `order_builder.v`'s fixed-2-cycle `trigger_seq`/`latency_cyc` assumption
+
+**Found during S6 integration, not fixed — flagged for a dedicated
+follow-up.** D23 already named the exact invariant this breaks:
+`order_builder.v`'s `seq_d0`/`seq_d1` and `ingress_d0`/`ingress_d1` are an
+*unconditional* two-stage shift register (`docs/contracts/
+order_builder.md` §2.2) that blindly shifts every cycle, relying entirely
+on "the total registered latency from `md_parser`'s `msg_valid` to the
+matching `order_valid`/`reject_reason` is exactly two cycles" (its own
+header comment) to guarantee `seq_d1`/`ingress_d1` happen to hold the
+*triggering* message's sequence number and ingress cycle at the moment
+`order_valid` fires — no explicit tagging, just a matched-length delay
+line assumption.
+
+D24's `ALIGN_DEPTH=3` cycles added to the signal→risk path (D24) makes
+that latency five cycles, not two. `order_builder.v`'s shift register was
+not touched (out of scope for `docs/contracts/ml_integration.md`), so
+`seq_d1`/`ingress_d1` now hold whatever message arrived **three events
+after** the actual trigger, not the trigger itself. Concretely, for every
+order accepted since S6 landed: `trigger_seq` in the emitted order frame
+attributes the order to the wrong market-data message, and `latency_cyc`
+is computed against the wrong ingress timestamp — both wrong by a fixed
+but incorrect offset, not merely "off by 3" in a harmless sense.
+
+**Why the full regression, including the 1,000,000-message soak, did not
+catch this:** `latency_histogram.v` reads its `lat_value` from
+`order_builder.v`'s own (now-wrong) `latency_cyc` field
+(`docs/contracts/latency_histogram.md`), and NFR-2's soak-level check only
+asserts a *single occupied bucket* — i.e. that the reported latency is
+*consistent* across the run, not that it is *correct*. A fixed
+systematic misattribution produces one bucket at the wrong value, which
+passes that check. No existing testbench asserts `trigger_seq`'s or
+`latency_cyc`'s absolute value against the actual triggering message, so
+nothing was positioned to catch this.
+
+**Not fixed here** — deliberately out of `docs/contracts/
+ml_integration.md`'s scope (`order_builder.v` was explicitly listed as
+untouched). The fix belongs in `order_builder.v` itself: either widen the
+unconditional shift register to `ALIGN_DEPTH + 2` stages (making
+`ALIGN_DEPTH` a shared constant both modules reference, so this can't
+silently drift again), or replace the blind shift-register assumption
+with something that doesn't depend on a hand-matched constant at all. A
+dedicated follow-up contract is needed before this project's latency/
+`trigger_seq` claims (§12.1, the "host's order capture doubles as a
+latency log" claim in `CLAUDE.md`) can be trusted again.
+
+**Resolved** (`docs/contracts/order_builder_trigger_delay_patch.md`):
+`order_builder.v`'s hand-rolled shift register was replaced with an
+instance of `rtl/common/delay_line.v` (the same module `ALIGN_DEPTH`
+itself uses), its depth exposed as a new `TRIGGER_DELAY` parameter;
+`tob_top.v` supplies `2 + ALIGN_DEPTH` from the same `ALIGN_DEPTH`
+`localparam` the alignment delay line already defines — one source of
+truth, chosen over the shared-constant alternative above because it
+also eliminates the duplicate shift-register implementation, not just
+the drift risk. Independently verified: `git diff` on `risk_engine.v`/
+`signal_engine.v`/`delay_line.v`/`csr_block.v`/`latency_histogram.v`
+confirmed empty, `tb_order_builder.v`'s existing coverage passes
+unmodified (default `TRIGGER_DELAY=2`), the new `tb_order_builder_delay.v`
+passes at the real depth, T6/T7's order frames were hand-decoded and now
+show `trigger_seq=4`/`6` (matching their triggering messages) with
+`latency_cyc=6`, and a from-scratch mutation (forcing `TRIGGER_DELAY`
+back to the old hardcoded `2`) reproduced exactly a 3-cycle
+(`ALIGN_DEPTH`-sized) `latency_cyc` discrepancy, confirming the fix's
+cycle accounting is exact, not just directionally plausible.
+
+---
+
+## D26 — First real Vivado synthesis attempt (S11 prep): three fixed blockers, one open — `feature_extractor.v` fails timing at 125 MHz
+
+**Context:** starting S11 (hardware bring-up), attempted the first real
+`scripts/build.tcl` run against the current, post-S6/D25 `tob_top.v` —
+every synthesis-adjacent claim up to this point had only ever been
+exercised by Icarus simulation and CI's `iverilog` lint, never real
+Vivado synthesis/implementation. `results/build/tob_top.bit` already
+existed on disk from **2026-09-01**, but its own `timing_summary.rpt`
+showed only 25 timing endpoints and a single `sys_clk` clock — the S0
+skeleton (`sys_clk`/`rst_n`/`key_in`/`led` only), built before RGMII/MDIO
+ports or any engine RTL existed. Nobody had synthesized the real design
+before today.
+
+### Three real blockers found and fixed
+
+1. **`constraints/tob_pins.xdc` only constrained the S0 skeleton's four
+   ports.** All 15 RGMII/MDIO/PHY-reset pins `tob_top.v` has had since S2
+   were entirely unconstrained. Fixed using `docs/refs/AX7035B_pinout_notes.md`'s
+   pin table (independently confirmed against both the real
+   `AX7035B_UG.pdf` manual and the schematic) cross-checked pin-for-pin
+   against ALINX's own working reference design's XDC
+   (`docs/refs/AX7035/SRC/21_ethernet_test/.../top.xdc` — same board, same
+   JL2121(D) PHY). `constraints/tob_timing.xdc` was missing the RGMII RX
+   clock definition (`rx_clk`, 125 MHz on `rgmii_rxc`) entirely — added,
+   matching that same reference design's own `create_clock`. No RGMII
+   input/output delay budget is set (deliberately — see that reference
+   design's own equally minimal treatment, and `AX7035B_pinout_notes.md`'s
+   own "still open" note that the JL2121(D)'s real AC timing has never
+   been re-derived from Micrel-era KSZ9031RNX assumptions per D9).
+2. **`scripts/build.tcl` never globbed `rtl/vendor/alinx_mac/`.** Its
+   `add_files` glob only ever covered `rtl/*.v rtl/common/*.v` — the
+   vendor MAC/RGMII adapter `tob_top.v` has instantiated since S2 was
+   never part of any synthesis attempt. Fixed by extending the glob.
+3. **D8's already-flagged IP regeneration gap** (`rtl/vendor/alinx_mac/`
+   depends on four Xilinx `fifo_generator`/`blk_mem_gen` IP cores —
+   `udp_tx_data_fifo`, `udp_checksum_fifo`, `udp_rx_ram_8_2048`,
+   `icmp_rx_ram_8_256` — "tracked as an S2 checklist item," never actually
+   done). Fixed: copied the four `.xci` configs from ALINX's own working
+   reference design into `rtl/vendor/alinx_mac/ip/<name>/<name>.xci`
+   (2018-era XCI schema), `upgrade_ip` brought them to this Vivado
+   install's `fifo_generator`/`blk_mem_gen` versions cleanly. These
+   default to out-of-context (per-IP) synthesis, which needs a separate
+   `write_checkpoint`/`read_checkpoint -cell` merge step; simpler for a
+   design this size to set `GENERATE_SYNTH_CHECKPOINT false` on each
+   `.xci` so `synth_design` resolves them inline as part of the top-level
+   run instead ("Global Synthesis," Vivado's other supported IP flow).
+   **Verified, not assumed:** `synth_design` completed with zero
+   blackboxes and zero inferred latches (`get_cells -hierarchical -filter
+   {IS_BLACKBOX == 1}` / `{IS_LATCH == 1}`, both empty) — the design
+   genuinely elaborates and synthesizes end to end for the first time.
+   `icmp_rx_ram_8_256` is instantiated with an 11-bit address by
+   `icmp_reply.v` despite its `_256`-implying-8-bit name (already noted in
+   `tb/sim_models/xilinx_ip_sim_models.v`'s own header) — Vivado only
+   warns (`[Synth 8-689] width (11) of port connection 'addra' does not
+   match port width (8)`) and truncates/zero-extends rather than erroring;
+   worth a closer look before trusting ICMP reply behavior on real
+   traffic, not chased further here.
+
+### One real blocker found, not fixed: `feature_extractor.v` fails setup timing
+
+Post-placement timing: **WNS = −9.127 ns** against the 8 ns (125 MHz)
+`rx_clk` period — not a rounding-error violation, a real one. The worst
+path: `u_csr/cfg_symbol_en_reg[0]/C` → `u_feat/feat_f7_volatility_reg[*]/D`,
+36 logic levels, 8.146 ns of pure logic delay before routing is even
+added. Same shape across the ten worst paths (all landing on
+`feat_f7_volatility_reg[*]`), and a smaller **hold** violation
+(`WHS = −0.002 ns`) inside `mdio_ctrl.v`, not investigated yet given the
+setup violation dominates.
+
+**Root cause, read from the path, not guessed:** `cfg_symbol_en` feeds
+`symbol_filter.v`'s slot selection → `applied_slot`/`sidx` →
+`feature_extractor.v`'s per-slot window array indexing → the F5/F7
+window's fully-recomputed-every-cycle adder tree (`f7acc`, a 16-term
+sum over `WINDOW`, plus the F5 popcount, both combinational in one
+`always @(*)` block, per `feature_extractor.v`'s own header). The slot-
+select mux and the window sum apparently share/chain LUTs in Vivado's
+synthesis, producing a single long combinational cone from a CSR config
+register through to F7's output register.
+
+**This was a predicted risk, not a surprise:** master spec §16's risk
+table already named "feature adder tree" as a known timing-closure
+suspect. It has now materialized for real, confirming that risk entry
+was well-founded, not paranoia.
+
+**Not fixed here — needs its own contract, not a quick patch.**
+`feature_extractor.v`'s own header explicitly documents the full-recompute
+design as deliberate (D13's "never maintained as an incremental
+add-newest/subtract-oldest sum" pitfall) — reverting to incremental
+accumulation to shorten the combinational path would reintroduce exactly
+the correctness bug D13 avoided. The real fix is pipelining (splitting
+the F5/F7 computation across two registered cycles, or restructuring the
+16-term sum into an explicit balanced adder tree rather than relying on
+synthesis inference) — a genuine RTL redesign requiring re-verification
+against `sim/feature_golden.py`'s bit-exact semantics and the existing
+`tb_feature_extractor.v`/`tb_feature_tob_chain.v`/`tb_ml_chain.v`
+regressions, not a same-day fix.
+
+**Consequence for S11:** hardware bring-up cannot proceed on a bitstream
+that fails setup timing this badly — `scripts/build.tcl`'s own WNS gate
+already refuses to write one (`route_design` was not even attempted here;
+no point routing a design already known to fail its own gate). This
+blocks every physical S11 step until resolved.
+
+### What's committed vs. not
+
+`constraints/tob_pins.xdc`, `constraints/tob_timing.xdc`,
+`scripts/build.tcl`, and the four new `rtl/vendor/alinx_mac/ip/*/*.xci`
+files are committed — genuine, independently-verified progress (design
+elaborates, synthesizes, places with zero blackboxes/latches). No RTL
+fix for the timing violation is included; `results/build/` stays
+gitignored as before (no fresh bitstream was produced or committed).
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |

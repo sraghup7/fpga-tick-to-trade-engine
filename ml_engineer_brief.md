@@ -87,7 +87,7 @@ For a watched symbol at event `t`, with best bid `b_t`, best ask `a_t`, bid size
 
 **Pin these down explicitly in your code and record them in `model_config.json`** (the FPGA owner matches you bit-for-bit, so ambiguity is a bug):
 
-- **Window `W`** (for F5/F7): default 16; allowed 4/8/16/32. Decide whether the current event is included in the window or not, and write it down.
+- **Window `W`** (for F5/F7): default 16; allowed 4/8/16/32. **Resolved** (`docs/design_decisions.md` D13, pinned during S3 contract-writing since it blocked a bit-exact `feature_extractor.v` contract): one W-deep sliding window per symbol, shared by F5/F7, advancing on **every accepted event of any `msg_type`** (quote/clear/trade/heartbeat), not only book-modifying ones — the current event's own contribution is included in that same event's output ("as of and including now"). Each slot records `(is_update, |F1|)`; `is_update` is true only for quote/clear. F5 = count of `is_update` slots in the window; F7 = sum of `|F1|` over the window. A book-clear resets `prev_bid`/`prev_ask`/the window to all-zero, then is itself treated as the first event after reset. `sim/feature_golden.py`'s `FeatureTracker` is the reference implementation — match it bit-for-bit, don't re-derive from this paragraph.
 - **Initial state:** before the first update for a symbol, `m_{t−1}`, `q_{b,t−1}`, `q_{a,t−1}` are undefined → define F1 = F3 = F4 = 0 and F7 = 0 for the first event (hardware resets to zero; match it).
 - **F6:** updated only by trade-print messages (aggressor side); persists across book updates until the next trade.
 - **Reset/clear:** a book-clear resets the feature history to the initial state.
@@ -322,7 +322,7 @@ If hls4ml blocks at S6, the FPGA owner has a hand-written `linear_classifier.v` 
 1. **Truncation vs. floor on negative shifts.** `int(v / 2**s)` ≠ `v >> s` for negative `v`. Use `np.right_shift`. This is the #1 bit-exactness bug.
 2. **Accumulator narrower than 32 bits.** A 24-bit accumulator overflows at 8 × int8 products + bias. Check the generated C++ types.
 3. **Changing arithmetic after exporting golden vectors.** Any change to an offset/shift/width invalidates everything downstream. Freeze at step 6 of §7.3.
-4. **Unspecified window semantics.** If you don't pin whether the current event is in `W`, the RTL author has to guess. Write it in `model_config.json`.
+4. **Window semantics.** Already pinned — see §4 and `docs/design_decisions.md` D13 (current event included; window advances on every event, not just book-modifying ones). Match `sim/feature_golden.py`, don't re-derive.
 5. **Unpinned versions.** hls4ml/Keras/Vitis HLS versions change arithmetic behavior. Pin and record.
 6. **DSP budget.** v1 = 8 MACs (≤ 8 DSP48, fine). v2 8×8×1 ≈ 72 MACs vs. the part's 90 DSPs — plan reuse or LUT multipliers, or you will not fit.
 7. **Overclaiming.** Say "synthetic proxy label" every time. A real practitioner will find the weakness in 30 seconds; owning it reads as maturity.
