@@ -524,6 +524,23 @@ class GoldenModel:
         if not book_modifying:
             return result
 
+        # -- ML bookkeeping (D30): the spec's own §10 defines cnt_ml_events
+        #    as "valid feature vectors processed" -- the ML branch is a
+        #    SEPARATE, parallel pipeline off book_upd_valid (master spec
+        #    S3.1's two-convergent-paths architecture), not gated on
+        #    whether the deterministic signal engine also fired an intent.
+        #    Must run for every book-modifying event, BEFORE the buy_ok/
+        #    sell_ok early-returns below -- it was previously placed after
+        #    them, so it silently never counted an ML-processed event that
+        #    produced no deterministic signal (D30, found via external
+        #    audit, independently confirmed against this file and the
+        #    spec's own §10 text before fixing).
+        self.counters.inc("cnt_ml_events")
+        if adverse_risk:
+            self.counters.inc("cnt_ml_adverse")
+        else:
+            self.counters.inc("cnt_ml_benign")
+
         # -- signal engine (S6.6, FR-35..40) --
         buy_ok = (
             book.bid_valid
@@ -562,15 +579,6 @@ class GoldenModel:
 
         order_qty = self.cfg.order_qty
 
-        # -- ML bookkeeping (gate 0x09 input is external; counters still
-        #    tracked here since they're part of the deterministic golden
-        #    model's accounting, not the classifier itself) --
-        self.counters.inc("cnt_ml_events")
-        if adverse_risk:
-            self.counters.inc("cnt_ml_adverse")
-        else:
-            self.counters.inc("cnt_ml_benign")
-
         # -- risk engine, all 9 gates, lowest-numbered wins (S8.2, FR-41..48) --
         gates_fired: list[int] = []
         if self.kill_latched:
@@ -602,10 +610,16 @@ class GoldenModel:
             else:
                 reduced_qty = max(1, order_qty >> self.cfg.ml_reduce_shift)
 
+        # D30: cnt_rej_ml is GATE_NAME[GATE_ML] -- the loop above already
+        # increments it exactly once whenever GATE_ML fired. A redundant
+        # second `inc("cnt_rej_ml")` used to sit here, unconditionally
+        # double-counting every ML-blocked order (found via external audit,
+        # independently confirmed: GATE_ML in gates_fired implies
+        # adverse_risk is already true, so the removed line's guard was
+        # never selective -- it fired every single time the loop above
+        # already counted it).
         for g in gates_fired:
             self.counters.inc(GATE_NAME[g])
-        if adverse_risk:
-            self.counters.inc("cnt_rej_ml") if GATE_ML in gates_fired else None
 
         if gates_fired:
             reject_reason = min(gates_fired)

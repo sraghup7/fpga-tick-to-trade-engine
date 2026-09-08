@@ -1,11 +1,20 @@
 """sim/ml_golden.py
 
-Bit-exact Python reference for the S6 ML fallback classifier -- the combined
-behavior of rtl/ml_classifier_wrap.v + rtl/ml_policy.v (contract
-docs/contracts/ml_integration.md S5). Written from the spec, not the RTL, per
-S11.1. One `MLClassifier` object holds the persisting hysteresis state and is
-called once per ML event (one per feature vector), matching ml_policy.v's
-registered `adverse_risk` exactly.
+Bit-exact Python reference for the S6 ML fallback classifier (master spec
+§5.4 model spec, §9 register map, FR-26/27/28/29/31/33) -- what
+rtl/ml_classifier_wrap.v + rtl/ml_policy.v are contracted to implement.
+Derived directly from those spec clauses, not from either RTL file --
+re-derived and cross-checked against the spec text alone in
+docs/design_decisions.md D31 after an earlier version of this docstring
+wrongly credited ml_policy.v's own always block as the source for the
+hysteresis/fail-safe logic below (a real violation of CLAUDE.md's "golden
+models are written from the spec, not the RTL" rule, even though the
+resulting arithmetic turned out to already be correct: a model that
+matches the RTL because it was copied from the RTL proves nothing about
+whether the RTL itself is right). One `MLClassifier` object holds the
+persisting hysteresis state and is called once per ML event (one per
+feature vector, FR-30's fixed-depth-pipeline framing), matching
+ml_policy.v's registered `adverse_risk` exactly.
 
 Weights/bias are loaded from model/weights.mem / model/bias.mem -- the SAME
 placeholder files the RTL loads via $readmemh -- so this stays bit-exact even
@@ -14,17 +23,26 @@ they are the master-spec S15 fallback (w_i = 1 for all i, bias = 0), chosen so
 every vector is trivially hand-computable. This is a documented placeholder,
 not a claim of predictive power.
 
-Arithmetic correspondence (bit-exact):
-  * z = bias + sum(w_i * x_i), plain Python ints -- no saturation needed at
-    these magnitudes (max |z| with placeholder weights is 8*128 = 1024).
-  * risk_level = clamp((z + score_offset) >> score_shift, 0, 255), using
-    Python's native >> which floors toward negative infinity on a signed int
-    -- the same semantics as the RTL's >>> sign-extending arithmetic shift
-    (the correspondence feature_golden.py/feature_normalizer.v already rely
-    on).
-  * Hysteresis + fail-safe forcing transcribed directly from ml_policy.v's
-    always block: adverse sets on z >= th_high, clears on z <= th_low, holds
-    in between; invalid side / crossed / seq_gap forces adverse regardless.
+Arithmetic correspondence (bit-exact), each traced to its own spec clause:
+  * z = bias + sum(w_i * x_i) (§5.4, FR-27's int8*int8->int32 accumulation),
+    plain Python ints -- no saturation needed at these magnitudes (max |z|
+    with placeholder weights is 8*128 = 1024, nowhere near int32 range).
+  * risk_level = clamp((z + score_offset) >> score_shift, 0, 255) -- §9's
+    literal ML_SCORE_OFFSET/ML_SCORE_SHIFT register definitions ("risk_level
+    = (z + offset) >> shift"), §5.4's "risk_level | unsigned 8-bit |
+    saturate((z + offset) >> shift)" row. Python's native >> floors toward
+    negative infinity on a signed int -- the same semantics as a sign-
+    extending arithmetic shift (the correspondence feature_golden.py/
+    feature_normalizer.v already rely on).
+  * Hysteresis (FR-28/29): adverse sets on z >= th_high, clears on
+    z <= th_low, holds in between (T_high > T_low is a runtime-configured
+    invariant, not re-derived here).
+  * Fail-safe forcing (FR-26/31): a side being invalid, the book being
+    crossed, or a sticky sequence gap forces adverse_risk=1 regardless of z.
+    FR-26 lists exactly these three conditions -- staleness is deliberately
+    NOT one of them (risk_engine.v's own gate 0x05 independently blocks any
+    stale order; duplicating that here would be scope creep past what FR-26
+    actually specifies).
 """
 
 from __future__ import annotations

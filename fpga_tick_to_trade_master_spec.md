@@ -483,7 +483,7 @@ Each requirement is numbered, independently testable, and mapped to tests in §1
 | ID | Requirement |
 | :-- | :-- |
 | FR-53 | A free-running 32-bit cycle counter at 125 MHz; captured at ingress timestamp point (last byte of a message entering the parser) and carried with the message. |
-| FR-54 | At egress timestamp point (first byte handed to MAC TX), compute latency and record in a 64-bucket BRAM histogram. |
+| FR-54 | At egress timestamp point (first byte handed to MAC TX), compute latency and record in a 64-bucket histogram (memory technology left to synthesis inference — a structure this small correctly infers as distributed RAM, not a block RAM tile; see `docs/design_decisions.md` D35). |
 | FR-55 | Maintain `lat_min`, `lat_max`, `lat_last` registers. |
 | FR-56 | Counters and histogram readable via stats frames every `cfg_stats_period` cycles and on-demand CSR read. |
 | FR-57 | Reading statistics never stalls, delays, or affects the fast path. |
@@ -531,7 +531,7 @@ The **signal branch** (`book → signal → order intent`, 1 cycle) runs in para
 | ID | Requirement |
 | :-- | :-- |
 | NFR-6 | Meet timing at 125 MHz on `XC7A35T-2FGG484I` with WNS > 0 after place-and-route. |
-| NFR-7 | Engine logic **excluding the ML classifier** consumes ≤15% LUTs (≈3,100 of 20,800), ≤10% FFs, ≤8 BRAM36 of 50, and **0 DSP**. The ML classifier consumes ≤8 DSP48 (v1) and ≤16 DSP48 (v2 via reuse/LUT multipliers). Total DSP ≤ 80% of the part's 90. |
+| NFR-7 | Hand-written engine logic **excluding the ML classifier and the vendored MAC/PHY datapath** (`rtl/vendor/alinx_mac/` — D1's full RGMII MAC/ARP/IP/UDP/ICMP stack, vendored rather than hand-rolled; same carve-out rationale as the ML classifier) consumes ≤15% LUTs (≈3,100 of 20,800), ≤10% FFs, ≤8 BRAM36 of 50, and **0 DSP**. The ML classifier consumes ≤8 DSP48 (v1) and ≤16 DSP48 (v2 via reuse/LUT multipliers). Total DSP ≤ 80% of the part's 90. Measured (post-implementation, `docs/design_decisions.md` D41): the vendor-MAC carve-out alone is not sufficient to meet this budget — see D41 for the honest gap and `csr_block.v`'s outsized share of it. |
 | NFR-8 | Single 125 MHz clock domain for the engine; any CDC (UART, buttons) confined to the slow path with two-flop synchronizers, documented. |
 
 ### 7.4 Design constraints
@@ -635,7 +635,7 @@ All counters 32-bit, saturating (not wrapping), clearable via `CTRL.bit2`. Satur
 **Errors:** `err_fcs`, `err_ethertype`, `err_ip`, `err_udp_port`, `err_frame_len`, `err_msg_type`, `err_flags`, `err_signal_conflict`
 **Feed health:** `cnt_seq_gap`, `cnt_seq_dup`, `cnt_crossed`, `cnt_book_clear`, `cnt_trades`, `cnt_heartbeats`
 **Signal:** `cnt_signal_buy`, `cnt_signal_sell`
-**ML:** `cnt_ml_events` (valid feature vectors processed), `cnt_ml_adverse` (`adverse_risk=1`), `cnt_ml_benign` (`adverse_risk=0`), `cnt_ml_safe_forced` (fail-safe forced adverse on invalid/stale/gap input), `cnt_rej_ml` (gate `0x09` blocked/reduced)
+**ML:** `cnt_ml_events` (valid feature vectors processed), `cnt_ml_adverse` (`adverse_risk=1`), `cnt_ml_benign` (`adverse_risk=0`), `cnt_ml_safe_forced` (fail-safe forced adverse on invalid/stale/gap input), `cnt_rej_ml` (gate `0x09` **block-mode only** — a reduce-mode action still sets `order_valid=1` with a resized quantity, so it is a resizing, not a rejection, and is deliberately not counted here; see `docs/design_decisions.md` D42)
 **Risk (one per gate):** `cnt_rej_kill`, `cnt_rej_size`, `cnt_rej_position`, `cnt_rej_band`, `cnt_rej_stale`, `cnt_rej_seqgap`, `cnt_rej_crossed`, `cnt_rej_throttle`, `cnt_rej_ml`
 **Egress:** `cnt_orders_tx`, `cnt_order_overflow`
 **Latency:** `lat_min`, `lat_max`, `lat_last`, 64-bucket histogram
