@@ -11,11 +11,13 @@
 //
 // Icarus (run from repo root so $readmemh finds model/weights.mem):
 //   iverilog -g2001 -Wall -o tb_ml_chain.vvp rtl/tob_engine.v rtl/feature_extractor.v \
-//     rtl/feature_normalizer.v rtl/ml_classifier_wrap.v rtl/ml_policy.v tb/tb_ml_chain.v
+//     rtl/feature_normalizer.v rtl/ml_classifier_wrap.v rtl/ml_policy.v \
+//     rtl/common/delay_line.v tb/tb_ml_chain.v
 //   vvp tb_ml_chain.vvp
 //
-// Pipeline timing (contract S1.3): book_upd_valid at cycle 0, feat_valid +1,
-// norm_valid +2, ml_valid (and z) +3, adverse_risk/pulses registered at +4.
+// Pipeline timing (D26/D27 v2 timing patch): book_upd_valid at cycle 0,
+// feat_valid +3 (feature_extractor.v's 3-stage pipeline), norm_valid +4,
+// ml_valid (and z) +5, adverse_risk/pulses registered at +6.
 // feature_normalizer's cfg_offset_i/cfg_shift_i are all 0 (identity
 // normalization), so x_i = raw feature clamped to int8 -- every raw feature
 // below is chosen small enough (< 128) that no clamp fires, making z a plain
@@ -31,6 +33,14 @@
 //       regardless of z.
 //   C   slot 2: QUOTE bid 500/10 -> ml_slot=2 routes end to end (z=11, forced
 //       adverse because slot 2's ask is invalid).
+//   D   D28-class same-slot interleave (ml_policy_align_fix.md S4.2): a bid
+//       QUOTE on slot 0 (own book: ask invalid) followed by an ask QUOTE on
+//       the SAME slot whose book update lands INSIDE the first message's ML
+//       window. The first message's fail-safe verdict must reflect ITS OWN
+//       snapshot (forced), not the second message's now-healthy book. An
+//       always-on check asserts u_policy's fs_snap_out_valid coincides with
+//       ml_valid on every cycle (S2.3 consistency note), so a future latency
+//       change anywhere in the ML chain is caught by simulation.
 //
 // Verilog-2001 only.
 
@@ -83,7 +93,9 @@ module tb_ml_chain;
 
     feature_extractor #(.NUM_SYMBOLS(4), .WINDOW(16)) u_feat (
         .clk(clk), .rst_n(rst_n),
-        .msg_type(msg_type), .msg_side(msg_side),
+        // D36: registered applied_msg_type/applied_msg_side, not the raw
+        // testbench msg_type/msg_side directly -- matches tob_top.v.
+        .msg_type(u_tob.applied_msg_type), .msg_side(u_tob.applied_msg_side),
         .msg_applied(u_tob.msg_applied),
         .book_upd_valid(u_tob.book_upd_valid),
         .applied_slot(u_tob.applied_slot),
@@ -124,6 +136,11 @@ module tb_ml_chain;
 
     ml_policy #(.NUM_SYMBOLS(4)) u_policy (
         .clk(clk), .rst_n(rst_n),
+        // D28-class fix (ml_policy_align_fix.md S3): key u_policy's internal
+        // fail-safe snapshot to the triggering message's own book update --
+        // real tob_engine outputs here, same wiring as tob_top.v.
+        .book_upd_valid(u_tob.book_upd_valid),
+        .applied_slot(u_tob.applied_slot),
         .ml_valid(ml_valid), .ml_slot(ml_slot), .z(z),
         .bid_valid(u_tob.bid_valid), .ask_valid(u_tob.ask_valid),
         .crossed(u_tob.crossed), .seq_gap(1'b0),
@@ -135,6 +152,23 @@ module tb_ml_chain;
     );
 
     reg     fail = 1'b0;
+
+    // ml_policy_align_fix.md S2.3 consistency note: u_policy's internal
+    // snapshot delay line (u_fs_align's out_valid) must coincide with ml_valid
+    // on every cycle -- both trace back to the same triggering event's
+    // book_upd_valid (this snapshot pipeline vs feature_extractor ->
+    // feature_normalizer -> ml_classifier_wrap's real latency). A future
+    // latency change anywhere in the ML chain that drifts ml_valid relative to
+    // ml_policy's SNAPSHOT_DEPTH default (4) is caught by simulation, not a
+    // later audit.
+    always @(posedge clk) begin
+        #1;
+        if (rst_n && (u_policy.fs_snap_out_valid !== ml_valid)) begin
+            $display("FAIL: SNAPSHOT drift: u_policy.fs_snap_out_valid=%b vs ml_valid=%b",
+                     u_policy.fs_snap_out_valid, ml_valid);
+            fail = 1'b1;
+        end
+    end
 
     task chk;
         input integer tag;
@@ -178,10 +212,10 @@ module tb_ml_chain;
     reg signed [31:0] c_z;
     reg        c_adverse, c_ev, c_forced, c_adv_pulse, c_ben_pulse;
 
-    // Present one message and advance the whole ML pipeline (4 clock cycles
-    // past the message's commit edge) so adverse_risk/pulses reflect it.
-    // z/ml_slot are sampled on ml_valid's own cycle (+3); the verdicts are
-    // sampled one cycle later (+4).
+    // Present one message and advance the whole ML pipeline (6 clock cycles
+    // past the message's commit edge, D26/D27 v2 timing patch) so
+    // adverse_risk/pulses reflect it. z/ml_slot are sampled on ml_valid's
+    // own cycle (+5); the verdicts are sampled one cycle later (+6).
     task fire;
         input [7:0]  mt;
         input [7:0]  ms;
@@ -192,12 +226,15 @@ module tb_ml_chain;
             @(negedge clk);                    // cycle 0: present
             msg_type = mt; msg_side = ms; msg_price = mp; msg_quantity = mq;
             filt_valid = 1'b1; filt_slot = fs; err_seq_dup = 1'b0;
-            @(posedge clk); #1;                // P0: book commits, feat_valid latches
-            @(negedge clk);
+            @(posedge clk); #1;                // P0: tob_engine's D36 front-end register captures
+            @(negedge clk);                    // deassert before tob_engine re-captures
             filt_valid = 1'b0; err_seq_dup = 1'b0;
+            @(posedge clk); #1;                // P0.5: book_upd_valid commits (D36), feat_valid latches
+            @(posedge clk); #1;                // two extra cycles: feat_valid
+            @(posedge clk); #1;                // now pulses at +3 (D26/D27 v2)
             @(posedge clk); #1;                // P1: norm_valid latches
             @(posedge clk); #1;                // P2: ml_valid/z latch
-            @(negedge clk);                    // cycle 3: ml_valid/z visible
+            @(negedge clk);                    // cycle 5: ml_valid/z visible
             c_ml_valid = ml_valid; c_slot = ml_slot; c_z = z;
             @(posedge clk); #1;                // P3: adverse/pulses latch
             c_adverse  = adverse_risk;
@@ -254,6 +291,50 @@ module tb_ml_chain;
         chkz(17, c_z, 32'sd11);        // slot 2's own features (0+0+10+0+0+1+0+0)
         chk(18, c_adverse, 1'b1);      // slot 2 ask invalid -> forced
         chk(19, c_forced, 1'b1);
+
+        // ============== Block D: D28-class same-slot interleave =============
+        // (ml_policy_align_fix.md S4.2.) Slot 0 was CLEARed by Block B, so a
+        // bid QUOTE on it leaves ask invalid -- its OWN fail-safe snapshot is
+        // "forced". An ask QUOTE on the SAME slot is presented 2 cycles later
+        // so its book update commits INSIDE the bid message's ML window (after
+        // the bid message's T+1 snapshot capture, before its ml_valid). If
+        // ml_policy read the live book at ml_valid, the bid message's verdict
+        // would see the now-healthy post-ask book and wrongly NOT force; the
+        // snapshot must make it reflect the bid message's own (ask-invalid)
+        // state. Presented and sampled at raw posedges (no `fire`, which would
+        // space the two messages too far apart).
+        @(negedge clk);                  // M1: bid QUOTE slot 0
+        msg_type = QUOTE; msg_side = SIDE_BID; msg_price = 32'd100; msg_quantity = 32'd10;
+        filt_valid = 1'b1; filt_slot = 2'd0; err_seq_dup = 1'b0;
+        @(posedge clk); #1;              // M1 front-end capture (D36)
+        @(negedge clk);
+        filt_valid = 1'b0; err_seq_dup = 1'b0;
+        @(posedge clk); #1;              // M1 book_upd_valid: book commits
+        @(posedge clk); #1;              // M1 snapshot captured into u_policy
+        @(negedge clk);                  // M2: ask QUOTE slot 0 (presented so its
+        msg_type = QUOTE; msg_side = SIDE_ASK; msg_price = 32'd110; msg_quantity = 32'd5;  // book
+        filt_valid = 1'b1; filt_slot = 2'd0; err_seq_dup = 1'b0;  // update lands 3 cycles
+        @(posedge clk); #1;              //   after M1's, inside M1's window)
+        @(negedge clk);
+        filt_valid = 1'b0; err_seq_dup = 1'b0;
+        @(posedge clk); #1;              // M2 book_upd_valid: slot 0 now healthy
+        @(posedge clk); #1;              // M1 ml_valid high
+        @(negedge clk);                  // sample M1's ml_valid/z on its own cycle
+        c_ml_valid = ml_valid; c_slot = ml_slot; c_z = z;
+        @(posedge clk); #1;              // M1 verdict commits
+        c_adverse  = adverse_risk;
+        c_ev       = ml_event_valid;
+        c_forced   = ml_safe_forced_pulse;
+        c_adv_pulse = ml_adverse_pulse;
+        c_ben_pulse = ml_benign_pulse;
+        chk(20, c_ml_valid, 1'b1);
+        chks(21, c_slot, 2'd0);
+        chk(22, c_adverse, 1'b1);        // M1's OWN book (ask invalid) -> forced,
+        chk(23, c_forced, 1'b1);         // NOT M2's now-healthy book
+        @(posedge clk); #1;              // let M2's pipeline finish (its verdict
+        @(posedge clk); #1;              // commits one posedge after this)
+        @(negedge clk);
+        @(posedge clk); #1;              // drain/settle
 
         if (fail) begin
             $display("FAIL");

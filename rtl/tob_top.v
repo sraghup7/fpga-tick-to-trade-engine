@@ -28,8 +28,12 @@
 //   * ML path (S6, contract docs/contracts/ml_integration.md): the full
 //     feature_extractor -> feature_normalizer -> ml_classifier_wrap ->
 //     ml_policy chain is wired; risk_engine's adverse_risk comes from
-//     ml_policy.v, and the signal branch is delayed ALIGN_DEPTH=3 cycles so
-//     the order intent and the ML verdict arrive at u_risk on the same cycle.
+//     ml_policy.v, and the signal branch is delayed ALIGN_DEPTH=4 cycles so
+//     the order intent and the ML verdict arrive at u_risk on the same cycle
+//     (D26/D27 v2 timing patch bumped this from 3 to 5; D40 rebalanced it to
+//     4 when signal_engine.v gained its own pipeline stage; risk_engine.v's
+//     own D28 fix keys its internal book-state snapshot to the same
+//     ALIGN_DEPTH).
 //   * err_fcs/err_ip are wired from mac_top's D5 outputs
 //     (mac_rec_error / udp_checksum_error); err_ethertype/err_udp_port
 //     stay tied to 0 -- mac_top exposes no distinct signal for either.
@@ -335,6 +339,8 @@ module tob_top #(
     wire        msg_applied;
     wire [1:0]  applied_slot;
     wire        book_upd_valid;
+    wire [7:0]  applied_msg_type;   // D36: registered copy of md_msg_type,
+    wire [7:0]  applied_msg_side;   // aligned with msg_applied/book_upd_valid
     wire        cnt_book_clear_pulse;
     wire        cnt_trades_pulse;
     wire        cnt_heartbeats_pulse;
@@ -370,6 +376,8 @@ module tob_top #(
         .msg_applied         (msg_applied),
         .applied_slot        (applied_slot),
         .book_upd_valid      (book_upd_valid),
+        .applied_msg_type    (applied_msg_type),
+        .applied_msg_side    (applied_msg_side),
         .cnt_book_clear_pulse(cnt_book_clear_pulse),
         .cnt_trades_pulse    (cnt_trades_pulse),
         .cnt_heartbeats_pulse(cnt_heartbeats_pulse),
@@ -461,7 +469,15 @@ module tob_top #(
     // (docs/contracts/ml_integration.md S1.3). u_csr's own sig_valid/sig_side
     // connections below stay on the RAW (unaligned) u_sig outputs -- they
     // count signals as generated, not as risk-gated.
-    localparam ALIGN_DEPTH = 3;
+    localparam ALIGN_DEPTH = 4;   // feature_extractor.v takes 3 cycles to
+                                  // feat_valid (D26/D27 v2 timing patch: F1
+                                  // split across 2 stages + incremental
+                                  // F5/F7 accumulator); ML branch is 6
+                                  // cycles total, signal branch now 2 (D40:
+                                  // signal_engine.v gained its own pipeline
+                                  // stage to close a timing violation
+                                  // exposed by D39 -- was 5 when the signal
+                                  // branch was 1 cycle)
     wire        sig_valid_aligned;
     wire [73:0] sig_data_aligned;
     wire [1:0]  sig_slot_aligned  = sig_data_aligned[73:72];
@@ -477,8 +493,13 @@ module tob_top #(
     ) u_feat (
         .clk                    (gmii_rx_clk),
         .rst_n                  (engine_rst_n),
-        .msg_type               (md_msg_type),
-        .msg_side               (md_msg_side),
+        // D36: applied_msg_type/applied_msg_side (registered inside
+        // tob_engine.v, aligned with msg_applied/book_upd_valid), NOT
+        // md_parser.v's raw md_msg_type/md_msg_side directly -- those now
+        // trail book_upd_valid by one cycle since tob_engine.v's own D36
+        // front-end pipeline register.
+        .msg_type               (applied_msg_type),
+        .msg_side               (applied_msg_side),
         .msg_applied            (msg_applied),
         .book_upd_valid         (book_upd_valid),
         .applied_slot           (applied_slot),
@@ -540,6 +561,12 @@ module tob_top #(
     ml_policy u_policy (
         .clk                  (gmii_rx_clk),
         .rst_n                (engine_rst_n),
+        // D28-class fix (ml_policy_align_fix.md S3): key ml_policy's internal
+        // per-slot fail-safe snapshot to the triggering message's own
+        // book_upd_valid/applied_slot -- already top-level wires (u_feat
+        // consumes both above).
+        .book_upd_valid       (book_upd_valid),
+        .applied_slot         (applied_slot),
         .ml_valid             (ml_valid),
         .ml_slot              (ml_slot),
         .z                    (ml_z),
@@ -613,7 +640,11 @@ module tob_top #(
         else               cur_cycle <= cur_cycle + 32'd1;
     end
 
-    risk_engine u_risk (
+    risk_engine #(
+        .ALIGN_DEPTH (ALIGN_DEPTH)   // reuse the localparam above -- must
+                                     // match u_align's depth or risk_engine's
+                                     // D28 snapshot misaligns again
+    ) u_risk (
         .clk                    (gmii_rx_clk),
         .rst_n                  (engine_rst_n),
         .sig_valid              (sig_valid_aligned),
@@ -621,6 +652,11 @@ module tob_top #(
         .sig_side               (sig_side_aligned),
         .sig_price              (sig_price_aligned),
         .sig_qty                (sig_qty_aligned),
+        // D28: raw (pre-alignment) sig_valid/sig_slot -- already top-level
+        // wires (u_csr reads them too). Keys risk_engine's internal book/
+        // timestamp snapshot to the triggering message's own cycle.
+        .sig_valid_raw          (sig_valid),
+        .sig_slot_raw           (sig_slot),
         .msg_applied            (msg_applied),
         .applied_slot           (applied_slot),
         .bid_price              (bid_price),
@@ -664,10 +700,15 @@ module tob_top #(
     wire         cnt_order_overflow_pulse;
 
     order_builder #(
-        .TRIGGER_DELAY (2 + ALIGN_DEPTH)   // signal_engine + risk_engine's own
-                                            // 1-cycle registers, plus S6's
-                                            // alignment delay (docs/design_
-                                            // decisions.md D25)
+        .TRIGGER_DELAY (5 + ALIGN_DEPTH)   // tob_engine's front-end pipeline
+                                            // register (D36, +1) + signal_engine
+                                            // (2, D40) + risk_engine's 2-cycle
+                                            // gate pipeline (D34), plus S6's
+                                            // alignment delay -- total stays 9
+                                            // (was 4+5): D40 moved one cycle
+                                            // from ALIGN_DEPTH into
+                                            // signal_engine's own latency, net
+                                            // zero change (docs/design_decisions.md D25, D40)
     ) u_ob (
         .clk                  (gmii_rx_clk),
         .rst_n                (engine_rst_n),
@@ -772,6 +813,7 @@ module tob_top #(
         .filt_dropped           (filt_dropped),
         .err_seq_dup            (err_seq_dup),
         .seq_gap_pulse          (seq_gap_pulse),
+        .seq_gap_amount         (seq_gap_amount),   // D44: was computed and dangling
         .cnt_book_clear_pulse   (cnt_book_clear_pulse),
         .cnt_trades_pulse       (cnt_trades_pulse),
         .cnt_heartbeats_pulse   (cnt_heartbeats_pulse),

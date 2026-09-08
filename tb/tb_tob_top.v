@@ -95,6 +95,48 @@ module tb_tob_top;
 
     reg fail = 1'b0;
 
+    // D28 alignment-drift guard (risk_engine_align_fix.md S2.3/S4.2): the
+    // DUT's internal snapshot delay line (u_risk.u_gate_align) and the top
+    // level's own u_align must both delay sig_valid_raw by the SAME
+    // ALIGN_DEPTH. Both derive from tob_top's single localparam today, so
+    // this can only trip if a future change makes them drift -- which is
+    // exactly the failure mode that must be caught by simulation. (Note:
+    // this tb drives frame-by-frame, so two same-slot messages can never land
+    // within the ALIGN_DEPTH window -- the frame cadence is hundreds of
+    // cycles -- meaning a D28 "poison message" case is not constructible at
+    // this level; the unit-level poison regression lives in tb_risk_engine.
+    // This check is the integration-level equivalent: sig_valid_aligned and
+    // the snapshot must coincide on every order event below.)
+    always @(posedge dut.gmii_rx_clk) begin
+        if (dut.engine_rst_n &&
+            (dut.u_risk.gate_snap_out_valid !== dut.sig_valid_aligned)) begin
+            $display("FAIL: D28 alignment drift: u_risk.gate_snap_out_valid=%b vs sig_valid_aligned=%b",
+                     dut.u_risk.gate_snap_out_valid, dut.sig_valid_aligned);
+            fail = 1'b1;
+        end
+    end
+
+    // ml_policy_align_fix.md S2.3/S4.2 -- ML-branch equivalent of the D28
+    // guard above: u_policy's internal fail-safe snapshot delay line
+    // (u_fs_align) must coincide with ml_valid on every cycle, since both
+    // trace back to the same triggering message's book_upd_valid (this
+    // snapshot pipeline vs feature_extractor -> feature_normalizer ->
+    // ml_classifier_wrap's real latency). A future latency change anywhere in
+    // the ML chain that drifts ml_valid relative to ml_policy's
+    // SNAPSHOT_DEPTH default (4) is caught by simulation, not a later audit.
+    // The same frame-cadence note as the D28 guard applies -- two same-slot
+    // book updates can never land inside the ~5-cycle ML window when frames
+    // arrive hundreds of cycles apart, so the unit-level poison regression
+    // lives in tb_ml_policy; this is the integration-level structural check.
+    always @(posedge dut.gmii_rx_clk) begin
+        if (dut.engine_rst_n &&
+            (dut.u_policy.fs_snap_out_valid !== dut.ml_valid)) begin
+            $display("FAIL: ML SNAPSHOT drift: u_policy.fs_snap_out_valid=%b vs ml_valid=%b",
+                     dut.u_policy.fs_snap_out_valid, dut.ml_valid);
+            fail = 1'b1;
+        end
+    end
+
     task chk;
         input integer tag;
         input [31:0] got;
