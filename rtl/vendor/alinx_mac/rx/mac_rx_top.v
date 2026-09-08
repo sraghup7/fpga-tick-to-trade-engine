@@ -25,7 +25,8 @@ module mac_rx_top
  input  [10:0]          udp_rec_ram_read_addr,
  output [15:0]          udp_rec_data_length,
  output                 udp_rec_data_valid,
- 
+ output [15:0]          udp_rec_dest_port,     // D49 (FR-3): UDP dest port (from udp_rx)
+
  output [7:0]           mac_rx_dataout,
  output [15:0]          upper_layer_data_length ,
  output [15:0]          ip_total_data_length,
@@ -37,7 +38,8 @@ module mac_rx_top
  // (D5 patch, not in original ALINX source) exposes internal error status
  // that previously only gated udp_rec_data_valid low with no visibility.
  output                 mac_rec_error,
- output                 udp_checksum_error
+ output                 udp_checksum_error,
+ output                 err_ethertype          // D49 (FR-2): from mac_rx
 ) ;
 
 
@@ -106,7 +108,7 @@ mac_rx mac0
       
  .mac_rx_dataout                (mac_rx_dataout ),
  .mac_rec_error                 (mac_rec_error),
- 
+ .err_ethertype                 (err_ethertype),   // D49 (FR-2)
  .mac_rx_destination_mac_addr   (mac_rx_destination_mac_addr ),
  .mac_rx_source_mac_addr        (mac_rx_source_mac_addr)     
 );
@@ -162,8 +164,9 @@ ip_rx ip0
  .udp_rec_ram_rdata             (udp_rec_ram_rdata),  
  .udp_rec_ram_read_addr         (udp_rec_ram_read_addr),
  .udp_rec_data_length           (udp_rec_data_length ),
-      
+ 
  .udp_rec_data_valid            (udp_rec_data_valid),
+ .udp_rec_dest_port             (udp_rec_dest_port),   // D49 (FR-3)
  .udp_checksum_error            (udp_checksum_error)
 );
 

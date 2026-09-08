@@ -361,24 +361,20 @@ def generate(count: int, seed: int) -> tuple[list[bytes], list[bytes], dict]:
 
     # tb/tb_top.v's randomized_soak() task sends 3 CSR write frames (CTRL,
     # ML_TH_HIGH, ML_TH_LOW) immediately before streaming this generator's
-    # output, to configure the engine. These are real 16-byte frames as far
-    # as the RTL is concerned: md_parser.v rejects msg_type 0x20 as invalid,
-    # so each one hits err_msg_type -- but BEFORE that check, seq_monitor.v
-    # ALSO sees each one (msg_complete = msg_valid | err_msg_type |
-    # err_flags), always with seq_num=0 (the CSR frame's tail is hardwired
-    # to zero). The first one becomes "the first message ever" post-reset
-    # (anchors expected_seq=1, matching this generator's own stream, which
-    # starts at seq=1 via _warmup_messages -- see clear_seq_gap's own
-    # comment in tb_top.v for why that alignment is deliberate); the other
-    # two are then DUPLICATES of it (seq 0 < expected_seq 1), each
-    # incrementing cnt_seq_dup. An earlier draft of this generator applied
-    # a flat "+3" adjustment to cnt_frames_rx/cnt_msgs_rx/err_msg_type only
-    # and missed this duplicate-counting effect entirely (confirmed
-    # directly: cnt_seq_dup and cnt_seq_gap were both off by more than the
-    # flat adjustment could explain). Modeling the exact 3 frames through
-    # process_frame() itself, before the real stream, gets every counter
-    # they touch right by construction instead of guessing which ones to
-    # patch by hand.
+    # output, to configure the engine, then reads every counter back via 35
+    # sequential 0x21 read frames. Those CSR frames are still REAL 16-byte
+    # Ethernet frames as far as the RTL is concerned, so they keep counting
+    # toward cnt_frames_rx (frame-level, S1's explicit scope decision) -- but
+    # since the csr_ingress_separation fix (md_parser.v recognizes 0x20/0x21
+    # so err_msg_type never fires for them, and seq_monitor.v/csr_block.v's
+    # message-level counters key off that), they have ZERO effect on every
+    # other counter and on seq-gap/dup state. The elaborate pre/post-read
+    # snapshot accounting this file used to do (D44 item 2 -- modeling each
+    # read frame's pipeline-depth-dependent pollution of cnt_msgs_rx /
+    # err_msg_type / cnt_seq_dup) is gone: there is nothing left to model.
+    # Modeling the frames through process_frame() itself still matters for
+    # cnt_frames_rx's own count, so the 38 CSR frames are all processed here
+    # in the exact order tb_top.v sends them.
     def _csr_frame_pack(mt: int, addr: int, data: int) -> bytes:
         import struct as _struct
         return _struct.pack(">BBHIQ", mt, 0, addr, data, 0)
@@ -400,26 +396,10 @@ def generate(count: int, seed: int) -> tuple[list[bytes], list[bytes], dict]:
             if r.order is not None:
                 expected_orders.append(r.order.encode())
 
-    # tb/tb_top.v reads back every counter via 35 sequential CSR 0x21 read
-    # frames (csr_read_value, one per COUNTER_ORDER entry, in that exact
-    # order). Each read is ITSELF a real 16-byte frame the RTL counts --
-    # md_parser.v rejects msg_type 0x21 the same way it rejects 0x20, so
-    # every single read increments cnt_frames_rx/cnt_msgs_rx/err_msg_type,
-    # and (via seq_monitor's msg_complete, same mechanism as the 3 setup
-    # writes above) counts as a seq_num=0 duplicate once any real traffic
-    # has occurred. This means the very act of reading cnt_frames_rx bumps
-    # cnt_frames_rx by 1 before its own response is built, and reading
-    # cnt_seq_dup after 13 other reads have already happened reflects 13
-    # EXTRA duplicate-counts contributed by those preceding reads, not just
-    # the real stream's own dup count. Confirmed directly: an earlier
-    # version of this generator that snapshotted every counter at once,
-    # after the stream but before modeling any reads, was off by exactly
-    # the amount each counter's own read-order position would predict
-    # (cnt_seq_dup read 13 low, matching its position as the 14th read).
-    # The only correct fix is to simulate the exact same 35 reads, in the
-    # exact same order, and snapshot each counter's value immediately after
-    # ITS OWN read -- exactly mirroring what tb_top.v's own csr_read_value
-    # sequence actually measures.
+    # tb/tb_top.v reads every counter back via 0x21 read frames in
+    # COUNTER_ORDER (see counter_addr below). The counters are snapshotted
+    # after the reads, in the exact way the counter_addr/read-order comment
+    # just below describes.
     counter_addr = {
         "cnt_frames_rx": 0x00A0, "cnt_msgs_rx": 0x00A4, "cnt_msgs_filtered": 0x00A8,
         "cnt_msgs_accepted": 0x00AC, "err_fcs": 0x00B0, "err_ethertype": 0x00B4,
@@ -436,24 +416,30 @@ def generate(count: int, seed: int) -> tuple[list[bytes], list[bytes], dict]:
     }
     assert list(counter_addr) == list(COUNTER_ORDER), "counter_addr must match COUNTER_ORDER exactly"
 
-    # cnt_frames_rx is NOT like the other 34: measured directly, it matched
-    # exactly when snapshotted AFTER its own read frame is processed (its
-    # own read's contribution IS visible in its own response) -- but every
-    # other counter (all downstream of md_parser's own multi-cycle
-    # pipeline: cnt_msgs_rx, err_msg_type, cnt_seq_gap/dup, etc.) measured
-    # consistently 1 LOW when snapshotted the same way, and consistently
-    # matched when snapshotted BEFORE processing that same read frame.
-    # Read this as: frame_classifier-level counting is fast enough to be
-    # visible to a CSR read response built from the very same frame that
-    # triggered it; anything one or more pipeline stages further down
-    # (md_parser and beyond) is not yet visible by the time that response
-    # goes out -- the read's own contribution to THOSE counters only
-    # becomes visible starting with the NEXT frame's own processing.
+    # tb/tb_top.v reads every counter back via a 0x21 read frame (one per
+    # COUNTER_ORDER entry, in this exact order), and each read frame is
+    # ITSELF a real 16-byte Ethernet frame. Post-csr_ingress_separation
+    # (md_parser.v recognizes 0x20/0x21, so neither seq_monitor.v nor
+    # csr_block.v's message-level counters ever see a CSR frame), only
+    # cnt_frames_rx still moves with those frames (frame-level counting,
+    # S1's explicit scope decision) -- every other counter is invariant to
+    # CSR frames by CONSTRUCTION now, not by empirical snapshot timing, so
+    # the old "snapshot before vs. after its own read" distinction (D44 item
+    # 2) is gone. cnt_frames_rx is read FIRST (COUNTER_ORDER[0] ==
+    # counter_addr[0]), and its own read's contribution IS visible in its
+    # own response (D44: frame-classifier-level counting is fast enough) --
+    # so it must still be snapshotted after exactly its own (the first)
+    # read frame, exactly as before. All other counters have the same value
+    # before and after every read, so they are snapshotted once, after the
+    # reads (== after the real stream; identical either way).
     counters: dict = {}
     for name in COUNTER_ORDER:
-        pre_value = gm.counters[name]
         gm.process_frame(_csr_frame_pack(0x21, counter_addr[name], 0), arrival_cycle=None, adverse_risk_fn=None)
-        counters[name] = gm.counters[name] if name == "cnt_frames_rx" else pre_value
+        if name == "cnt_frames_rx":
+            counters[name] = gm.counters[name]   # after its own (the first) read
+    for name in COUNTER_ORDER:
+        if name != "cnt_frames_rx":
+            counters[name] = gm.counters[name]   # invariant to CSR frames now
     # golden_model.py itself never increments cnt_ml_safe_forced (its
     # adverse_risk_fn interface has no way to convey "forced" vs
     # "predicted") -- overridden here with this generator's own accurate

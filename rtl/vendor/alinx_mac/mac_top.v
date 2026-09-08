@@ -33,21 +33,23 @@ module mac_top
          
          input                rx_dv,
          input  [7:0]         mac_rx_datain,
-         output [7:0]         udp_rec_ram_rdata ,
-         input  [10:0]        udp_rec_ram_read_addr,
-         output [15:0]        udp_rec_data_length,
-         output               udp_rec_data_valid,
-         
-         output               arp_found,
-         output               mac_not_exist,
+          output [7:0]         udp_rec_ram_rdata ,
+          input  [10:0]        udp_rec_ram_read_addr,
+          output [15:0]        udp_rec_data_length,
+          output               udp_rec_data_valid,
+          output [15:0]        udp_rec_dest_port,      // D49 (FR-3), from mac_rx_top/udp_rx
+          
+          output               arp_found,
+          output               mac_not_exist,
 
-         // (D5 patch, not in original ALINX source) exposes internal error
-         // status that previously only gated udp_rec_data_valid low with
-         // no visibility -- see docs/design_decisions.md D5.
-         output               mac_rec_error,
-         output               udp_checksum_error
+          // (D5 patch, not in original ALINX source) exposes internal error
+          // status that previously only gated udp_rec_data_valid low with
+          // no visibility -- see docs/design_decisions.md D5.
+          output               mac_rec_error,
+          output               udp_checksum_error,
+          output               err_ethertype           // D49 (FR-2), from mac_rx_top/mac_rx
 
-       ) ;
+        ) ;
        
        
 wire                  arp_reply_ack ;
@@ -134,6 +136,7 @@ mac_rx_top mac_rx0
             .udp_rec_ram_read_addr    (udp_rec_ram_read_addr),
             .udp_rec_data_length      (udp_rec_data_length ),
             .udp_rec_data_valid       (udp_rec_data_valid),
+            .udp_rec_dest_port        (udp_rec_dest_port),   // D49 (FR-3)
 
             .mac_rx_dataout           (mac_rx_dataout ),
             .upper_layer_data_length  (upper_layer_data_length  ),
@@ -144,7 +147,8 @@ mac_rx_top mac_rx0
             .arp_found                (arp_found  ),
 
             .mac_rec_error            (mac_rec_error),
-            .udp_checksum_error       (udp_checksum_error)
+            .udp_checksum_error       (udp_checksum_error),
+            .err_ethertype            (err_ethertype)   // D49 (FR-2)
            ) ;
            
            

@@ -36,6 +36,12 @@ MSG_CLEAR = 0x03
 MSG_HEARTBEAT = 0xFF
 VALID_MSG_TYPES = (MSG_QUOTE, MSG_TRADE, MSG_CLEAR, MSG_HEARTBEAT)
 
+# S9 CSR frame types (D19, csr_ingress_separation.md): they share md_parser's
+# byte stream by design but are NOT market data. process_message returns
+# before any counter/seq side effect for them, mirroring rtl/md_parser.v,
+# which now recognizes these types so err_msg_type never fires for them.
+CSR_FRAME_TYPES = (0x20, 0x21)
+
 SIDE_BID = 0x00
 SIDE_ASK = 0x01
 
@@ -391,8 +397,24 @@ class GoldenModel:
         self._refill_tokens(self.current_cycle)
         self._retire_tx_slots(self.current_cycle)
 
-        self.counters.inc("cnt_msgs_rx")
         msg = Message.decode(raw)
+
+        # csr_ingress_separation.md: CSR write/read-request frames (0x20/0x21)
+        # share md_parser's byte stream by design (D19) but are not market
+        # data -- and, matching rtl/md_parser.v (which now recognizes these
+        # types so err_msg_type never fires for them), they must have ZERO
+        # effect on every message-level counter and on seq-gap/dup tracking.
+        # This early return is the very first thing process_message does with
+        # a decoded message, BEFORE cnt_msgs_rx and BEFORE the seq block:
+        # csr_block.v's cnt_msgs_rx condition (md_msg_valid | err_msg_type |
+        # err_flags) and seq_monitor.v's msg_complete both key off signals
+        # md_parser keeps low for CSR frames, so this model must not count
+        # them either. (process_frame's own cnt_frames_rx still moves for a
+        # CSR frame -- it counts Ethernet frames, not messages; unchanged.)
+        if msg.msg_type in CSR_FRAME_TYPES:
+            return ProcessResult()
+
+        self.counters.inc("cnt_msgs_rx")
 
         # FR-10/11/12: sequence gap/dup tracking, run BEFORE symbol filter
         # and msg_type/flags validation, on every message regardless of

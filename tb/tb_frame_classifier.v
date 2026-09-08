@@ -15,17 +15,26 @@
 //                 recovery" / "parser returns to idle before next frame")
 //   plus an FR-4 upper-bound case: 1424 bytes (89*16, a clean multiple of
 //   16 but over the 88-message limit) is also discarded.
+//   T-FR3 (FR-3)  a frame whose UDP destination port != cfg_udp_port is
+//                 discarded whole (err_udp_port pulses exactly once, no byte
+//                 reaches out_data/out_valid), and the next frame on the
+//                 CONFIGURED port passes through unchanged (clean recovery).
+//                 The port-match gate is combinational off udp_rec_dest_port
+//                 (stable for the whole frame, like rx_len), so a mismatched
+//                 frame streams zero bytes even though rx_valid carries bytes.
 //
-// Drives rx_data/rx_valid/frame_start/rx_len directly -- the same
-// eth_mac_if-shaped boundary tb_eth_mac_if_rx.v mocks -- rather than
-// instantiating eth_mac_if itself, since frame_classifier's contract with
-// its producer is exactly these four signals (docs/design_decisions.md D11).
+// Drives rx_data/rx_valid/frame_start/rx_len/udp_rec_dest_port/cfg_udp_port
+// directly -- the same eth_mac_if-shaped boundary tb_eth_mac_if_rx.v mocks,
+// plus the FR-3 port inputs -- rather than instantiating eth_mac_if itself,
+// since frame_classifier's contract with its producer is exactly these
+// signals (docs/design_decisions.md D11; the UDP dest port is carried
+// mac_top -> frame_classifier at tob_top, D49 FR-3).
 //
 // A rejected frame still streams its declared number of bytes on
 // rx_valid/rx_data (a frame can be "bad length" and still have real bytes
 // behind it); the check is that ZERO of them reach out_data/out_valid and
-// err_frame_len pulses exactly once, timed off frame_start -- which is also
-// what makes a zero-length frame's rejection observable at all.
+// err_frame_len / err_udp_port pulse exactly once, timed off frame_start --
+// which is also what makes a zero-length frame's rejection observable at all.
 //
 // Verilog-2001 only.
 
@@ -39,21 +48,27 @@ module tb_frame_classifier;
     reg        rx_valid = 1'b0;
     reg        frame_start = 1'b0;
     reg [15:0] rx_len = 16'd0;
+    reg [15:0] udp_rec_dest_port = 16'd0;   // D49 (FR-3)
+    reg [15:0] cfg_udp_port = 16'd0;        // D49 (FR-3)
 
     wire [7:0] out_data;
     wire       out_valid;
     wire       err_frame_len;
+    wire       err_udp_port;
 
     frame_classifier dut (
-        .clk           (clk),
-        .rst_n         (rst_n),
-        .rx_data       (rx_data),
-        .rx_valid      (rx_valid),
-        .frame_start   (frame_start),
-        .rx_len        (rx_len),
-        .out_data      (out_data),
-        .out_valid     (out_valid),
-        .err_frame_len (err_frame_len)
+        .clk               (clk),
+        .rst_n             (rst_n),
+        .rx_data           (rx_data),
+        .rx_valid          (rx_valid),
+        .frame_start       (frame_start),
+        .rx_len            (rx_len),
+        .udp_rec_dest_port (udp_rec_dest_port),
+        .cfg_udp_port      (cfg_udp_port),
+        .out_data          (out_data),
+        .out_valid         (out_valid),
+        .err_frame_len     (err_frame_len),
+        .err_udp_port      (err_udp_port)
     );
 
     reg fail = 1'b0;
@@ -62,10 +77,14 @@ module tb_frame_classifier;
     reg [7:0] got [0:1599];
     integer   got_cnt;
     integer   err_pulses;
+    integer   udp_err_pulses;
 
-    // Count err_frame_len pulses continuously (independent of the tasks
-    // below, so a pulse mid-task is never missed).
-    always @(posedge clk) if (err_frame_len) err_pulses = err_pulses + 1;
+    // Count err_frame_len / err_udp_port pulses continuously (independent of
+    // the tasks below, so a pulse mid-task is never missed).
+    always @(posedge clk) begin
+        if (err_frame_len) err_pulses = err_pulses + 1;
+        if (err_udp_port)  udp_err_pulses = udp_err_pulses + 1;
+    end
 
     // Present one frame: pulse frame_start/rx_len for one cycle, then (if
     // n_bytes > 0) stream n_bytes back-to-back on rx_valid/rx_data, values
@@ -129,6 +148,10 @@ module tb_frame_classifier;
         #20;
         rst_n = 1'b1;
         #20;
+        // FR-3 baseline: configured port 60000, matching every frame below
+        // unless a specific case changes udp_rec_dest_port.
+        cfg_udp_port = 16'd60000;
+        udp_rec_dest_port = 16'd60000;
 
         // ---- T01: one 16-byte frame, passes through untouched ----
         err_pulses = 0;
@@ -203,6 +226,53 @@ module tb_frame_classifier;
         check_passthrough(16, 8'h80);
         if (err_pulses !== 0) begin
             $display("FAIL: post-bad-frame recovery: err_frame_len pulsed %0d times, expected 0", err_pulses);
+            fail = 1'b1;
+        end
+
+        // ---- T-FR3: UDP port mismatch discards the whole frame ----
+        // A 16-byte frame (length OK) on the WRONG UDP port must be discarded
+        // entirely: err_udp_port pulses exactly once at frame_start and ZERO
+        // bytes reach out_data/out_valid, even though rx_valid carries bytes.
+        udp_err_pulses = 0;
+        udp_rec_dest_port = 16'd60001;   // wrong port (cfg is 60000)
+        send_frame(16'd16, 16, 8'h90);
+        if (got_cnt !== 0) begin
+            $display("FAIL: FR-3 wrong-port forwarded %0d bytes, expected 0", got_cnt);
+            fail = 1'b1;
+        end
+        if (udp_err_pulses !== 1) begin
+            $display("FAIL: FR-3 wrong-port err_udp_port pulsed %0d times, expected 1", udp_err_pulses);
+            fail = 1'b1;
+        end
+        if (err_pulses !== 0) begin
+            $display("FAIL: FR-3 wrong-port err_frame_len pulsed %0d times, expected 0 (length was fine)", err_pulses);
+            fail = 1'b1;
+        end
+
+        // ---- FR-3 clean recovery: next frame on the CONFIGURED port passes ----
+        err_pulses = 0; udp_err_pulses = 0;
+        udp_rec_dest_port = 16'd60000;   // back to the configured port
+        send_frame(16'd16, 16, 8'hA0);
+        check_passthrough(16, 8'hA0);
+        if (err_pulses !== 0 || udp_err_pulses !== 0) begin
+            $display("FAIL: FR-3 recovery: err pulses (len=%0d udp=%0d), expected 0/0",
+                     err_pulses, udp_err_pulses);
+            fail = 1'b1;
+        end
+
+        // ---- FR-3 regression: port match must not mask the FR-5 length
+        //      check (a wrong-length frame on the RIGHT port still counts
+        //      err_frame_len, not err_udp_port) ----
+        err_pulses = 0; udp_err_pulses = 0;
+        udp_rec_dest_port = 16'd60000;
+        send_frame(16'd17, 17, 8'hB0);   // bad length, right port
+        if (got_cnt !== 0) begin
+            $display("FAIL: FR-3+FR-5 (bad len, right port) forwarded %0d bytes, expected 0", got_cnt);
+            fail = 1'b1;
+        end
+        if (err_pulses !== 1 || udp_err_pulses !== 0) begin
+            $display("FAIL: FR-3+FR-5 (bad len, right port): len=%0d udp=%0d, expected 1/0",
+                     err_pulses, udp_err_pulses);
             fail = 1'b1;
         end
 

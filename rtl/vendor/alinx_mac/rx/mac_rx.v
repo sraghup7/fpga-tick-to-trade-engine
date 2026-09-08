@@ -28,7 +28,17 @@ module mac_rx
  output reg             mac_rec_error ,
  
  output reg [47:0]      mac_rx_destination_mac_addr,
- output reg [47:0]      mac_rx_source_mac_addr
+ output reg [47:0]      mac_rx_source_mac_addr,
+
+ // (D49 patch, not in original ALINX source) pulses for one cycle when a
+ // fully-received frame's EtherType is neither 0x0800 (IPv4) nor 0x0806
+ // (ARP) -- computed from the SAME frame_type register, at the SAME point
+ // in the state machine (REC_IDENTIFY) this file already uses to decide
+ // ip_rx_req/arp_rx_req, so there is exactly one source of truth for "what
+ // EtherType was this frame". Such frames are still silently dropped (they
+ // go REC_ERROR, never REC_DATA) -- this patch only makes the reason visible
+ // for FR-2's err_ethertype counter. No other behavior changed.
+ output reg             err_ethertype
 );
 
 reg [4:0]               mac_rx_cnt       ;
@@ -180,6 +190,25 @@ begin
     arp_rx_req <=  	1'b1 ;
   else
     arp_rx_req <=  	1'b0 ;
+end
+
+// D49 patch (FR-2, err_ethertype): mirror image of ip_rx_req/arp_rx_req --
+// fires one cycle when a fully-received frame's frame_type is neither IPv4
+// (0x0800) nor ARP (0x0806), computed from the SAME frame_type register at
+// the SAME dispatch point (REC_IDENTIFY) so there is exactly one source of
+// truth. Such frames still go REC_ERROR (silently dropped, as before); this
+// only exposes the reason to the engine's err_ethertype counter. Frame_type
+// is fully captured by the time REC_IDENTIFY is reached (bytes latched in
+// REC_MAC_HEAD at mac_rx_cnt 20/21, exactly as ip_rx_req/arp_rx_req rely on).
+always @(posedge clk or negedge rst_n)
+begin
+  if (~rst_n)
+    err_ethertype <= 1'b0 ;
+  else if (rec_state == REC_IDENTIFY &&
+           frame_type != 16'h0800 && frame_type != 16'h0806)
+    err_ethertype <= 1'b1 ;
+  else
+    err_ethertype <= 1'b0 ;
 end
 
 //rx dv and rx data resigster

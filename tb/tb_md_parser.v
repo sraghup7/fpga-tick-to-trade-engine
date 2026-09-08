@@ -260,6 +260,41 @@ module tb_md_parser;
             check_msg(1, 8'h03, 8'h07, 8'h00, 8'h00, 32'd72, 32'd82, 32'd92);
         end
 
+        // ---- T07 (csr_ingress_separation.md S6): CSR write (0x20) and CSR
+        //      read-request (0x21) frames share this byte stream by design
+        //      (D19) but are NOT malformed market data. They must be
+        //      invisible to both status signals -- err_msg_type=0 AND
+        //      msg_valid=0 -- while a genuinely-undefined type (0x07, control)
+        //      still fires err_msg_type. A CSR frame that fired err_msg_type
+        //      would (in the real top) inflate cnt_msgs_rx/cnt_err_msg_type
+        //      and appear to seq_monitor as a phantom dup/gap -- the bug
+        //      this case guards. ----
+        got_cnt = 0; err_type_pulses = 0; err_flags_pulses = 0;
+        send_msg(8'h01, 8'h08, 8'h00, 8'h00, 32'd80, 32'd90, 32'd100);   // good (before)
+        send_msg(8'h20, 8'h00, 8'h00, 8'h00, 32'h0000_0000, 32'd0, 32'd0);  // CSR write
+        send_msg(8'h21, 8'h00, 8'h00, 8'h00, 32'h0000_0000, 32'd0, 32'd0);  // CSR read-req
+        send_msg(8'h07, 8'h08, 8'h00, 8'h00, 32'd81, 32'd91, 32'd101);  // genuinely undefined (control)
+        send_msg(8'h02, 8'h08, 8'h01, 8'h00, 32'd82, 32'd92, 32'd102);  // good (after)
+        @(posedge clk); #1;
+
+        if (got_cnt !== 2) begin
+            $display("FAIL: T07 (CSR) got_cnt=%0d, expected 2 (CSR frames must not be msg_valid)", got_cnt);
+            fail = 1'b1;
+        end
+        if (err_type_pulses !== 1) begin
+            $display("FAIL: T07 (CSR) err_msg_type pulsed %0d times, expected 1 -- only the 0x07 control; 0x20/0x21 frames must NOT fire it",
+                     err_type_pulses);
+            fail = 1'b1;
+        end
+        if (err_flags_pulses !== 0) begin
+            $display("FAIL: T07 (CSR) err_flags pulsed %0d times, expected 0", err_flags_pulses);
+            fail = 1'b1;
+        end
+        if (got_cnt >= 2) begin
+            check_msg(0, 8'h01, 8'h08, 8'h00, 8'h00, 32'd80, 32'd90, 32'd100);
+            check_msg(1, 8'h02, 8'h08, 8'h01, 8'h00, 32'd82, 32'd92, 32'd102);
+        end
+
         if (fail) begin
             $display("FAIL");
             $finish;

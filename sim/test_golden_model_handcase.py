@@ -400,10 +400,60 @@ r = m3.process_message(msg(3, 1, MSG_QUOTE, SIDE_ASK, price=1010, qty=10), arriv
 check("n5 order.reject_reason (D17: STALE)", r.order.reject_reason, GATE_STALE)
 
 # n6 ("then fresh update"): seq=4, same QUOTE again @ cycle 1010 -- only 10
-#     cycles since n5's touch (1000), not > max_age(50) -> accepted again,
-#     confirming the block clears once the book is genuinely fresh.
+# cycles since n5's touch (1000), not > max_age(50) -> accepted again,
+# confirming the block clears once the book is genuinely fresh.
 r = m3.process_message(msg(4, 1, MSG_QUOTE, SIDE_ASK, price=1010, qty=10), arrival_cycle=1010)
 check("n6 order.reject_reason (fresh again, accepted)", r.order.reject_reason, 0x00)
+
+# ============================================================================
+# csr_ingress_separation regression (docs/contracts/csr_ingress_separation.md):
+# CSR write (0x20) / read-request (0x21) frames share md_parser's byte stream
+# by design (D19) but are NOT malformed market data. process_message must
+# return for them BEFORE any counter side effect or seq-gap/dup bookkeeping --
+# in the RTL, md_parser now recognizes these types so err_msg_type never fires
+# for them, which means csr_block's cnt_msgs_rx and seq_monitor never see them
+# either (both key off err_msg_type). Before this fix, a CSR frame inflated
+# cnt_msgs_rx + err_msg_type and (with its hardwired-zero tail) looked like a
+# phantom seq_num=0 duplicate to seq_monitor. Fresh model: a CSR write and a
+# CSR read-request must leave EVERY counter and all seq state untouched.
+m4 = GoldenModel(Config(cfg_reject_report=True))
+
+# c1: 0x20 write frame. Only msg_type (byte 0) matters to md_parser/golden --
+# the rest of a CSR frame is csr_block.v's own addr/data decode, off the raw
+# stream, never seen by process_message's message-level logic.
+r = m4.process_message(msg(0, 0, 0x20, price=0))
+check("c1 order", r.order, None)
+check("c1 signal", r.signal_fired, None)
+
+# c2: 0x21 read-request frame, same expectation.
+r = m4.process_message(msg(0, 0, 0x21, price=0))
+check("c2 order", r.order, None)
+check("c2 signal", r.signal_fired, None)
+
+# Zero counter effect from both CSR frames: cnt_msgs_rx must still be 0 (the
+# msg-level "messages received" count excludes non-market-data frames), and
+# no error/seq-dup/gap side effects may have occurred. This is the assertion
+# that fails on the pre-fix model (which treated 0x20/0x21 like any undefined
+# type: cnt_msgs_rx=2, err_msg_type=2, and seq tracking would have seen two
+# seq_num=0 messages).
+check("c1/c2 cnt_msgs_rx", m4.counters["cnt_msgs_rx"], 0)
+check("c1/c2 err_msg_type", m4.counters["err_msg_type"], 0)
+check("c1/c2 err_flags", m4.counters["err_flags"], 0)
+check("c1/c2 cnt_seq_gap", m4.counters["cnt_seq_gap"], 0)
+check("c1/c2 cnt_seq_dup", m4.counters["cnt_seq_dup"], 0)
+check("c1/c2 cnt_msgs_filtered", m4.counters["cnt_msgs_filtered"], 0)
+check("c1/c2 cnt_msgs_accepted", m4.counters["cnt_msgs_accepted"], 0)
+check("c1/c2 expected_seq untouched", m4.expected_seq, None)
+
+# And the model is still fully usable for real market data afterward: a
+# genuine QUOTE (seq=1) must be accepted as the first real message (expected
+# exactly the normal path -- seq tracking never saw the CSR frames above).
+r = m4.process_message(msg(1, 1, MSG_QUOTE, SIDE_BID, price=1000, qty=50))
+r = m4.process_message(msg(2, 1, MSG_QUOTE, SIDE_ASK, price=1010, qty=10))
+check("c3 order.msg_type", r.order.msg_type, ORDER_MSG_NEW)
+check("c3 cnt_msgs_rx", m4.counters["cnt_msgs_rx"], 2)
+check("c3 cnt_msgs_accepted", m4.counters["cnt_msgs_accepted"], 2)
+check("c3 position1", m4.position[1], 100)
 
 if failures:
     print(f"FAIL ({len(failures)} mismatch(es)):")

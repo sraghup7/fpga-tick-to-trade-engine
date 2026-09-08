@@ -481,6 +481,77 @@ module tb_tob_top;
             chk(7001, frame[63:32], 32'd50);    // qty reduced: 100 >> 1
         end
 
+        // ================= T8: FR-3 UDP port mismatch (D49) =================
+        // Force the mock MAC to report a UDP destination port != cfg_udp_port
+        // (default 60000) while delivering the exact tradeable-book pair that
+        // T6 used to trigger an order. The whole frame must be discarded by
+        // frame_classifier's FR-3 gate: no order/reject TX, and err_udp_port
+        // (0x00BC) increments exactly once. Release the port back to the
+        // configured value BEFORE the CSR read (a read frame is itself a UDP
+        // frame that must arrive on the configured port), then confirm the
+        // next pair trades normally.
+        csr_write(16'h0050, 32'd0);       // ML_CTRL: block mode again (T7 set reduce)
+        csr_write(16'h0048, 32'd100);     // ML_TH_HIGH (matches T6's tradeable z=132)
+        csr_write(16'h004C, 32'hFFFFFF9C);
+        @(negedge rgmii_rxc);
+        force dut.u_mac.udp_rec_dest_port = 16'd60001;   // wrong port
+        rx_frame(msg_frame(8'h01, 8'h04, 8'h00, 8'h00, 32'd100, 32'd10, 32'd7));
+        adv(60);
+        prev = dut.u_mac.tx_frame_cnt;
+        rx_frame(msg_frame(8'h01, 8'h04, 8'h01, 8'h00, 32'd110, 32'd4, 32'd8));
+        adv(60);
+        wait_tx_after(prev, ok);
+        if (ok) begin
+            $display("FAIL: T8 wrong-port frame pair produced a TX (should be discarded whole)");
+            fail = 1'b1;
+        end
+        @(negedge rgmii_rxc);
+        force dut.u_mac.udp_rec_dest_port = 16'd60000;   // back to the configured port
+        csr_read_value(16'h00BC, val, rd_ok);   // err_udp_port
+        // two wrong-port frames were sent above (bid + ask) -- each discarded
+        // frame counts exactly once, so 2, proving once-per-mismatched-frame
+        chk(8000, val, 32'd2);
+
+        // recovery: back on the configured port, ML neutralized so the same
+        // tradeable pair emits a clean NEW order (0x10), not an ML reject.
+        // seq 7/8 are reused: the wrong-port frames carrying them were
+        // discarded by frame_classifier BEFORE md_parser/seq_monitor, so they
+        // never consumed a sequence slot -- expected_seq is still 7.
+        csr_write(16'h0048, 32'h7FFFFFFF);   // ML_TH_HIGH -> never adverse by z
+        csr_write(16'h004C, 32'h7FFFFFFE);   // ML_TH_LOW
+        prev = dut.u_mac.tx_frame_cnt;
+        rx_frame(msg_frame(8'h01, 8'h04, 8'h00, 8'h00, 32'd100, 32'd10, 32'd7));
+        adv(60);
+        prev = dut.u_mac.tx_frame_cnt;
+        rx_frame(msg_frame(8'h01, 8'h04, 8'h01, 8'h00, 32'd110, 32'd4, 32'd8));
+        adv(60);
+        wait_tx_after(prev, ok);
+        if (!ok) begin
+            $display("FAIL: T8 post-mismatch recovery: no order on configured port");
+            fail = 1'b1;
+        end else begin
+            get_tx_frame(frame);
+            if (frame[127:120] !== 8'h10) begin
+                $display("FAIL: T8 recovery emitted type %02x, expected 10 (NEW)", frame[127:120]);
+                fail = 1'b1;
+            end
+        end
+
+        // ================= T9: err_ethertype wiring (FR-2 / D49) =================
+        // The mac_rx.v err_ethertype pulse (a frame whose EtherType is neither
+        // 0x0800 nor 0x0806) is forced through the mock MAC's output to the
+        // csr_block counter -- the real pulse's RTL-level behavior is covered
+        // by tb/tb_mac_rx_ethertype.v; this confirms the tob_top wiring from
+        // mac_top.err_ethertype to csr_block.err_ethertype (0x00B4).
+        @(negedge rgmii_rxc);
+        force dut.u_mac.err_ethertype = 1'b1;
+        @(posedge rgmii_rxc);
+        #1;
+        force dut.u_mac.err_ethertype = 1'b0;
+        adv(20);
+        csr_read_value(16'h00B4, val, rd_ok);   // err_ethertype
+        chk(9000, val, 32'd1);
+
         if (fail) begin
             $display("FAIL");
             $finish;

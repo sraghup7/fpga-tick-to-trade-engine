@@ -569,6 +569,11 @@ module tb_top;
     // register map, 0x00A0..0x0128) -- keep the two in sync by position.
     reg [15:0] counter_addr [0:34];
     integer expected_counters [0:34];
+    // D48 (csr_ingress_separation.md S4): every counter's REAL RTL readback,
+    // stored during the counter-comparison loop below and used afterward to
+    // check §10's five counter invariants against the actual RTL state --
+    // independent of whether it matches the golden model's expected file.
+    integer actual_counters [0:34];
     initial begin
         counter_addr[0]  = 16'h00A0;   // cnt_frames_rx
         counter_addr[1]  = 16'h00A4;   // cnt_msgs_rx
@@ -630,7 +635,7 @@ module tb_top;
     end
 
     task randomized_soak;
-        integer fd, r, i, k, mismatches, cnt_mismatches;
+        integer fd, r, i, k, mismatches, cnt_mismatches, reject_frames;
         reg [31:0] rd_val;
         begin
             // Config matching sim/gen_top_soak_vectors.py's Config()
@@ -760,6 +765,7 @@ module tb_top;
 
             for (i = 0; i <= 34; i = i + 1) begin
                 csr_read_value(counter_addr[i], rd_val, rd_ok);
+                actual_counters[i] = rd_val;
                 if (rd_val !== expected_counters[i][31:0]) begin
                     $display("FAIL: counter[addr=%04x] index %0d: got %0d, expected %0d",
                              counter_addr[i], i, rd_val, expected_counters[i]);
@@ -769,6 +775,108 @@ module tb_top;
             end
             $display("PART B: %0d order mismatches, %0d counter mismatches (of 35)",
                       mismatches, cnt_mismatches);
+
+            // ---- §10 counter invariants (csr_ingress_separation.md S4).
+            //      Computed from the REAL RTL readbacks just stored in
+            //      actual_counters[], NOT from expected_counters[] -- the
+            //      point is to check the RTL is internally self-consistent,
+            //      independent of whether it agrees with the golden model on
+            //      any individual number (RTL and golden agreeing on a wrong
+            //      number is exactly the bug class that made this contract
+            //      necessary, so these checks must not be able to pass just
+            //      because both sides share the same mistake). Index
+            //      positions are the fixed 0-34 mapping counter_addr[] above
+            //      already documents. ----
+            // 1: cnt_msgs_rx == cnt_msgs_filtered + cnt_msgs_accepted +
+            //    err_msg_type + err_flags. Message-level errors only (per the
+            //    contract's S0 derivation): frame-level err_* (err_fcs /
+            //    err_ethertype / err_ip / err_udp_port / err_frame_len) never
+            //    reach md_parser to become part of cnt_msgs_rx's count, and
+            //    err_signal_conflict is a downstream signal-stage error.
+            //    Invariant holds now that CSR frames no longer inflate
+            //    cnt_msgs_rx / err_msg_type (D48).
+            // 2: cnt_signal_buy + cnt_signal_sell == cnt_orders_tx +
+            //    cnt_order_overflow + (number of 0x11 reject frames actually
+            //    transmitted). This is the CORRECTED form of §10's invariant
+            //    (which literally sums every cnt_rej_*): reject counters are
+            //    per-gate-fire (FR-43 -- when two gates fire on one intent,
+            //    both counters increment), so Σ(cnt_rej_*) counts gate fires,
+            //    not rejected intents, and can exceed the true reject count
+            //    whenever gates co-fire. The quantity that must balance
+            //    against signals is the number of order DECISIONS: each
+            //    signal becomes exactly one NEW order (orders_tx), one reject
+            //    (a 0x11 frame, reject-reporting is on in this soak), or an
+            //    overflow drop. Every 0x11 frame transmitted is captured in
+            //    captured_orders[] (RTL output, not the golden file), so the
+            //    reject count is measured directly from the real hardware
+            //    stream rather than reconstructed from the double-counting
+            //    per-gate counters.
+            begin : invariant_checks
+                integer lhs1;
+                integer lhs2;
+                integer lhs3;
+                lhs1 = actual_counters[1];
+                lhs2 = actual_counters[2] + actual_counters[3]
+                     + actual_counters[9] + actual_counters[10];
+                if (lhs1 !== lhs2) begin
+                    $display("FAIL: §10 invariant 1: cnt_msgs_rx=%0d != filtered(%0d)+accepted(%0d)+err_msg_type(%0d)+err_flags(%0d)",
+                             lhs1, actual_counters[2], actual_counters[3],
+                             actual_counters[9], actual_counters[10]);
+                    fail = 1'b1;
+                end
+                // 2: signal count == order decisions (0x10 NEW tx + 0x11
+                //    reject frames tx + overflow drops). Count the 0x11
+                //    reject frames among the frames actually captured from
+                //    the RTL's TX stream (all 81 soak order frames are 0x10
+                //    or 0x11; the CSR 0x22 read responses come later, after
+                //    the capture window ends at soak_expected_count).
+                reject_frames = 0;
+                for (k = 0; k < soak_expected_count; k = k + 1)
+                    if (captured_orders[k][127:120] == 8'h11)
+                        reject_frames = reject_frames + 1;
+                lhs1 = actual_counters[18] + actual_counters[19];
+                lhs2 = actual_counters[33] + actual_counters[34] + reject_frames;
+                if (lhs1 !== lhs2) begin
+                    $display("FAIL: §10 invariant 2 (reject-frame conservation): signal_buy(%0d)+signal_sell(%0d) != orders_tx(%0d)+overflow(%0d)+0x11-rejects(%0d)",
+                             actual_counters[18], actual_counters[19],
+                             actual_counters[33], actual_counters[34], reject_frames);
+                    fail = 1'b1;
+                end
+                // 3: cnt_ml_events == cnt_ml_adverse + cnt_ml_benign
+                lhs1 = actual_counters[20];
+                lhs2 = actual_counters[21] + actual_counters[22];
+                if (lhs1 !== lhs2) begin
+                    $display("FAIL: §10 invariant 3: cnt_ml_events=%0d != cnt_ml_adverse(%0d)+cnt_ml_benign(%0d)",
+                             lhs1, actual_counters[21], actual_counters[22]);
+                    fail = 1'b1;
+                end
+                // 4: cnt_rej_ml <= cnt_ml_adverse (a block-mode reject is one
+                //    adverse event; reduce-mode is not a reject at all)
+                if (actual_counters[32] > actual_counters[21]) begin
+                    $display("FAIL: §10 invariant 4: cnt_rej_ml=%0d > cnt_ml_adverse=%0d",
+                             actual_counters[32], actual_counters[21]);
+                    fail = 1'b1;
+                end
+                // 5: cnt_ml_safe_forced <= cnt_ml_adverse (every forced
+                //    adverse also counts as adverse -- safe_state_c forces
+                //    both pulses)
+                if (actual_counters[23] > actual_counters[21]) begin
+                    $display("FAIL: §10 invariant 5: cnt_ml_safe_forced=%0d > cnt_ml_adverse=%0d",
+                             actual_counters[23], actual_counters[21]);
+                    fail = 1'b1;
+                end
+            end
+            // Diagnostic print so the invariant checks are not vacuous: the
+            // real left/right sides of invariants 1 and 2 (the ones this
+            // contract's fix / the FR-43 correction speak to) are visible in
+            // the transcript.
+            $display("PART B: invariant 1 real values: cnt_msgs_rx=%0d filtered=%0d accepted=%0d err_msg_type=%0d err_flags=%0d",
+                     actual_counters[1], actual_counters[2], actual_counters[3],
+                     actual_counters[9], actual_counters[10]);
+            $display("PART B: invariant 2 real values: signal_buy=%0d signal_sell=%0d orders_tx=%0d overflow=%0d reject_frames(0x11)=%0d",
+                     actual_counters[18], actual_counters[19],
+                     actual_counters[33], actual_counters[34],
+                     reject_frames);
         end
     endtask
 

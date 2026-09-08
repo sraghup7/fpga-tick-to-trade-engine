@@ -47,21 +47,29 @@ module tb_parser_soak;
     reg        rx_valid    = 1'b0;
     reg        frame_start = 1'b0;
     reg [15:0] rx_len      = 16'd0;
+    // D49 (FR-3): this soak's frames are all on the default UDP port 60000,
+    // matching cfg_udp_port's reset value -- the port gate must stay open.
+    reg [15:0] udp_rec_dest_port = 16'd60000;
+    reg [15:0] cfg_udp_port      = 16'd60000;
 
     wire [7:0] fc_out_data;
     wire       fc_out_valid;
     wire       err_frame_len;
+    wire       err_udp_port;
 
     frame_classifier fc (
-        .clk           (clk),
-        .rst_n         (rst_n),
-        .rx_data       (rx_data),
-        .rx_valid      (rx_valid),
-        .frame_start   (frame_start),
-        .rx_len        (rx_len),
-        .out_data      (fc_out_data),
-        .out_valid     (fc_out_valid),
-        .err_frame_len (err_frame_len)
+        .clk               (clk),
+        .rst_n             (rst_n),
+        .rx_data           (rx_data),
+        .rx_valid          (rx_valid),
+        .frame_start       (frame_start),
+        .rx_len            (rx_len),
+        .udp_rec_dest_port (udp_rec_dest_port),
+        .cfg_udp_port      (cfg_udp_port),
+        .out_data          (fc_out_data),
+        .out_valid         (fc_out_valid),
+        .err_frame_len     (err_frame_len),
+        .err_udp_port      (err_udp_port)
     );
 
     wire        msg_valid;

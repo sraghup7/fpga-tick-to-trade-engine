@@ -2985,6 +2985,187 @@ whole pipeline after the lockstep change).
 
 ---
 
+## D48 — CSR frames (`0x20`/`0x21`) polluted ingress counters and seq state; §10's counter invariants now asserted
+
+**Status: fixed and regression-tested.** Implements
+`docs/contracts/csr_ingress_separation.md`. Found by the same external
+review that produced D45/D46/D47; the fix and the invariant assertions are
+bundled in one contract deliberately (the assertions cannot be added
+truthfully until the thing they assert stops being false).
+
+**The bug:** `csr_block.v` taps the same `frame_classifier.v` →
+`md_parser.v` byte stream as market data (D19) — there is no second
+ingress path. `md_parser.v` decoded `msg_type` from every complete 16-byte
+frame and its `type_ok` check only recognized the four market-data types,
+so every CSR write (`0x20`) / read-request (`0x21`) frame failed `type_ok`
+and was treated exactly like a genuinely malformed message:
+`err_msg_type` fired, inflating `cnt_msgs_rx`/`cnt_err_msg_type`
+(`csr_block.v:484`), and via `seq_monitor.v`'s `msg_complete =
+msg_valid | err_msg_type | err_flags` the CSR frame was ALSO seen by the
+sequence monitor with `seq_num=0` (its tail is hardwired zero) — a phantom
+duplicate once any real traffic had occurred. `sim/gen_top_soak_vectors.py`
+modeled this exactly (D44 item 1), so `tb_top`'s 35/35 counters passed —
+but that meant the test checked RTL-vs-golden agreement on a wrong number,
+not that the number was right. §10's invariant 1 (`cnt_msgs_rx = filtered +
+accepted + err_msg_type + err_flags`) was false on its own terms (real
+`err_msg_type` was 12, entirely CSR noise), and §11.6's "cnt_msgs_rx
+equals host count exactly" criterion would fail on hardware the moment
+anyone read a counter mid-session. One field from dangerous: a nonzero CSR
+tail would have looked like a sequence GAP, latching sticky `seq_gap` and
+gate `0x06` shut until a snapshot.
+
+**The fix, per file (contract S1-S3):**
+* `rtl/md_parser.v`: recognizes `0x20`/`0x21` as a distinct legitimate
+  frame category (`is_csr_type`) and excludes them from `err_msg_type`
+  (`assign err_msg_type = complete_d & ~type_ok & ~is_csr_type;`).
+  `msg_valid`/`err_flags` are unchanged (CSR frames were already invisible
+  to both — they still are not market data, `type_ok` still excludes
+  them). With all three pulses low for a CSR frame, `seq_monitor.v`'s
+  `msg_complete` and `csr_block.v`'s `cnt_msgs_rx` condition are both 0 —
+  so **no RTL change was needed in `seq_monitor.v`/`csr_block.v`** (S1's
+  claim, verified in practice by re-running `tb_seq_monitor` unchanged).
+  `cnt_frames_rx` is deliberately left counting CSR frames (frame-level,
+  S1's scope decision).
+* `sim/golden_model.py`: `process_message` now returns early for
+  `msg.msg_type in CSR_FRAME_TYPES` (0x20/0x21) before ANY counter side
+  effect or seq-gap/dup tracking — the model mirror of the RTL fix, in the
+  same place the RTL draws the line. `cnt_frames_rx` in `process_frame`
+  unchanged.
+* `sim/gen_top_soak_vectors.py`: the elaborate per-read pre/post snapshot
+  apparatus (D44 item 2) is gone — after S1/S2, no counter except
+  `cnt_frames_rx` can move from a CSR frame, by construction. The 38 CSR
+  frames are still processed in tb_top's exact order (for `cnt_frames_rx`),
+  and every other counter is snapshotted once after the reads (its value
+  is identical before/after them). Stale D44-era comments replaced.
+* `tb/tb_md_parser.v`: new T07 — `0x20`/`0x21` frames must produce
+  `err_msg_type=0` AND `msg_valid=0` simultaneously (invisible to both
+  signals) while a genuinely-undefined type still fires `err_msg_type`.
+* `sim/test_golden_model_handcase.py`: new c1/c2 — a CSR write/read-request
+  through `process_message` leaves every counter and all seq state
+  untouched (and the model still works for real market data afterward).
+* `tb/tb_top.v`: `actual_counters[0:34]` stored during the existing
+  readback loop; §10's five invariants asserted at the end of
+  `randomized_soak` from REAL RTL readbacks (not the golden expected file)
+  so they cannot pass merely because RTL and golden share the same mistake.
+
+**§10 invariant 2 correction (also in the master spec's §10 note):**
+`Σ(cnt_rej_*)` is not the right term for the decision-conservation
+identity. `cnt_rej_*` are genuinely per-gate-fire counters (FR-43: "every
+triggered gate's counter increments" — verified tested behavior,
+`tb_risk_engine.v` block G/T21), so on an intent where multiple gates fire
+simultaneously, `Σ(cnt_rej_*)` counts that ONE rejected intent multiple
+times. The soak's `gaps` scenario makes `seq_gap` sticky and FR-26 forces
+`adverse_risk=1` during it — so 12 intents fired both gate 0x06 and 0x09:
+Σ cnt_rej = 90 while only 78 intents were rejected (81 signals − 3
+orders). `tb/tb_top.v` therefore asserts invariant 2 in its corrected
+reject-frame-conservation form: `signals == orders_tx + overflow + (number
+of 0x11 reject frames actually transmitted)`, counting the 0x11 frames
+from the RTL's captured TX stream (order_builder emits exactly one per
+blocked intent, carrying the winning `reject_reason`, independent of how
+many gates fired).
+
+**Mutation check:** reverted the `md_parser.v` `is_csr_type` exclusion on
+a scratch copy — the new §10 invariant 1 assertion (not just the
+counter-mismatch loop) fails, proving the assertion catches this bug class
+even if a future golden-model change re-introduced the same mistake on
+both sides at once.
+
+**Independently verified:** `rtl/md_parser.v` compiles clean under
+`iverilog -g2001 -Wall`; `tb_md_parser` (new T07), `tb_seq_monitor`
+(unchanged), the Python hand-case (new CSR steps), and `tb_top` (new
+invariant assertions, real invariant-1 numbers printed: `cnt_msgs_rx=209
+filtered=0 accepted=209 err_msg_type=0 err_flags=0` → 209 == 0+209+0+0)
+all pass; full `bash scripts/run_sim.sh` passes with the soak stimulus
+regenerated from the fixed generator.
+
+---
+
+## D49 — FR-3's UDP destination-port match and FR-2's `err_ethertype`: `cfg_udp_port`/`err_udp_port`/`err_ethertype` wired to real logic
+
+**Status: fixed and regression-tested.** Implements
+`docs/contracts/fr3_udp_port_match.md`. Found by the same external review
+that produced D45-D48; the §0 row's "FR-3 UDP port match" entry was
+already flagged implementation-pending.
+
+**The gap:** `tob_top.v` tied `csr_block.v`'s `cfg_udp_port` (register
+`0x40`) to nothing and tied `err_udp_port`/`err_ethertype` (csr_block's
+inputs feeding §10 counters) to `1'b0`. Checked against the vendored MAC's
+actual RX datapath: `udp_rx.v` checksums the UDP payload but never compares
+the destination port to anything, and `mac_rx.v` dispatches IP/ARP by an
+internal `frame_type` register but silently drops anything else. Net
+effect: any UDP datagram reaching the board's IP on ANY port was parsed as
+market data (and, per the D48 findings, could write CSRs including
+kill-switch clear); `err_udp_port`/`err_ethertype` could never increment
+(§11.5's "every error counter incremented" unreachable for those two) --
+and an unfiltered UDP port on a device that can receive kill-clearing CSR
+writes is a security-relevant gap before S11 puts it on a real network.
+
+**The fix, per file (contract S1-S6):**
+* `udp_rx.v` (vendored, D5-pattern patch): new `udp_rec_dest_port [15:0]`
+  output, committed at `REC_END` (the same point `udp_rec_data_length` is
+  committed) so it is stable for the whole downstream frame-drain window.
+  **Byte alignment was verified empirically, not assumed**: driving the real
+  mac_rx→ip_rx→udp_rx chain with a hand-encoded frame showed UDP header
+  byte N is on `udp_rx_data` when `udp_rx_cnt==N` -- so dest port high is
+  captured at `udp_rx_cnt==2` and low at `udp_rx_cnt==3`. This matches the
+  checksum accumulator's own `{udp_rx_data_d0,udp_rx_data}` pairing at odd
+  counts (which forms exactly the {src,dst,len,cksum} header words). The
+  contract's sketch captured `udp_rx_data_d0` at counts 2/3 -- that would
+  have grabbed bytes 1/2 (off by one); corrected against the real chain.
+* `mac_rx.v` (vendored, D5-pattern patch): new `err_ethertype` output, one
+  cycle when `frame_type` is neither `0x0800` nor `0x0806` at the same
+  REC_IDENTIFY dispatch point that already decides `ip_rx_req`/
+  `arp_rx_req` (one source of truth). Such frames still go REC_ERROR
+  (silently dropped, as before) -- only the reason is now visible.
+* `mac_rx_top.v`/`mac_top.v`: thread both new signals up (pure plumbing).
+* `frame_classifier.v`: new `udp_rec_dest_port` + `cfg_udp_port` inputs and
+  `err_udp_port` output. `out_valid` is now gated on
+  `port_ok = (udp_rec_dest_port == cfg_udp_port)` in addition to `frame_ok`
+  (whole-frame discard, combinational off the stable port value, same D11
+  discipline as the length check); `err_udp_port = frame_start & ~port_ok`.
+  **Plumbing deviation from the contract (documented):** the port value
+  routes mac_top→frame_classifier directly at tob_top, NOT through
+  `eth_mac_if.v` -- mac_top-level signals already bypass eth_mac_if in this
+  repo (the D5 `mac_rec_error`/`udp_checksum_error` pattern), and
+  eth_mac_if has no role in the frame-level port decision.
+* `tob_top.v`: `.cfg_udp_port (cfg_udp_port)` now driven from csr_block to
+  frame_classifier; `.err_ethertype (mac_err_ethertype)` /
+  `.err_udp_port (fc_err_udp_port)` replace the `1'b0` tie-offs (the
+  err_ethertype pulse routes mac_rx→mac_rx_top→mac_top→csr_block directly,
+  matching how err_fcs/err_ip already bypass eth_mac_if/frame_classifier).
+* `tb/sim_models/tob_top_sim_leaves.v`: mock mac_top gains
+  `udp_rec_dest_port` (default 60000 == cfg_udp_port reset) and
+  `err_ethertype`, so existing board-level tests that never touch the port
+  still pass the new gate.
+
+**New directed tests:**
+* `tb/tb_udp_rx_dest_port.v`: drives udp_rx.v with hand-encoded datagrams
+  carrying two DIFFERENT known dest ports (60000 and 24577, each with a
+  correct hand-computed UDP checksum) and asserts `udp_rec_dest_port`
+  matches at `udp_rec_data_valid` -- byte-exact, so an off-by-one or
+  swapped capture can't pass.
+* `tb/tb_frame_classifier.v` (extended): FR-3 wrong-port frame discarded
+  whole with `err_udp_port` exactly once and zero bytes forwarded; clean
+  recovery on the configured port; FR-5 length check still independent of
+  the port check (bad length on the RIGHT port still counts `err_frame_len`).
+* `tb/tb_mac_rx_ethertype.v`: 0x88B5 frame → `err_ethertype` once, no
+  `ip_rx_req`; 0x0800 → no `err_ethertype`, `ip_rx_req` pulses; 0x0806 →
+  no `err_ethertype`.
+
+**Out of scope (contract S7), unchanged:** IHL=5/IPv4-checksum validation
+(already handled upstream via `udp_checksum_error`/`ip_addr_check_error`,
+D5); `LINK_MODE=0` raw mode (D3); `csr_block.v` (register map already
+correct, only the consumer was missing); md_parser/symbol_filter/seq_monitor.
+
+**Independently verified:** every touched file compiles clean under
+`iverilog -g2001 -Wall` (both the sim-leaves rtl-lint path and the real
+vendored-MAC path tb_eth_mac_if_tx uses); the three new/extended testbenches
+pass; `tb_tob_top` and `tb_top` pass unchanged (all existing traffic is on
+the default port 60000, so the new gate is a pure regression check);
+full `bash scripts/run_sim.sh` passes.
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |

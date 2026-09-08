@@ -92,6 +92,9 @@ run_tb tb_eth_mac_if_tx rtl/eth_mac_if.v tb/sim_models/xilinx_ip_sim_models.v \
     rtl/vendor/alinx_mac/rx/*.v rtl/vendor/alinx_mac/tx/*.v
 run_tb tb_frame_classifier rtl/frame_classifier.v
 run_tb tb_md_parser rtl/md_parser.v
+run_tb tb_mac_rx_ethertype rtl/vendor/alinx_mac/rx/mac_rx.v
+run_tb tb_udp_rx_dest_port rtl/vendor/alinx_mac/rx/udp_rx.v \
+    tb/sim_models/xilinx_ip_sim_models.v
 run_tb tb_symbol_filter rtl/symbol_filter.v
 run_tb tb_seq_monitor rtl/seq_monitor.v
 run_tb tb_tob_engine rtl/tob_engine.v

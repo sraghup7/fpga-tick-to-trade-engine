@@ -24,10 +24,18 @@ module udp_rx
  input      [10:0]      udp_rec_ram_read_addr,   //udp ram read address
  output reg [15:0]      udp_rec_data_length,     //udp data length
  output reg             udp_rec_data_valid,      //udp data valid
- output reg             udp_checksum_error       //(D5 patch, not in original ALINX source) pulses
+ output reg             udp_checksum_error,      //(D5 patch, not in original ALINX source) pulses
                                                   //for one cycle on UDP checksum failure -- exposes
                                                   //what was previously an internal-only reg, for the
                                                   //engine's own error counters. No other behavior changed.
+ output reg [15:0]      udp_rec_dest_port        //(D49 patch, not in original ALINX source) the UDP
+                                                  //destination port (header bytes 2-3, RFC 768: src 0-1 /
+                                                  //dst 2-3 / length 4-5 / checksum 6-7), committed at
+                                                  //REC_END like udp_rec_data_length so it is stable for
+                                                  //the whole downstream frame-drain window. This module
+                                                  //itself does no filtering -- it only exposes the value
+                                                  //so the engine can implement FR-3's port match. No other
+                                                  //behavior changed.
 );
 
 reg  [15:0]             udp_rx_cnt ;
@@ -38,6 +46,16 @@ reg                     verify_end ;
 reg  [15:0]             udp_data_length ;
 reg                     ip_addr_check_error_d0 ;
 reg  [7:0]              udp_rx_data_d0 ;         //udp data resigster
+
+// D49 patch (FR-3, not in original ALINX source): dest port captured during
+// REC_HEAD (header bytes 2-3, one byte per udp_rx_cnt step -- byte N of the
+// UDP header is on udp_rx_data when udp_rx_cnt==N, the same alignment the
+// checksum accumulator below relies on: {udp_rx_data_d0,udp_rx_data} at odd
+// udp_rx_cnt forms exactly the {src,dst,len,cksum} header words). Committed
+// to the output at REC_END (same point udp_rec_data_length is committed) so
+// it stays stable across the whole downstream frame-drain window, exactly
+// like udp_rec_data_length.
+reg [15:0]              udp_rec_dest_port_tmp ;
 
 parameter IDLE             =  8'b0000_0001  ;
 parameter REC_HEAD         =  8'b0000_0010  ;
@@ -168,6 +186,29 @@ begin
     udp_rec_data_length <= 16'd0 ;
   else if (state == REC_END)
     udp_rec_data_length <= udp_data_length ;
+end
+
+// D49 patch (FR-3): capture the destination port bytes (header bytes 2-3)
+// during REC_HEAD and commit at REC_END. Byte N of the UDP header is on
+// udp_rx_data when udp_rx_cnt==N (verified against the real chain and the
+// checksum accumulator's own {d0,data} pairing), so dst[15:8] = byte 2 at
+// udp_rx_cnt==2 and dst[7:0] = byte 3 at udp_rx_cnt==3.
+always @(posedge clk or negedge rst_n)
+begin
+  if (~rst_n)
+    udp_rec_dest_port_tmp <= 16'd0 ;
+  else if (state == REC_HEAD && udp_rx_cnt == 16'd2)
+    udp_rec_dest_port_tmp[15:8] <= udp_rx_data ;
+  else if (state == REC_HEAD && udp_rx_cnt == 16'd3)
+    udp_rec_dest_port_tmp[7:0]  <= udp_rx_data ;
+end
+
+always @(posedge clk or negedge rst_n)
+begin
+  if (~rst_n)
+    udp_rec_dest_port <= 16'd0 ;
+  else if (state == REC_END)
+    udp_rec_dest_port <= udp_rec_dest_port_tmp ;
 end
 
 always @(posedge clk or negedge rst_n)

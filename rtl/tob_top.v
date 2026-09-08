@@ -35,8 +35,14 @@
 //     own D28 fix keys its internal book-state snapshot to the same
 //     ALIGN_DEPTH).
 //   * err_fcs/err_ip are wired from mac_top's D5 outputs
-//     (mac_rec_error / udp_checksum_error); err_ethertype/err_udp_port
-//     stay tied to 0 -- mac_top exposes no distinct signal for either.
+//     (mac_rec_error / udp_checksum_error). D49 (FR-2/FR-3):
+//     err_ethertype now comes from mac_top's new mac_rx.v pulse (a frame
+//     whose EtherType is neither 0x0800 nor 0x0806 is dropped upstream and
+//     counted here); err_udp_port comes from frame_classifier.v's port
+//     match; cfg_udp_port (register 0x40) is driven to frame_classifier.v.
+//     eth_mac_if.v is intentionally NOT in that path -- MAC-level status
+//     signals route direct at this level, the same D5 pattern mac_rec_error/
+//     udp_checksum_error already use.
 //
 // Host addresses are compile-time parameters (not CSR-configurable); the
 // defaults are placeholders per the contract -- real values must be set
@@ -183,6 +189,8 @@ module tob_top #(
     wire        udp_tx_req;
     wire        mac_send_end;
     wire        mac_rec_error, udp_checksum_error;
+    wire [15:0] mac_udp_rec_dest_port;   // D49 (FR-3): UDP dest port, mac_top -> frame_classifier
+    wire        mac_err_ethertype;       // D49 (FR-2): mac_rx.v pulse, mac_top -> csr_block
 
     mac_top u_mac (
         .gmii_tx_clk              (gmii_tx_clk),
@@ -214,7 +222,9 @@ module tob_top #(
         .arp_found                (),
         .mac_not_exist            (),
         .mac_rec_error            (mac_rec_error),     // D5
-        .udp_checksum_error       (udp_checksum_error) // D5
+        .udp_checksum_error       (udp_checksum_error),// D5
+        .udp_rec_dest_port        (mac_udp_rec_dest_port),  // D49 (FR-3)
+        .err_ethertype            (mac_err_ethertype)        // D49 (FR-2)
     );
 
     wire [7:0]  eth_rx_data;
@@ -254,6 +264,8 @@ module tob_top #(
     wire [7:0] fc_out_data;
     wire        fc_out_valid;
     wire        fc_err_frame_len;
+    wire        fc_err_udp_port;
+    wire [15:0] cfg_udp_port;   // D49 (FR-3): csr_block 0x40 -> frame_classifier
     frame_classifier u_fc (
         .clk           (gmii_rx_clk),
         .rst_n         (engine_rst_n),
@@ -261,9 +273,12 @@ module tob_top #(
         .rx_valid      (eth_rx_valid),
         .frame_start   (eth_frame_start),
         .rx_len        (eth_rx_len),
+        .udp_rec_dest_port (mac_udp_rec_dest_port),
+        .cfg_udp_port      (cfg_udp_port),
         .out_data      (fc_out_data),
         .out_valid     (fc_out_valid),
-        .err_frame_len (fc_err_frame_len)
+        .err_frame_len (fc_err_frame_len),
+        .err_udp_port  (fc_err_udp_port)
     );
 
     wire        md_msg_valid;
@@ -785,7 +800,7 @@ module tob_top #(
         // feature-normalizer / not-yet-consumed registers: no consumers in
         // this build, left unconnected
         .cfg_enable             (),
-        .cfg_udp_port           (),
+        .cfg_udp_port           (cfg_udp_port),      // D49 (FR-3): to frame_classifier
         .cfg_stats_period       (),
         .cfg_ml_th_high         (cfg_ml_th_high),
         .cfg_ml_th_low          (cfg_ml_th_low),
@@ -810,9 +825,9 @@ module tob_top #(
         .err_msg_type           (md_err_msg_type),
         .err_flags              (md_err_flags),
         .err_fcs                (mac_rec_error),      // D5 -- S1.5
-        .err_ethertype          (1'b0),
+        .err_ethertype          (mac_err_ethertype),  // D49 (FR-2): from mac_rx.v via mac_top
         .err_ip                 (udp_checksum_error), // D5 -- S1.5
-        .err_udp_port           (1'b0),
+        .err_udp_port           (fc_err_udp_port),    // D49 (FR-3): from frame_classifier
         .filt_valid             (filt_valid),
         .filt_dropped           (filt_dropped),
         .err_seq_dup            (err_seq_dup),

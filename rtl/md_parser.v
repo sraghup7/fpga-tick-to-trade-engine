@@ -29,6 +29,19 @@
 // both ways fires err_msg_type only, never err_flags) for bit-exact
 // parity with the reference model, not just bit-exact final results.
 //
+// CSR frames (0x20 write / 0x21 read-request, docs/contracts/
+// csr_ingress_separation.md D48) share this byte stream by design (D19)
+// but are NOT malformed market data -- they are a separate, legitimate
+// frame category on the same wire, decoded independently by csr_block.v
+// straight off the raw bytes. They must therefore be invisible to both
+// status signals: err_msg_type stays 0 (they are not undefined types) and
+// msg_valid stays 0 (type_ok still excludes them -- they are not market
+// data either). Keeping err_msg_type low is what stops csr_block.v's
+// cnt_msgs_rx and seq_monitor.v (both keyed on err_msg_type) from ever
+// seeing a CSR frame -- which is the whole fix (before it, every CSR frame
+// inflated cnt_msgs_rx/cnt_err_msg_type and looked to seq_monitor like a
+// phantom seq_num=0 duplicate).
+//
 // Verilog-2001 only.
 
 module md_parser (
@@ -58,6 +71,11 @@ module md_parser (
     localparam [7:0] MSG_TRADE     = 8'h02;
     localparam [7:0] MSG_CLEAR     = 8'h03;
     localparam [7:0] MSG_HEARTBEAT = 8'hFF;
+    // S9 CSR frame types (D19, csr_ingress_separation.md): they share this
+    // byte stream by design but are NOT market data -- recognized here so
+    // err_msg_type never fires for them (they are not undefined types).
+    localparam [7:0] MSG_CSR_WRITE    = 8'h20;   // S9: CSR write frame
+    localparam [7:0] MSG_CSR_READ_REQ = 8'h21;   // S9: CSR read-request frame
     localparam [7:0] FLAG_RESERVED_MASK = 8'hFC;   // bits 7:2 must be 0 (FR-9)
 
     reg [3:0] byte_cnt;     // position within the current message, 0..15
@@ -112,10 +130,20 @@ module md_parser (
                     (msg_type == MSG_HEARTBEAT);
     wire flags_ok = (msg_flags & FLAG_RESERVED_MASK) == 8'd0;
 
+    // csr_ingress_separation.md: CSR frame types are legitimate non-market-
+    // data frames (D19), not undefined types. is_csr_type excludes them from
+    // err_msg_type so csr_block.v's cnt_msgs_rx and seq_monitor.v (both keyed
+    // on err_msg_type via md_msg_valid|err_msg_type|err_flags) never see a
+    // CSR frame at all. type_ok and msg_valid are deliberately UNCHANGED: a
+    // CSR frame is still not a valid market-data message (msg_valid stays 0).
+    wire is_csr_type = (msg_type == MSG_CSR_WRITE) || (msg_type == MSG_CSR_READ_REQ);
+
     // FR-8 checked before FR-9 (golden_model.py order): a message that is
     // invalid in both ways reports err_msg_type and never reaches the
-    // flags check, so err_flags is gated on type_ok too.
-    assign err_msg_type = complete_d & ~type_ok;
+    // flags check, so err_flags is gated on type_ok too. is_csr_type also
+    // excludes CSR frames from err_msg_type (they are not undefined types;
+    // err_flags already implicitly excludes them since type_ok is false).
+    assign err_msg_type = complete_d & ~type_ok & ~is_csr_type;
     assign err_flags    = complete_d & type_ok & ~flags_ok;
     assign msg_valid    = complete_d & type_ok & flags_ok;
 

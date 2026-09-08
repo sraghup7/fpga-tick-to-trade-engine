@@ -100,10 +100,12 @@ module mac_top (
     input  [10:0]        udp_rec_ram_read_addr,
     output reg [15:0]    udp_rec_data_length,
     output reg           udp_rec_data_valid,
+    output reg [15:0]    udp_rec_dest_port,   // D49 (FR-3): tb drives this (default 60000 in initial)
     output               arp_found,
     output               mac_not_exist,
     output reg           mac_rec_error,
-    output reg           udp_checksum_error
+    output reg           udp_checksum_error,
+    output reg           err_ethertype         // D49 (FR-2): tb forceable
 );
 
     assign udp_ram_data_req = 1'b0;
@@ -127,14 +129,19 @@ module mac_top (
     end
 
     // udp_rec_data_length / udp_rec_data_valid / mac_rec_error /
-    // udp_checksum_error intentionally have NO internal driver: the
-    // testbench owns them via force/release. Default them to 0 so the
-    // engine never sees X before the first force.
+    // udp_checksum_error / udp_rec_dest_port / err_ethertype intentionally
+    // have NO internal driver: the testbench owns them via force/release.
+    // Default them so the engine never sees X before the first force.
+    // udp_rec_dest_port defaults to 60000 (== csr_block's cfg_udp_port reset
+    // value), so existing tests that don't touch it still pass the FR-3 port
+    // match; a test that exercises the reject path forces a different value.
     initial begin
         udp_rec_data_length = 16'd0;
         udp_rec_data_valid  = 1'b0;
+        udp_rec_dest_port   = 16'd60000;
         mac_rec_error       = 1'b0;
         udp_checksum_error  = 1'b0;
+        err_ethertype       = 1'b0;
     end
 
     // ---- TX capture ----
