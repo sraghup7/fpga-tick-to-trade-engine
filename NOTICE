@@ -1,0 +1,48 @@
+fpga-tick-to-trade-engine
+Copyright (c) 2026 Sai Charan Raghupatruni
+
+Licensed under the Apache License, Version 2.0 (see LICENSE).
+
+This project contains one vendored third-party component, described below.
+Per Apache-2.0 §4(d), this NOTICE file is informational and does not modify
+the terms of the License grant above, which applies to this project's own
+original work (hand-written RTL under rtl/, Python under sim/ and model/,
+and documentation) and not to the third-party component listed here.
+
+------------------------------------------------------------------------
+
+Component: rtl/vendor/alinx_mac/ (RGMII/Ethernet MAC datapath: mac_top.v,
+mac_rx.v, mac_tx.v, arp_rx.v, arp_tx.v, ip_rx.v, ip_tx.v, udp_rx.v,
+udp_tx.v, crc.v, arp_cache.v, dpram.v, icmp_reply.v, util_gmii_to_rgmii.v,
+and the four Xilinx IP core configs under ip/*/*.xci)
+
+Origin: ALINX Electronic Technology Co., Ltd.'s AX7035B board support
+package, reference project docs/refs/AX7035/SRC/21_ethernet_test/ (a
+separate git repository vendored alongside this one for reference, not a
+submodule of it — see this repo's own CLAUDE.md "Repo quirk" note).
+
+License status: the source files as distributed by ALINX carry no
+copyright header, license text, or NOTICE of their own — this was
+independently checked before writing this notice (docs/design_decisions.md
+D4 records the same finding for a different block in the same reference
+tree, ALINX's MIIM/MDIO code, which was NOT vendored in for exactly this
+reason plus a real functional bug). This project makes no claim about
+what license, if any, ALINX intends this code to carry; it is reproduced
+here, modified (see below), and attributed on a good-faith best-effort
+basis as the origin of record. Anyone with a definitive answer on ALINX's
+actual distribution terms for this reference code is welcome to open an
+issue; this notice will be corrected accordingly.
+
+Modifications made in this repository (docs/design_decisions.md D5
+records the substantive one): two new output ports added to
+mac_rx_top.v/udp_rx.v, exposing mac_rec_error (CRC/FCS failure) and a
+udp_checksum_error bit that ALINX's original code already computed
+internally but did not expose past the point where it silently gated
+udp_rec_data_valid low. No other functional changes to the vendored files.
+
+------------------------------------------------------------------------
+
+Everything else in this repository — every file under rtl/ not listed
+above, all of sim/, model/, tb/, constraints/, scripts/, and docs/ — is
+this project's own original work, copyright the author named above,
+licensed under Apache-2.0 with no third-party attribution required.
