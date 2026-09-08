@@ -69,6 +69,26 @@
 // (feature_extractor.v/feature_normalizer.v) at all, and the order intent is
 // NOT a guaranteed order (the S7 risk gates and S8 order_builder.v own that).
 //
+// Timing (D40, docs/design_decisions.md): sig_valid now registers TWO cycles
+// after book_upd_valid, not one. D39's RGMII pin-placement fix shifted
+// routing enough to violate this module's own spread_ok/buy_ok/sell_ok
+// chain by a hair (worst case -0.062ns) -- a 32-bit `ask_price - bid_price`
+// compare is an 8-CARRY4-deep chain on its own, chained directly off
+// tob_engine.v's own next_bid_price/next_ask_price derivation in the SAME
+// cycle book_upd_valid fires; unlike D26/27's F1/F3 fixes, there was no
+// existing spare pipeline stage here to reuse (this module was always a
+// single combinational block feeding one output register), so closing it
+// requires a real extra cycle, not just moving work across an existing
+// boundary. Stage 0 below registers the raw next_*/book_upd_valid/
+// applied_slot inputs as-is (cheap, no chain); stage 1 computes spread_ok/
+// buy_qty_ok/sell_qty_ok/conflict from those now-registered operands and
+// registers sig_*. tob_top.v's ALIGN_DEPTH decreases by exactly 1 (5->4) to
+// compensate, since ALIGN_DEPTH's whole job is
+// `ML_branch_total - signal_branch_own_latency`, and signal_branch_own_
+// latency just went from 1 to 2 -- the TOTAL latency from book_upd_valid to
+// risk_engine's aligned evaluation, and TRIGGER_DELAY (order_builder.v),
+// are both unchanged by construction.
+//
 // Verilog-2001 only.
 
 module signal_engine (
@@ -108,43 +128,79 @@ module signal_engine (
     localparam [7:0] SIDE_BID = 8'h00;   // buy at the ask (wire format)
     localparam [7:0] SIDE_ASK = 8'h01;   // sell at the bid
 
-    // ---- applied slot's post-update state (D23: direct scalar ports from
-    //      tob_engine.v, not an indexed slice of the registered book bus) ----
-    wire [31:0] s_bp = next_bid_price;
-    wire [31:0] s_bq = next_bid_qty;
-    wire        s_bv = next_bid_valid;
-    wire [31:0] s_ap = next_ask_price;
-    wire [31:0] s_aq = next_ask_qty;
-    wire        s_av = next_ask_valid;
-    wire        s_cr = next_crossed;
+    // =====================================================================
+    // Stage 0 (D40): register the applied slot's post-update state (D23:
+    // scalar ports from tob_engine.v) plus book_upd_valid/applied_slot,
+    // as-is -- no arithmetic here, just a plain register, so tob_engine.v's
+    // own next_* derivation only has to complete by THIS edge, not also
+    // clear an entire spread/imbalance comparison on top of it in the same
+    // cycle (see file header).
+    // =====================================================================
+    reg        p0_valid;
+    reg [1:0]  p0_slot;
+    reg [31:0] p0_bp, p0_bq, p0_ap, p0_aq;
+    reg        p0_bv, p0_av, p0_cr;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            p0_valid <= 1'b0;
+            p0_slot  <= 2'd0;
+            p0_bp <= 32'd0; p0_bq <= 32'd0; p0_bv <= 1'b0;
+            p0_ap <= 32'd0; p0_aq <= 32'd0; p0_av <= 1'b0;
+            p0_cr <= 1'b0;
+        end else begin
+            p0_valid <= book_upd_valid;
+            p0_slot  <= applied_slot;
+            p0_bp <= next_bid_price;
+            p0_bq <= next_bid_qty;
+            p0_bv <= next_bid_valid;
+            p0_ap <= next_ask_price;
+            p0_aq <= next_ask_qty;
+            p0_av <= next_ask_valid;
+            p0_cr <= next_crossed;
+        end
+    end
+
+    // =====================================================================
+    // Stage 1 (combinational): the actual decision, now computed entirely
+    // from stage 0's registered operands. D15's wide-precision shift and
+    // FR-35..37's logic are otherwise UNCHANGED -- only the operands moved
+    // from live wires to registers, and everything here now lands one
+    // cycle later relative to book_upd_valid than before D40.
+    // =====================================================================
 
     // ---- D15 (S2.4): wide-precision imbalance shift. Zero-extend each qty
     //      by cfg_imb_shift's maximum width (3 bits -- IMB_SHIFT is 0-3)
     //      BEFORE shifting, and compare at that 35-bit width, so a shifted
     //      quantity can never lose a bit off the top. A plain 32-bit
     //      `qty << cfg_imb_shift` is the bug this guards against. ----
-    wire [34:0] ask_shifted = {3'b0, s_aq} << cfg_imb_shift;
-    wire [34:0] bid_shifted = {3'b0, s_bq} << cfg_imb_shift;
-    wire        buy_qty_ok  = ({3'b0, s_bq} > ask_shifted);
-    wire        sell_qty_ok = ({3'b0, s_aq} > bid_shifted);
+    wire [34:0] ask_shifted = {3'b0, p0_aq} << cfg_imb_shift;
+    wire [34:0] bid_shifted = {3'b0, p0_bq} << cfg_imb_shift;
+    wire        buy_qty_ok  = ({3'b0, p0_bq} > ask_shifted);
+    wire        sell_qty_ok = ({3'b0, p0_aq} > bid_shifted);
 
     // ---- FR-35/36. crossed is an independent AND term: when the book is
-    //      crossed (s_bp >= s_ap) the plain unsigned subtraction below
-    //      underflows to a huge value, and only ~s_cr keeps that wrapped
+    //      crossed (p0_bp >= p0_ap) the plain unsigned subtraction below
+    //      underflows to a huge value, and only ~p0_cr keeps that wrapped
     //      spread from reading as "enormous but tradeable". ----
-    wire spread_ok = ((s_ap - s_bp) >= cfg_min_spread);
+    wire spread_ok = ((p0_ap - p0_bp) >= cfg_min_spread);
 
-    wire base_ok = s_bv & s_av & ~s_cr & spread_ok;
+    wire base_ok = p0_bv & p0_av & ~p0_cr & spread_ok;
     wire buy_ok  = base_ok & buy_qty_ok;
     wire sell_ok = base_ok & sell_qty_ok;
 
     // ---- FR-37: defensive, provably unreachable via honest inputs once the
     //      wide-precision shift above is in place (see file header). On a
-    //      conflict no intent is emitted -- only the pulse. ----
-    wire conflict = book_upd_valid & buy_ok & sell_ok;
+    //      conflict no intent is emitted -- only the pulse. Now combinational
+    //      with p0_valid (one cycle after book_upd_valid, D40), not
+    //      book_upd_valid itself -- csr_block.v's cnt_err_signal_conflict is
+    //      a plain saturating event counter with no cycle-alignment
+    //      dependency on book_upd_valid, so this one-cycle shift is safe. ----
+    wire conflict = p0_valid & buy_ok & sell_ok;
     assign err_signal_conflict = conflict;
 
-    // ---- registered order intent, one cycle after book_upd_valid ----
+    // ---- registered order intent, now TWO cycles after book_upd_valid
+    //      (D40) ----
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             sig_valid <= 1'b0;
@@ -152,8 +208,8 @@ module signal_engine (
             sig_side  <= 8'd0;
             sig_price <= 32'd0;
             sig_qty   <= 32'd0;
-        end else if (book_upd_valid) begin
-            sig_slot <= applied_slot;
+        end else if (p0_valid) begin
+            sig_slot <= p0_slot;
             if (conflict) begin
                 sig_valid <= 1'b0;      // FR-37: pulse replaces any intent
                 sig_side  <= 8'd0;
@@ -162,12 +218,12 @@ module signal_engine (
             end else if (buy_ok) begin
                 sig_valid <= 1'b1;
                 sig_side  <= SIDE_BID;
-                sig_price <= s_ap;      // buy at the ask
+                sig_price <= p0_ap;     // buy at the ask
                 sig_qty   <= cfg_order_qty;
             end else if (sell_ok) begin
                 sig_valid <= 1'b1;
                 sig_side  <= SIDE_ASK;
-                sig_price <= s_bp;      // sell at the bid
+                sig_price <= p0_bp;     // sell at the bid
                 sig_qty   <= cfg_order_qty;
             end else begin
                 sig_valid <= 1'b0;      // slot/side/price/qty are don't-care

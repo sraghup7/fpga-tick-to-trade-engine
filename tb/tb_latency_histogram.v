@@ -35,11 +35,16 @@
 //         bucket 63; bucket 62 never increments
 //   H5    per-bucket saturation (dut4, BUCKET_W=4): 20 pulses into one
 //         bucket hold it at 15 (0xF) instead of wrapping
-//   H6    cfg_counter_clear resets all 64 buckets to 0 in one cycle
+//   H6    cfg_counter_clear resets all 64 buckets to 0 (a sequential
+//         64-cycle sweep, one address per cycle -- see rtl/
+//         latency_histogram.v's header for why it isn't one cycle anymore)
 //   H7    hist_rd_data is a registered read: the previous value persists
 //         for one cycle after hist_rd_addr changes
 //   H8    lat_valid/lat_value pin-compatibility with csr_block.v's input
 //         ports: 1-bit pulse on 0x10 only, 16-bit value = payload[15:0]
+//   H9    a lat_valid pulse landing during the clear sweep is dropped, not
+//         queued (the sequential-clear fix's documented tradeoff); a pulse
+//         after the sweep finishes counts normally again
 //
 // On any mismatch a FAIL line names the bucket/case and expected vs actual;
 // a final PASS/FAIL line summarizes. Verilog-2001 only.
@@ -110,7 +115,11 @@ module tb_latency_histogram;
     reg        s_lat_valid;
     reg [15:0] s_lat_value;
 
-    // Assert + release reset.
+    // Assert + release reset, then wait out the sequential clear sweep (64
+    // cycles, one address per cycle -- see rtl/latency_histogram.v's header)
+    // before returning. A lat_valid pulse fired while the DUT is still
+    // clearing is dropped by design, so every test in this file needs the
+    // memory to be genuinely all-zero and idle before it starts pulsing.
     task reset_dut;
         begin
             @(negedge clk);
@@ -122,7 +131,7 @@ module tb_latency_histogram;
             rst_n = 1'b0;
             repeat (3) @(negedge clk);
             rst_n = 1'b1;
-            @(posedge clk);
+            repeat (70) @(posedge clk);   // 64-cycle clear sweep + margin
             #1;
         end
     endtask
@@ -151,7 +160,9 @@ module tb_latency_histogram;
         end
     endtask
 
-    // One-cycle cfg_counter_clear pulse.
+    // One-cycle cfg_counter_clear pulse, then wait out the 64-cycle
+    // sequential clear sweep it triggers before returning (same reasoning
+    // as reset_dut above).
     task clear_pulse;
         begin
             @(negedge clk);
@@ -159,6 +170,8 @@ module tb_latency_histogram;
             @(posedge clk);
             #1;
             cfg_counter_clear = 1'b0;
+            repeat (70) @(posedge clk);
+            #1;
         end
     endtask
 
@@ -316,6 +329,36 @@ module tb_latency_histogram;
         pulse_ob(8'h10, 16'hFFFE);
         chk(8001, s_lat_value, 32'h0000FFFE);
         rd_bucket(6'd63, v); chk(8002, v, 32'd2);   // ABC1 and FFFE both >= 63
+
+        // ============ H9: increments during the clear sweep are dropped ============
+        // Post-audit fix: the write port can only touch one address per
+        // cycle (real BRAM has one write port, one address), so
+        // cfg_counter_clear/reset now sweep the 64 entries sequentially
+        // instead of all at once. A pulse landing inside that ~64-cycle
+        // window is dropped, not queued -- this proves that documented
+        // behaviour dynamically instead of leaving it as an unverified
+        // comment, and confirms a pulse right after the sweep finishes
+        // counts normally again.
+        //
+        // Timing matters here: the pulse must land AFTER the sweep has
+        // already passed bucket 40's turn (clear_idx walks 0..63
+        // monotonically and never revisits an address), not merely
+        // "sometime during clearing" -- a pulse fired before the sweep
+        // reaches bucket 40 would have any wrongly-applied increment
+        // silently overwritten when the sweep's own walk gets there later,
+        // masking a real drop-during-clear bug instead of catching it.
+        reset_dut;
+        @(negedge clk);
+        cfg_counter_clear = 1'b1;
+        @(posedge clk);
+        #1;
+        cfg_counter_clear = 1'b0;
+        repeat (45) @(posedge clk);      // clear_idx is now well past 40
+        pulse_ob(8'h10, 16'd40);         // fired mid-sweep, past bucket 40's turn
+        repeat (25) @(posedge clk);      // let the rest of the sweep finish
+        rd_bucket(6'd40, v); chk(9000, v, 32'd0);   // dropped, not counted
+        pulse_ob(8'h10, 16'd40);         // now well past the sweep
+        rd_bucket(6'd40, v); chk(9001, v, 32'd1);   // counts normally
 
         if (fail) begin
             $display("FAIL");

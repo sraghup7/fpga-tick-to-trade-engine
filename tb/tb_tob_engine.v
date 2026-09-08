@@ -7,17 +7,23 @@
 //   iverilog -g2001 -Wall -o tob_engine_tb.vvp rtl/tob_engine.v tb/tb_tob_engine.v
 //   vvp tob_engine_tb.vvp
 //
-// tob_engine registers per-slot book state at the posedge of each applied
-// message cycle (msg_applied = filt_valid & ~err_seq_dup) and drives the
-// status pulses combinationally for that same cycle. The testbench samples
-// the same way tb_seq_monitor.v does:
+// tob_engine now has a one-cycle front-end pipeline register (D36,
+// docs/design_decisions.md): filt_valid/filt_slot/err_seq_dup/msg_type/
+// msg_side/msg_price/msg_quantity are captured at P0 (the message's drive
+// cycle), and msg_applied/applied_slot/book_upd_valid/the next_* outputs/
+// applied_msg_type/applied_msg_side/the committed book-state write all
+// happen one cycle LATER, at P1, from those captured values -- not at P0
+// itself as before D36. The `fire` task below drives P0, deasserts
+// filt_valid/err_seq_dup before the pipeline could re-capture them, then
+// advances to P1. The testbench samples the same way tb_seq_monitor.v does:
 //   * one-cycle verdicts (msg_applied, book_upd_valid, cnt_*_pulse) and
-//     applied_slot are captured at the posedge ending the message cycle
-//     (c_* regs), pre-state-update;
+//     applied_slot/applied_msg_type/applied_msg_side are captured at the
+//     posedge ending fire's own two-cycle sequence (c_* regs), pre-state-
+//     update;
 //   * committed book state is read off the buses one delta after that
 //     posedge (post-update).
-// Each message is driven for exactly one cycle then followed by an idle
-// cycle (end_msg), which also proves no status pulse lingers.
+// Each message is driven for its two-cycle fire sequence then followed by
+// one idle cycle (end_msg), which also proves no status pulse lingers.
 //
 // Directed cases (contract S3), slot 0 first then slot 2:
 //   reset      FR-18: all slots invalid / uncrossed after rst_n, with bogus
@@ -67,6 +73,8 @@ module tb_tob_engine;
     wire        msg_applied;
     wire [1:0]  applied_slot;
     wire        book_upd_valid;
+    wire [7:0]  applied_msg_type;
+    wire [7:0]  applied_msg_side;
     wire        cnt_book_clear_pulse;
     wire        cnt_trades_pulse;
     wire        cnt_heartbeats_pulse;
@@ -96,6 +104,8 @@ module tb_tob_engine;
         .msg_applied          (msg_applied),
         .applied_slot         (applied_slot),
         .book_upd_valid       (book_upd_valid),
+        .applied_msg_type     (applied_msg_type),
+        .applied_msg_side     (applied_msg_side),
         .cnt_book_clear_pulse (cnt_book_clear_pulse),
         .cnt_trades_pulse     (cnt_trades_pulse),
         .cnt_heartbeats_pulse (cnt_heartbeats_pulse),
@@ -126,6 +136,7 @@ module tb_tob_engine;
     // they too are captured here at the message cycle's own posedge.
     reg        c_applied, c_bookupd, c_clear, c_trades, c_hb, c_crossed;
     reg [1:0]  c_slot;
+    reg [7:0]  c_amt, c_ams;   // D36: applied_msg_type/applied_msg_side
     reg [31:0] c_nbp, c_nbq, c_nap, c_naq;
     reg        c_nbv, c_nav, c_ncr;
     always @(posedge clk) begin
@@ -136,6 +147,8 @@ module tb_tob_engine;
         c_hb      = cnt_heartbeats_pulse;
         c_crossed = cnt_crossed_pulse;
         c_slot    = applied_slot;
+        c_amt     = applied_msg_type;
+        c_ams     = applied_msg_side;
         c_nbp = next_bid_price;
         c_nbq = next_bid_qty;
         c_nbv = next_bid_valid;
@@ -145,9 +158,17 @@ module tb_tob_engine;
         c_ncr = next_crossed;
     end
 
-    // Drive one message for exactly one clock cycle. Book state updates at
-    // the posedge inside; on return (posedge + 1ns) the committed state is
-    // post-update and c_* holds the message cycle's verdicts.
+    // Drive one message for exactly one clock cycle, then let tob_engine's
+    // D36 front-end pipeline register commit it. P0 (first posedge):
+    // p_filt_valid/p_msg_type/etc capture this message's inputs. N0
+    // (negedge in between): deassert filt_valid/err_seq_dup so the pipeline
+    // doesn't re-capture the same message a second time. P1 (second
+    // posedge): msg_applied/book state actually commit, using the values
+    // captured at P0 -- this is the D26/D27-style "N0 present, P1 commits,
+    // N1 deassert, P2 capture" shape already used elsewhere in this repo,
+    // adapted for tob_engine.v's own D36 one-cycle front-end register. On
+    // return (P1 + 1ns) the committed state is post-update and c_* holds
+    // the message cycle's verdicts.
     task fire;
         input [7:0]  mt;
         input [7:0]  ms;
@@ -165,8 +186,28 @@ module tb_tob_engine;
             filt_valid  = fv;
             filt_slot   = fs;
             err_seq_dup = dup;
-            @(posedge clk);
+            @(posedge clk);   // P0: p_filt_valid/p_msg_type/etc capture
             #1;
+            @(negedge clk);   // N0: deassert before the pipeline re-captures
+            filt_valid  = 1'b0;
+            err_seq_dup = 1'b0;
+            @(posedge clk);   // P1: msg_applied/book state commit (D36)
+            #1;
+            // D36 alignment check: whenever this message was actually
+            // applied, applied_msg_type/applied_msg_side (registered inside
+            // tob_engine.v) must match exactly what was driven -- proves the
+            // new front-end pipeline register doesn't desync msg_type/
+            // msg_side from msg_applied/book_upd_valid.
+            if (fv & ~dup) begin
+                if (c_amt !== mt) begin
+                    $display("FAIL: D36 applied_msg_type=%0d, expected %0d", c_amt, mt);
+                    fail = 1'b1;
+                end
+                if (c_ams !== ms) begin
+                    $display("FAIL: D36 applied_msg_side=%0d, expected %0d", c_ams, ms);
+                    fail = 1'b1;
+                end
+            end
         end
     endtask
 
@@ -552,6 +593,55 @@ module tb_tob_engine;
         expect_slot(8, 32'd200, 32'd2, 32'd0, 32'd0, 1'b1, 1'b0, 1'b0);
         snap(2'd0);   // slot 0 untouched
         expect_slot(8, 32'd100, 32'd5, 32'd90, 32'd8, 1'b1, 1'b1, 1'b1);
+        end_msg;
+
+        // ====================================================================
+        // D36 back-to-back regression (docs/design_decisions.md D36): message
+        // B's inputs start loading on message A's OWN P1 cycle (no idle gap --
+        // real traffic can apply one message per cycle). applied_msg_type/
+        // applied_msg_side must reflect A's type/side at A's P1 (using
+        // p_msg_type/p_msg_side captured at A's P0), NOT B's, which is only
+        // at ITS OWN P0 that same cycle. This is the exact scenario a
+        // mutation to `assign applied_msg_type = msg_type` (live, instead of
+        // the registered p_msg_type) fails: this testbench's other fire()
+        // calls never change msg_type between a message's P0 and P1, so they
+        // cannot tell registered from live -- this one can and does.
+        // Uses slot 1, untouched by every prior case in this file (confirmed
+        // by the earlier whole-book assertion), so no reset is needed here.
+        // ====================================================================
+        @(negedge clk);
+        msg_type = QUOTE; msg_side = SIDE_BID; msg_price = 32'd900; msg_quantity = 32'd9;
+        filt_valid = 1'b1; filt_slot = 2'd1; err_seq_dup = 1'b0;
+        @(posedge clk);   // A's P0: p_msg_type/p_msg_side capture QUOTE/BID
+        #1;
+        @(negedge clk);
+        // No deassert -- B's inputs start loading immediately, back-to-back.
+        msg_type = TRADE; msg_side = SIDE_ASK; msg_price = 32'd0; msg_quantity = 32'd0;
+        filt_valid = 1'b1; filt_slot = 2'd1; err_seq_dup = 1'b0;
+        @(posedge clk);   // A's P1 (commits using P0's capture) AND B's P0 (captures TRADE/ASK now)
+        #1;
+        if (c_applied !== 1'b1 || c_bookupd !== 1'b1) begin
+            $display("FAIL: D36 back-to-back A: msg_applied=%b book_upd_valid=%b, expected 1/1", c_applied, c_bookupd);
+            fail = 1'b1;
+        end
+        if (c_amt !== QUOTE || c_ams !== SIDE_BID) begin
+            $display("FAIL: D36 back-to-back A: applied_msg_type=%0d/applied_msg_side=%0d, expected QUOTE/SIDE_BID (B's TRADE/ASK must not leak into A's cycle)", c_amt, c_ams);
+            fail = 1'b1;
+        end
+        snap(2'd1);
+        expect_slot(21, 32'd900, 32'd9, 32'd0, 32'd0, 1'b1, 1'b0, 1'b0);
+        @(negedge clk);
+        filt_valid = 1'b0; err_seq_dup = 1'b0;
+        @(posedge clk);   // B's P1 (commits using B's own P0 capture: TRADE/ASK)
+        #1;
+        if (c_applied !== 1'b1 || c_trades !== 1'b1) begin
+            $display("FAIL: D36 back-to-back B: msg_applied=%b cnt_trades_pulse=%b, expected 1/1", c_applied, c_trades);
+            fail = 1'b1;
+        end
+        if (c_amt !== TRADE || c_ams !== SIDE_ASK) begin
+            $display("FAIL: D36 back-to-back B: applied_msg_type=%0d/applied_msg_side=%0d, expected TRADE/SIDE_ASK", c_amt, c_ams);
+            fail = 1'b1;
+        end
         end_msg;
 
         if (fail) begin

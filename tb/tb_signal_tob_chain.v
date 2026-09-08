@@ -141,9 +141,15 @@ module tb_signal_tob_chain;
     reg     fail = 1'b0;
     integer tc = 0;
 
-    // Drive one message for exactly one cycle (commit + register intent at
-    // its posedge), then one idle cycle. On return c_* holds that message's
-    // verdict.
+    // Drive one message. P0 (first posedge): tob_engine.v's own D36
+    // front-end pipeline register captures filt_valid/msg_type/etc. N0.5
+    // (negedge in between): deassert before tob_engine's pipeline could
+    // re-capture. P1 (second posedge): book_upd_valid commits (D36 -- one
+    // cycle later than before this fix); signal_engine.v's own stage-0
+    // register (D40) captures book_upd_valid/the applied state here. N1:
+    // deassert (redundant with N0.5, harmless). P1.5 (D40): signal_engine.v's
+    // intent actually registers here now -- one cycle later than before its
+    // own D40 pipeline stage. P2: c_* captures the verdict.
     task fire;
         input [7:0]  mt;
         input [7:0]  ms;
@@ -159,11 +165,16 @@ module tb_signal_tob_chain;
             filt_valid  = 1'b1;
             filt_slot   = fs;
             err_seq_dup = 1'b0;
-            @(posedge clk);                     // P1: book commits, intent registers
+            @(posedge clk);                     // P0: tob_engine's D36 front-end register captures
             #1;
-            @(negedge clk);                     // N1: deassert
+            @(negedge clk);                     // N0.5: deassert before tob_engine re-captures
             filt_valid  = 1'b0;
             err_seq_dup = 1'b0;
+            @(posedge clk);                     // P1: book_upd_valid commits (D36); signal_engine's
+                                                 // stage-0 register captures it (D40)
+            #1;
+            @(posedge clk);                     // P1.5 (D40): signal_engine's intent registers here
+            #1;
             @(posedge clk);                     // P2: c_* captures the verdict
             #1;
         end

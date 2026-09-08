@@ -25,3 +25,17 @@
 
 create_clock -period 20.000 -name sys_clk [get_ports sys_clk]
 create_clock -period 8.000  -name rx_clk  [get_ports rgmii_rxc]
+
+# sys_clk and rx_clk are genuinely asynchronous to each other (independent
+# oscillators; no shared reference), and the only two real crossings between
+# them (kill_sw_n, the async reset) already go through proper 2FF
+# synchronizers (rtl/common/sync_2ff.v -- u_kill_sync/u_rst_sync in
+# tob_top.v) -- mdio_done_latched's only fan-out is an LED output port,
+# which has no setup/hold requirement at all. Without this exception Vivado
+# times every path between the two domains as if they shared a clock,
+# which is where D26's unexplained mdio_ctrl WHS = -0.002 ns almost
+# certainly comes from -- a spurious violation on a path that was never
+# meant to be synchronous, not a real hold problem. This does not weaken
+# anything: it tells the tool the two real crossings are handled by design
+# (the synchronizers), not that timing on them doesn't matter.
+set_clock_groups -asynchronous -group [get_clocks sys_clk] -group [get_clocks rx_clk]

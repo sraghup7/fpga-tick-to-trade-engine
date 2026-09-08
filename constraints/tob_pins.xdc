@@ -43,39 +43,54 @@ set_property PACKAGE_PIN L13 [get_ports {key_in[3]}]
 set_property IOSTANDARD LVCMOS33 [get_ports {key_in[3]}]
 
 # ---- RGMII (E1_* in the manual's own naming) ----
+# D39: a trailing "# comment" on the SAME line as set_property was silently
+# swallowing every one of these 15 PACKAGE_PIN constraints -- Vivado's
+# set_property parses '#' as a literal extra "objects" argument, not a
+# comment (comments are only recognized where a NEW command is expected,
+# i.e. at the start of a line/after a ';', not after other arguments already
+# on the same line) -- confirmed directly against Vivado's own error when
+# the identical line is evaluated on its own:
+# "ERROR: [Common 17-161] Invalid option value '#' specified for 'objects'."
+# read_xdc swallows that error per-line and keeps going, so the whole file
+# appeared to load cleanly while these 15 pins silently landed on whatever
+# Vivado's placer auto-assigned instead of the schematic-verified pin --
+# not just wrong, but a real hardware-safety risk (DRC UCIO-1's own warning:
+# "may cause I/O contention... in extreme cases cause damage to the
+# device"). Every comment moved to its own line; nothing else changed
+# (docs/design_decisions.md D39).
 set_property IOSTANDARD LVCMOS33 [get_ports {rgmii_txd[*]}]
 set_property SLEW FAST [get_ports {rgmii_txd[*]}]
-set_property PACKAGE_PIN J21 [get_ports {rgmii_txd[0]}]   # E1_TXD0
-set_property PACKAGE_PIN M20 [get_ports {rgmii_txd[1]}]   # E1_TXD1
-set_property PACKAGE_PIN L18 [get_ports {rgmii_txd[2]}]   # E1_TXD2
-set_property PACKAGE_PIN L20 [get_ports {rgmii_txd[3]}]   # E1_TXD3
+set_property PACKAGE_PIN J21 [get_ports {rgmii_txd[0]}]
+set_property PACKAGE_PIN M20 [get_ports {rgmii_txd[1]}]
+set_property PACKAGE_PIN L18 [get_ports {rgmii_txd[2]}]
+set_property PACKAGE_PIN L20 [get_ports {rgmii_txd[3]}]
 
-set_property PACKAGE_PIN L19 [get_ports rgmii_tx_ctl]      # E1_TXEN
+set_property PACKAGE_PIN L19 [get_ports rgmii_tx_ctl]
 set_property IOSTANDARD LVCMOS33 [get_ports rgmii_tx_ctl]
 set_property SLEW FAST [get_ports rgmii_tx_ctl]
 
-set_property PACKAGE_PIN L14 [get_ports rgmii_txc]         # E1_GTXC
+set_property PACKAGE_PIN L14 [get_ports rgmii_txc]
 set_property IOSTANDARD LVCMOS33 [get_ports rgmii_txc]
 set_property SLEW FAST [get_ports rgmii_txc]
 
 set_property IOSTANDARD LVCMOS33 [get_ports {rgmii_rxd[*]}]
-set_property PACKAGE_PIN K19 [get_ports {rgmii_rxd[0]}]   # E1_RXD0
-set_property PACKAGE_PIN M15 [get_ports {rgmii_rxd[1]}]   # E1_RXD1
-set_property PACKAGE_PIN J17 [get_ports {rgmii_rxd[2]}]   # E1_RXD2
-set_property PACKAGE_PIN J20 [get_ports {rgmii_rxd[3]}]   # E1_RXD3
+set_property PACKAGE_PIN K19 [get_ports {rgmii_rxd[0]}]
+set_property PACKAGE_PIN M15 [get_ports {rgmii_rxd[1]}]
+set_property PACKAGE_PIN J17 [get_ports {rgmii_rxd[2]}]
+set_property PACKAGE_PIN J20 [get_ports {rgmii_rxd[3]}]
 
-set_property PACKAGE_PIN M21 [get_ports rgmii_rx_ctl]      # E1_RXDV
+set_property PACKAGE_PIN M21 [get_ports rgmii_rx_ctl]
 set_property IOSTANDARD LVCMOS33 [get_ports rgmii_rx_ctl]
 
-set_property PACKAGE_PIN K18 [get_ports rgmii_rxc]         # E1_RXC
+set_property PACKAGE_PIN K18 [get_ports rgmii_rxc]
 set_property IOSTANDARD LVCMOS33 [get_ports rgmii_rxc]
 
 # ---- MDIO / PHY reset ----
-set_property PACKAGE_PIN K17 [get_ports mdc]               # E1_MDC
+set_property PACKAGE_PIN K17 [get_ports mdc]
 set_property IOSTANDARD LVCMOS33 [get_ports mdc]
-set_property PACKAGE_PIN K16 [get_ports mdio]               # E1_MDIO
+set_property PACKAGE_PIN K16 [get_ports mdio]
 set_property IOSTANDARD LVCMOS33 [get_ports mdio]
-set_property PACKAGE_PIN L15 [get_ports phy_reset_n]       # E1_RESET
+set_property PACKAGE_PIN L15 [get_ports phy_reset_n]
 set_property IOSTANDARD LVCMOS33 [get_ports phy_reset_n]
 
 # ---- Board-required config properties (ALINX reference top.xdc) ----

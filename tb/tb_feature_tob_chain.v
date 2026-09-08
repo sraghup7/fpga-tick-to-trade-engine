@@ -30,11 +30,12 @@
 // Expectation semantics: feature_golden.py computes F0-F7 from the book
 // state AFTER the triggering event was applied. feature_extractor.v must
 // therefore read tob_engine.v's next_* scalar ports (combinational
-// post-update state of the applied slot, D23) and register its vector one
-// cycle after book_upd_valid. Each `fire` below drives one message cycle
-// (book commits + vector registers at its posedge) followed by one idle
-// cycle; on return the c_* capture regs (sampled pre-edge at the idle
-// posedge) hold that message's registered feature vector.
+// post-update state of the applied slot, D23) and register its vector
+// THREE cycles after book_upd_valid (D26/D27 v2 timing patch). Each `fire`
+// below drives one message cycle (book commits + stage-0 registers at its
+// posedge) followed by three idle cycles; on return the c_* capture regs
+// (sampled pre-edge at the final idle posedge) hold that message's
+// registered feature vector.
 //
 // Block layout (each preceded by a reset, per the standalone TB's
 // convention, so per-slot feature history starts fresh):
@@ -122,8 +123,12 @@ module tb_feature_tob_chain;
     ) u_feat (
         .clk                  (clk),
         .rst_n                (rst_n),
-        .msg_type             (msg_type),
-        .msg_side             (msg_side),
+        // D36: applied_msg_type/applied_msg_side (registered inside
+        // tob_engine.v, aligned with msg_applied/book_upd_valid), not the
+        // raw testbench msg_type/msg_side registers directly -- matches
+        // tob_top.v's real wiring.
+        .msg_type             (u_tob.applied_msg_type),
+        .msg_side             (u_tob.applied_msg_side),
         .msg_applied          (u_tob.msg_applied),
         .book_upd_valid       (u_tob.book_upd_valid),
         .applied_slot         (u_tob.applied_slot),
@@ -144,9 +149,9 @@ module tb_feature_tob_chain;
     );
 
     // Capture feat_* at each posedge (pre-edge), so the sample taken at the
-    // idle posedge after a driven message cycle holds that message's
-    // registered vector (feat_valid pulses one cycle after book_upd_valid --
-    // same convention as tb_feature_extractor.v / tb_signal_tob_chain.v).
+    // final idle posedge after a driven message cycle holds that message's
+    // registered vector (feat_valid pulses three cycles after book_upd_valid,
+    // D26/D27 v2 timing patch).
     reg        c_valid;
     reg [1:0]  c_slot;
     reg [31:0] c_f0, c_f1, c_f2, c_f3, c_f4, c_f5, c_f6, c_f7;
@@ -166,9 +171,16 @@ module tb_feature_tob_chain;
     reg     fail = 1'b0;
     integer tc = 0;
 
-    // Drive one message for exactly one cycle (book commits + vector
-    // registers at its posedge), then one idle cycle. On return c_* holds
-    // that message's verdict.
+    // Drive one message. P0 (first posedge): tob_engine.v's own D36
+    // front-end pipeline register captures filt_valid/msg_type/etc (see
+    // rtl/tob_engine.v's header). N0.5 (negedge in between): deassert
+    // filt_valid/err_seq_dup before tob_engine's pipeline could re-capture
+    // them. P1 (second posedge): msg_applied/book_upd_valid/stage-0
+    // registers actually commit (D36 -- one cycle later than before this
+    // fix). Then three more idle cycles for feat_valid, which still pulses
+    // exactly 3 cycles after book_upd_valid (feature_extractor.v's own
+    // pipeline, unchanged by D36). On return c_* holds that message's
+    // verdict.
     task fire;
         input [7:0]  mt;
         input [7:0]  ms;
@@ -184,11 +196,17 @@ module tb_feature_tob_chain;
             filt_valid   = 1'b1;
             filt_slot    = fs;
             err_seq_dup  = 1'b0;
-            @(posedge clk);                      // P1: book commits, vector registers
+            @(posedge clk);                      // P0: tob_engine's D36 front-end register captures
             #1;
-            @(negedge clk);                      // N1: deassert
+            @(negedge clk);                      // N0.5: deassert before tob_engine re-captures
             filt_valid   = 1'b0;
             err_seq_dup  = 1'b0;
+            @(posedge clk);                      // P1: book_upd_valid/stage-0 registers commit (D36)
+            #1;
+            @(posedge clk);   // two extra idle cycles: feat_valid still pulses
+            #1;               // three cycles after book_upd_valid
+            @(posedge clk);
+            #1;
             @(posedge clk);                      // P2: c_* captures the vector
             #1;
         end

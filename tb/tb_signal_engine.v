@@ -164,11 +164,20 @@ module tb_signal_engine;
             @(negedge clk);             // N0: present the event
             book_upd_valid = buv;
             applied_slot   = slot;
-            @(posedge clk);             // P1: intent registered here
+            @(posedge clk);             // P1: stage-0 registers (p0_*) capture
+                                         // book_upd_valid/the event (D40);
+                                         // p0_valid is high from here until
+                                         // P1.5, so conflict/err_signal_conflict
+                                         // is readable now
             #1;
             c_err = err_signal_conflict;
             @(negedge clk);             // N1: deassert
             book_upd_valid = 1'b0;
+            @(posedge clk);             // P1.5 (D40): intent registers here
+                                         // now -- one cycle later than before
+                                         // signal_engine.v's own D40 pipeline
+                                         // stage; p0_valid also drops here
+            #1;
             @(posedge clk);             // P2: c_* captures the event verdict
             #1;
         end
@@ -297,14 +306,22 @@ module tb_signal_engine;
         applied_slot   = 2'd0;
         force dut.buy_ok  = 1'b1;   // make the (provably unreachable) both-true
         force dut.sell_ok = 1'b1;   // state happen anyway
-        @(posedge clk);
+        @(posedge clk);             // P1: stage-0 samples book_upd_valid ->
+                                     // p0_valid=1 (D40); conflict is readable
         #1;
         c_err = err_signal_conflict;
         @(negedge clk);
-        book_upd_valid = 1'b0;
+        book_upd_valid = 1'b0;      // deassert for the NEXT p0_valid update;
+                                     // forces MUST stay active through P1.5
+                                     // below -- that is the edge that actually
+                                     // registers the decision off p0_valid
+                                     // (still 1, pre-edge) & buy_ok & sell_ok
+        @(posedge clk);             // P1.5 (D40): intent registers here,
+                                     // suppressed by the conflict captured above
+        #1;
         release dut.buy_ok;
         release dut.sell_ok;
-        @(posedge clk);
+        @(posedge clk);             // P2: c_* captures the settled verdict
         #1;
         check(16, 1'b0, 2'd0, SIDE_BID, 32'd0, 32'd0, 1'b1);   // conflict pulses, intent suppressed
         cycle(2'd0, 1'b1, 32'd100, 32'd100, 1'b1, 32'd102, 32'd1, 1'b1, 1'b0);  // back to normal after release

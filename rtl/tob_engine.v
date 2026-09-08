@@ -27,6 +27,42 @@
 // either, matching sim/golden_model.py's process_message, whose `if is_dup:
 // return` sits before the msg_type dispatch.
 //
+// Timing (D36, docs/design_decisions.md): filt_valid/filt_slot (from
+// symbol_filter.v), err_seq_dup (from seq_monitor.v), and msg_type/msg_side/
+// msg_price/msg_quantity (from md_parser.v) are registered here, one cycle,
+// BEFORE msg_applied/applied_slot/book_upd_valid/the next_* outputs/the
+// committed-state write are computed from them -- p_filt_valid/p_filt_slot/
+// p_err_seq_dup/p_msg_type/p_msg_side/p_msg_price/p_msg_quantity below.
+// Before this, the entire chain from symbol_filter.v's cfg_symbol_en compare
+// through this module's per-slot book-state mux to signal_engine.v's own
+// decision registers was one uninterrupted combinational cone (confirmed:
+// real post-route synthesis put the worst path here, WNS -0.933 ns, 12
+// logic levels dominated by route delay from cfg_symbol_en through
+// slot_match through the applied-slot book mux to signal_engine.v's
+// spread_ok). Registering the "which slot, is it a dup, what's the message"
+// verdict before it is CONSUMED (rather than touching symbol_filter.v/
+// seq_monitor.v's own combinational, zero-latency-by-design decisions, or
+// signal_engine.v's own cheap spread_ok arithmetic) is the same shape as
+// every other timing fix this project has made: split "decide" from "act
+// on the decision" across a cycle boundary. msg_applied/book_upd_valid/
+// applied_slot/next_*/bid_price/ask_price/crossed and the new
+// applied_msg_type/applied_msg_side outputs all now trail md_parser.v's
+// msg_valid by ONE cycle more than before this fix -- everything downstream
+// (feature_extractor.v, signal_engine.v, risk_engine.v) reacts to
+// book_upd_valid/msg_applied whenever they actually pulse and needed no
+// internal change, since none of them assume any absolute cycle distance
+// from md_parser.v; the one exception is order_builder.v's TRIGGER_DELAY,
+// which explicitly counts cycles from md_parser.v's msg_valid and must grow
+// by one to match (tob_top.v S3).
+//
+// applied_msg_type/applied_msg_side (NEW, D36) expose the registered copies
+// of msg_type/msg_side, aligned with msg_applied/book_upd_valid --
+// feature_extractor.v reads these instead of md_parser.v's raw msg_type/
+// msg_side directly, so its own CLEAR/TRADE detection stays aligned with
+// the now-one-cycle-later book_upd_valid it also consumes. feature_extractor
+// .v's own internals are completely unchanged by this fix -- only which
+// wires tob_top.v connects to its msg_type/msg_side ports changes.
+//
 // Per-message semantics (matching sim/golden_model.py's MSG_* branches
 // exactly, and D14's fix to FR-15):
 //   QUOTE (0x01): the addressed side is bid iff msg_side==0, else ask (any
@@ -77,12 +113,21 @@ module tob_engine #(
     // status: msg_applied = filt_valid & !err_seq_dup, pulses for every
     // message type once it clears the FR-11 dup gate. Exposed directly
     // because feature_extractor.v needs it for TRADE/HEARTBEAT triggers.
+    // D36: now registered one cycle after filt_valid/err_seq_dup arrive
+    // (see file header) -- still exactly "the message's own applied cycle"
+    // from the perspective of every downstream consumer.
     output wire        msg_applied,
     output wire [1:0]  applied_slot,   // valid when msg_applied=1
 
     // book_upd_valid = msg_applied & (QUOTE | CLEAR): the "book was
     // modified" pulse feature_extractor.v's FR-20 trigger needs.
     output wire        book_upd_valid,
+
+    // D36 (NEW): registered copies of msg_type/msg_side, aligned with
+    // msg_applied/book_upd_valid -- feature_extractor.v reads these instead
+    // of md_parser.v's raw msg_type/msg_side (see file header).
+    output wire [7:0]  applied_msg_type,
+    output wire [7:0]  applied_msg_side,
 
     // status pulses for a later CSR/counters block (S10) -- raw,
     // un-accumulated, same pattern as every other module's err_*/cnt_*
@@ -105,14 +150,15 @@ module tob_engine #(
     output wire [NUM_SYMBOLS-1:0]    crossed,
 
     // post-update ("next") state of the APPLIED slot -- combinational,
-    // valid on the message's own cycle whenever msg_applied is high, i.e.
-    // the state the committed buses will read on the NEXT cycle (D23:
-    // consumers gated on book_upd_valid must read these, NOT the registered
-    // buses below, which only reflect the book as it stood before the
-    // triggering message's own effect). For TRADE/HEARTBEAT, where nothing
-    // changes, these equal the current committed state by construction; a
-    // consumer should gate on book_upd_valid (or msg_applied) before reading
-    // them, exactly as it already gates on the committed buses.
+    // valid on the message's own (now registered, D36) applied cycle
+    // whenever msg_applied is high, i.e. the state the committed buses
+    // will read on the NEXT cycle (D23: consumers gated on book_upd_valid
+    // must read these, NOT the registered buses below, which only reflect
+    // the book as it stood before the triggering message's own effect).
+    // For TRADE/HEARTBEAT, where nothing changes, these equal the current
+    // committed state by construction; a consumer should gate on
+    // book_upd_valid (or msg_applied) before reading them, exactly as it
+    // already gates on the committed buses.
     output wire [31:0] next_bid_price,
     output wire [31:0] next_bid_qty,
     output wire         next_bid_valid,
@@ -127,6 +173,40 @@ module tob_engine #(
     localparam [7:0] MSG_CLEAR     = 8'h03;
     localparam [7:0] MSG_HEARTBEAT = 8'hFF;
 
+    // ---- D36: front-end pipeline register. Unconditional every cycle (not
+    //      gated on filt_valid) so p_filt_valid tracks filt_valid exactly
+    //      one cycle later and no message can be lost between the raw
+    //      symbol_filter.v/seq_monitor.v/md_parser.v outputs and this
+    //      module's own applied-message logic. See file header for the
+    //      timing rationale (D36). ----
+    reg        p_filt_valid;
+    reg [1:0]  p_filt_slot;
+    reg        p_err_seq_dup;
+    reg [7:0]  p_msg_type;
+    reg [7:0]  p_msg_side;
+    reg [31:0] p_msg_price;
+    reg [31:0] p_msg_quantity;
+
+    always @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            p_filt_valid    <= 1'b0;
+            p_filt_slot     <= 2'd0;
+            p_err_seq_dup   <= 1'b0;
+            p_msg_type      <= 8'd0;
+            p_msg_side      <= 8'd0;
+            p_msg_price     <= 32'd0;
+            p_msg_quantity  <= 32'd0;
+        end else begin
+            p_filt_valid    <= filt_valid;
+            p_filt_slot     <= filt_slot;
+            p_err_seq_dup   <= err_seq_dup;
+            p_msg_type      <= msg_type;
+            p_msg_side      <= msg_side;
+            p_msg_price     <= msg_price;
+            p_msg_quantity  <= msg_quantity;
+        end
+    end
+
     reg [NUM_SYMBOLS*32-1:0] bid_price_r, bid_qty_r;
     reg [NUM_SYMBOLS-1:0]    bid_valid_r;
     reg [NUM_SYMBOLS*32-1:0] ask_price_r, ask_qty_r;
@@ -139,18 +219,22 @@ module tob_engine #(
     assign ask_qty    = ask_qty_r;
     assign ask_valid  = ask_valid_r;
 
-    // FR-11 gate; applied_slot is filt_slot (meaningful only when applied).
-    assign msg_applied = filt_valid & ~err_seq_dup;
-    assign applied_slot = filt_slot;
+    // FR-11 gate; applied_slot is the REGISTERED filt_slot (meaningful only
+    // when applied). D36: keyed off p_filt_valid/p_err_seq_dup, not the raw
+    // (same-cycle) filt_valid/err_seq_dup.
+    assign msg_applied = p_filt_valid & ~p_err_seq_dup;
+    assign applied_slot = p_filt_slot;
+    assign applied_msg_type = p_msg_type;
+    assign applied_msg_side = p_msg_side;
 
     // Book-modifying types narrow msg_applied into book_upd_valid, and the
     // per-type counters (all gated on msg_applied identically, per S1).
-    wire is_quote = (msg_type == MSG_QUOTE);
-    wire is_clear = (msg_type == MSG_CLEAR);
+    wire is_quote = (p_msg_type == MSG_QUOTE);
+    wire is_clear = (p_msg_type == MSG_CLEAR);
     assign book_upd_valid        = msg_applied & (is_quote | is_clear);
     assign cnt_book_clear_pulse  = msg_applied & is_clear;
-    assign cnt_trades_pulse      = msg_applied & (msg_type == MSG_TRADE);
-    assign cnt_heartbeats_pulse  = msg_applied & (msg_type == MSG_HEARTBEAT);
+    assign cnt_trades_pulse      = msg_applied & (p_msg_type == MSG_TRADE);
+    assign cnt_heartbeats_pulse  = msg_applied & (p_msg_type == MSG_HEARTBEAT);
 
     // FR-17: crossed[i] continuous, strictly combinational off state.
     genvar g;
@@ -165,7 +249,8 @@ module tob_engine #(
     //      nb_* is what this message leaves the slot at; it both feeds the
     //      sequential latch below and the crossed re-check, so the update
     //      rule has exactly one source of truth. When msg_applied is low the
-    //      nb_* values mirror current state and nothing latches. ----
+    //      nb_* values mirror current state and nothing latches. D36: reads
+    //      p_msg_price/p_msg_quantity (registered), not the raw ports. ----
     wire [31:0] s_bp = bid_price_r[applied_slot*32 +: 32];
     wire [31:0] s_bq = bid_qty_r  [applied_slot*32 +: 32];
     wire        s_bv = bid_valid_r[applied_slot];
@@ -173,20 +258,20 @@ module tob_engine #(
     wire [31:0] s_aq = ask_qty_r  [applied_slot*32 +: 32];
     wire        s_av = ask_valid_r[applied_slot];
 
-    wire quote_bid = msg_applied & is_quote & (msg_side == 8'h00);
-    wire quote_ask = msg_applied & is_quote & (msg_side != 8'h00);
-    wire qty_nz    = (msg_quantity != 32'd0);
+    wire quote_bid = msg_applied & is_quote & (p_msg_side == 8'h00);
+    wire quote_ask = msg_applied & is_quote & (p_msg_side != 8'h00);
+    wire qty_nz    = (p_msg_quantity != 32'd0);
 
     // bid side next state (QUOTE-bid updates it, CLEAR clears its validity,
     // anything else leaves it untouched)
-    wire [31:0] nb_bp = (quote_bid & qty_nz) ? msg_price : s_bp;
-    wire [31:0] nb_bq = quote_bid            ? msg_quantity : s_bq;
+    wire [31:0] nb_bp = (quote_bid & qty_nz) ? p_msg_price : s_bp;
+    wire [31:0] nb_bq = quote_bid            ? p_msg_quantity : s_bq;
     wire        nb_bv = quote_bid            ? qty_nz      :
                         is_clear             ? 1'b0        : s_bv;
 
     // ask side next state (symmetric)
-    wire [31:0] nb_ap = (quote_ask & qty_nz) ? msg_price : s_ap;
-    wire [31:0] nb_aq = quote_ask            ? msg_quantity : s_aq;
+    wire [31:0] nb_ap = (quote_ask & qty_nz) ? p_msg_price : s_ap;
+    wire [31:0] nb_aq = quote_ask            ? p_msg_quantity : s_aq;
     wire        nb_av = quote_ask            ? qty_nz      :
                         is_clear             ? 1'b0        : s_av;
 
@@ -194,8 +279,8 @@ module tob_engine #(
     // TRADE/HEARTBEAT leave nb_* == s_*, so an already-crossed slot keeps
     // re-firing cnt_crossed_pulse on every applied message for it; a CLEAR
     // or qty=0 side forces it to 0. Combinational, valid on the message's
-    // own cycle, race-free (equals the post-update state on both sides of
-    // the clock edge).
+    // own (registered) applied cycle, race-free (equals the post-update
+    // state on both sides of the clock edge).
     wire addr_crossed_next = nb_bv & nb_av & (nb_bp >= nb_ap);
     assign cnt_crossed_pulse = msg_applied & addr_crossed_next;
 

@@ -5,7 +5,17 @@
 #
 # Gates enforced (a bitstream is never written if these fail):
 #   - zero inferred latches
-#   - non-negative worst negative slack (WNS)
+#   - non-negative worst negative setup slack (WNS)
+#   - non-negative worst hold slack (WHS)
+#
+# All reports (utilization, timing) are written BEFORE any gate check, not
+# after -- a failing build must still leave fresh diagnostics in
+# results/build/, not the previous passing run's stale ones (found via
+# external audit + independently confirmed, docs/design_decisions.md D29:
+# every run since 2026-09-01 had failed the WNS gate and exited before ever
+# reaching report_utilization/report_timing_summary, so those two files sat
+# frozen at the very first S0-skeleton build while genuinely describing
+# nothing about the current design).
 
 set part    "xc7a35tfgg484-2"
 set top     "tob_top"
@@ -62,28 +72,46 @@ set_property top $top [current_fileset]
 
 synth_design -top $top -part $part
 
-set latch_count [llength [get_cells -hierarchical -filter {IS_LATCH == 1}]]
+# {IS_LATCH == 1} silently fails open: that property isn't set on LDCE cells
+# the way it is on some other primitive classes, so this filter can return
+# an empty list even when real latches exist -- it did exactly that in the
+# 2026-09-04 run of this design (D26 recorded "zero inferred latches --
+# verified" from this exact query; a corrected filter run afterward found
+# 32 real LDCE latches inside hand-written RTL that this query had missed
+# entirely, D29). PRIMITIVE_SUBGROUP is the property that actually
+# classifies latch primitives correctly across cell types.
+report_utilization -file $out_dir/utilization_synth.rpt
+
+set latch_cells [get_cells -hierarchical -filter {PRIMITIVE_SUBGROUP == LATCH}]
+set latch_count [llength $latch_cells]
 if {$latch_count > 0} {
     puts "ERROR: $latch_count inferred latch(es) found -- failing build."
+    foreach c $latch_cells { puts "  latch: $c" }
     exit 1
 }
-
-report_utilization -file $out_dir/utilization_synth.rpt
 
 opt_design
 place_design
 route_design
 
+# Reports are written BEFORE the gate checks below (see file header) so a
+# failing build still leaves fresh, current diagnostics in results/build/.
+report_utilization  -file $out_dir/utilization.rpt
+report_timing_summary -file $out_dir/timing_summary.rpt
+
 set wns [get_property SLACK [lindex [get_timing_paths -max_paths 1 -nworst 1 -setup] 0]]
+set whs [get_property SLACK [lindex [get_timing_paths -max_paths 1 -nworst 1 -hold] 0]]
 puts "WNS = $wns ns"
+puts "WHS = $whs ns"
 if {$wns < 0} {
-    puts "ERROR: negative slack (WNS = $wns ns) -- refusing to write a bitstream."
+    puts "ERROR: negative setup slack (WNS = $wns ns) -- refusing to write a bitstream."
+    exit 1
+}
+if {$whs < 0} {
+    puts "ERROR: negative hold slack (WHS = $whs ns) -- refusing to write a bitstream."
     exit 1
 }
 
-report_utilization -file $out_dir/utilization.rpt
-report_timing_summary -file $out_dir/timing_summary.rpt
-
 write_bitstream -force $out_dir/$top.bit
 
-puts "Build OK: $out_dir/$top.bit (WNS = $wns ns)"
+puts "Build OK: $out_dir/$top.bit (WNS = $wns ns, WHS = $whs ns)"

@@ -12,9 +12,10 @@
 // authoritative reference -- sim/feature_golden.py run over the exact event
 // streams this testbench drives (see sim/_tb_ground_truth.py), and for the
 // ported case from sim/test_feature_golden_handcase.py itself. The feature
-// vector is registered one cycle after book_upd_valid (S2.5), so the
-// testbench samples feat_* at the posedge following the event's drive cycle
-// (c_* regs capture pre-edge values each posedge, like the other S3 TBs).
+// vector is registered THREE cycles after book_upd_valid (D26/D27 v2 timing
+// patch, S2.5), so the testbench samples feat_* three posedges after the
+// event's drive cycle (c_* regs capture pre-edge values each posedge, like
+// the other S3 TBs).
 //
 // Each event is driven for exactly one cycle (inputs deasserted before the
 // sampling edge). The four next_* scalar inputs (post-update state of the
@@ -50,6 +51,14 @@
 //       presented next_* values, F1/F3/F4 the prior-event prev_* history),
 //       and a TRADE + HEARTBEAT cycle proving next_* is not consulted on
 //       non-book-modifying events (no feat_valid, window/book gating intact).
+//   F   D26/D27 v2's D13-safety regression: drives F7 into genuine 32-bit
+//       saturation (three simultaneous huge |F1| entries in the window,
+//       WINDOW=4) and through every one aging back out, checking against
+//       sim/feature_golden.py's independent from-scratch oracle at each
+//       step -- the exact "does a saturated value ever get subtracted back
+//       out" failure mode D13 originally rejected an incremental
+//       accumulator over. The final checkpoint recovers to an exact
+//       unsaturated value (0x80000000), not a corrupted one.
 //
 // On any mismatch: FAIL line naming the step, feature, and expected vs.
 // actual; final PASS/FAIL.
@@ -167,6 +176,10 @@ module tb_feature_extractor;
             @(negedge clk);
             msg_applied     = 1'b0;
             book_upd_valid  = 1'b0;
+            @(posedge clk);
+            #1;
+            @(posedge clk);   // two extra idle cycles: feat_valid now pulses
+            #1;               // three cycles after book_upd_valid (D26/D27 v2)
             @(posedge clk);
             #1;
         end
@@ -386,6 +399,46 @@ module tb_feature_extractor;
         check_feat(69, 1'b0, 2'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0, 32'd0);
         q(2'd2, 32'd500, 32'd20, 32'd520, 32'd10);     // E10: completing ask QUOTE
         check_feat(70, 1'b1, 2'd2, 32'd20, 32'd260, 32'd10, 32'd0, 32'd10, 32'd2, -32'd1, 32'd260);
+
+        // ============== BLOCK F: D26/D27 v2 D13-safety regression ==============
+        // The incremental F5/F7 accumulator (D26/D27 v2 timing patch) must
+        // never corrupt the running sum when a per-event magnitude that
+        // caused the OUTPUT to saturate later ages out of the window -- the
+        // exact failure mode D13 originally rejected an incremental
+        // accumulator over. No other block in this file drives real 32-bit
+        // saturation (Block C's rollover uses small numbers); this one does,
+        // deliberately, and checks recovery back to the true unsaturated sum
+        // once every oversized entry has aged out. Expected values are from
+        // sim/feature_golden.py's FeatureTracker (independent from-scratch
+        // recompute every event, immune to this bug class by construction)
+        // run over this exact sequence -- not hand-derived, not read off the
+        // RTL. Slot 1, WINDOW=4: mid swings 0 <-> 0xFFFFFFFF force |F1| to
+        // its two saturation-clamp extremes (0x7FFFFFFF / 0x80000000); by
+        // step 4 three such entries are in the window at once and F7's
+        // OUTPUT is genuinely saturated (0xFFFFFFFF), not merely large. Steps
+        // 5-8 are benign (mid=15, F1=0) so each aging step only removes the
+        // oldest surviving huge entry; step 8 is the critical checkpoint --
+        // the last huge entry (step 4's, |F1|=0x80000000) ages out and F7
+        // must read EXACTLY 0x80000000, not a corrupted value, proving the
+        // accumulator subtracted the true raw magnitude the whole way
+        // through, never a saturated one.
+        do_reset;
+        q(2'd1, 32'd0,          32'd100, 32'd0,          32'd100);
+        check_feat(80, 1'b1, 2'd1, 32'd0, 32'd0,            32'd0, 32'd0, 32'd0, 32'd1, 32'd0, 32'd0);
+        q(2'd1, 32'hFFFFFFFF,   32'd100, 32'hFFFFFFFF,   32'd100);
+        check_feat(81, 1'b1, 2'd1, 32'd0, 32'sd2147483647,  32'd0, 32'd0, 32'd0, 32'd2, 32'd0, 32'd2147483647);
+        q(2'd1, 32'd0,          32'd100, 32'd0,          32'd100);
+        check_feat(82, 1'b1, 2'd1, 32'd0, -32'sd2147483648, 32'd0, 32'd0, 32'd0, 32'd3, 32'd0, 32'd4294967295);
+        q(2'd1, 32'hFFFFFFFF,   32'd100, 32'hFFFFFFFF,   32'd100);
+        check_feat(83, 1'b1, 2'd1, 32'd0, 32'sd2147483647,  32'd0, 32'd0, 32'd0, 32'd4, 32'd0, 32'd4294967295);
+        q(2'd1, 32'd10,         32'd100, 32'd20,         32'd100);
+        check_feat(84, 1'b1, 2'd1, 32'd10, -32'sd2147483648, 32'd0, 32'd0, 32'd0, 32'd4, 32'd0, 32'd4294967295);
+        q(2'd1, 32'd10,         32'd100, 32'd20,         32'd100);
+        check_feat(85, 1'b1, 2'd1, 32'd10, 32'sd0,          32'd0, 32'd0, 32'd0, 32'd4, 32'd0, 32'd4294967295);
+        q(2'd1, 32'd10,         32'd100, 32'd20,         32'd100);
+        check_feat(86, 1'b1, 2'd1, 32'd10, 32'sd0,          32'd0, 32'd0, 32'd0, 32'd4, 32'd0, 32'd4294967295);
+        q(2'd1, 32'd10,         32'd100, 32'd20,         32'd100);
+        check_feat(87, 1'b1, 2'd1, 32'd10, 32'sd0,          32'd0, 32'd0, 32'd0, 32'd4, 32'd0, 32'd2147483648);
 
         if (fail) begin
             $display("FAIL");
