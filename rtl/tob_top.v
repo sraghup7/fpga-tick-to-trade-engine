@@ -454,7 +454,11 @@ module tob_top #(
     wire [1:0]   ml_slot;
     wire signed [31:0] ml_z;
 
-    wire         adverse_risk;
+    // D47 (docs/design_decisions.md D47 / docs/contracts/
+    // ml_policy_per_symbol.md S3): per-symbol adverse_risk vector -- one
+    // hysteresis bit per watched slot (ml_policy.v output -> risk_engine.v
+    // input, both default NUM_SYMBOLS=4).
+    wire [3:0] adverse_risk;
 
     wire [31:0] cfg_offset_0, cfg_shift_0, cfg_offset_1, cfg_shift_1;
     wire [31:0] cfg_offset_2, cfg_shift_2, cfg_offset_3, cfg_shift_3;

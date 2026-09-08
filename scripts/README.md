@@ -13,11 +13,15 @@ golden-model hand-cases, `sim/order_rx.py --selftest`, an RTL lint of `rtl/`, ev
 exiting non-zero on any failure. Invoked via `make sim`; this is also what CI's
 `golden-model-sim` job runs on every push (`.github/workflows/ci.yml`).
 
+`report.py` (already here) parses `results/build/timing_summary.rpt` and
+`results/build/utilization.rpt` (real Vivado output, gitignored) into the checked-in
+`results/timing.md` / `results/utilization.md` tables master spec §12.2/§12.3 cite.
+Run `python scripts/report.py` after any `make synth`/`make bit`.
+
 Planned, not yet written (master spec §13):
 
 ```
 build_hls4ml.py    hls4ml convert + build + export IP (ML collaborator's flow) — needs S4 first
-report.py           parses Vivado reports into the results/*.md tables — needs S10 first
 ```
 
 `CLAUDE.md`/`AGENTS.md` both warn not to assume a file exists — check before invoking.

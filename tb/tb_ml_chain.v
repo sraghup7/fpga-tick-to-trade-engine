@@ -23,6 +23,12 @@
 // below is chosen small enough (< 128) that no clamp fires, making z a plain
 // sum of the raw F0-F7.
 //
+// D47 (docs/design_decisions.md D47 / docs/contracts/ml_policy_per_symbol
+// .md): ml_policy's adverse_risk output is a NUM_SYMBOLS-wide vector indexed
+// by ml_slot. This tb's verdict checks therefore read adverse_risk[slot of
+// the event just fired], not a single scalar (block C fires slot 2; the
+// others fire slot 0). Pulses stay scalar (last event across any symbol).
+//
 // Thresholds: cfg_ml_th_high=50, cfg_ml_th_low=-50.
 //
 // Cases (all NUM_SYMBOLS=4):
@@ -68,7 +74,7 @@ module tb_ml_chain;
     wire        ml_valid;
     wire [1:0]  ml_slot;
     wire signed [31:0] z;
-    wire        adverse_risk;
+    wire [3:0]  adverse_risk;   // D47: per-symbol vector
     wire        ml_event_valid, ml_adverse_pulse, ml_benign_pulse, ml_safe_forced_pulse;
 
     reg signed [31:0] cfg_ml_th_high = 32'sd50;
@@ -210,7 +216,9 @@ module tb_ml_chain;
     reg        c_ml_valid;
     reg [1:0]  c_slot;
     reg signed [31:0] c_z;
-    reg        c_adverse, c_ev, c_forced, c_adv_pulse, c_ben_pulse;
+    reg [3:0]  c_adverse;   // D47: per-symbol vector; checks index the slot
+                            // the fired event was on
+    reg        c_ev, c_forced, c_adv_pulse, c_ben_pulse;
 
     // Present one message and advance the whole ML pipeline (6 clock cycles
     // past the message's commit edge, D26/D27 v2 timing patch) so
@@ -267,20 +275,20 @@ module tb_ml_chain;
         chk(1, c_ml_valid, 1'b1);
         chks(2, c_slot, 2'd0);
         chkz(3, c_z, 32'sd11);         // 0+0+10+0+0+1+0+0
-        chk(4, c_adverse, 1'b1);       // ask invalid -> forced
+        chk(4, c_adverse[0], 1'b1);     // ask invalid -> forced
         chk(5, c_forced, 1'b1);
 
         fire(QUOTE, SIDE_ASK, 32'd110, 32'd5, 2'd0);
         chk(6, c_ml_valid, 1'b1);
         chks(7, c_slot, 2'd0);
         chkz(8, c_z, 32'sd132);        // 10+55+5+0+5+2+0+55
-        chk(9, c_adverse, 1'b1);       // z=132 >= 50 -> threshold adverse
+        chk(9, c_adverse[0], 1'b1);    // z=132 >= 50 -> threshold adverse
         chk(10, c_forced, 1'b0);       // both sides valid -> not forced
         chk(11, c_adv_pulse, 1'b1);
 
         // ============== Block B: CLEAR forces fail-safe adverse ============
         fire(CLEAR, SIDE_BID, 32'd0, 32'd0, 2'd0);
-        chk(12, c_adverse, 1'b1);      // both sides invalid -> forced
+        chk(12, c_adverse[0], 1'b1);   // both sides invalid -> forced
         chk(13, c_forced, 1'b1);
         chk(14, c_ev, 1'b1);
 
@@ -289,7 +297,7 @@ module tb_ml_chain;
         chk(15, c_ml_valid, 1'b1);
         chks(16, c_slot, 2'd2);        // slot 2 routed end to end
         chkz(17, c_z, 32'sd11);        // slot 2's own features (0+0+10+0+0+1+0+0)
-        chk(18, c_adverse, 1'b1);      // slot 2 ask invalid -> forced
+        chk(18, c_adverse[2], 1'b1);   // slot 2's own bit: ask invalid -> forced
         chk(19, c_forced, 1'b1);
 
         // ============== Block D: D28-class same-slot interleave =============
@@ -329,7 +337,7 @@ module tb_ml_chain;
         c_ben_pulse = ml_benign_pulse;
         chk(20, c_ml_valid, 1'b1);
         chks(21, c_slot, 2'd0);
-        chk(22, c_adverse, 1'b1);        // M1's OWN book (ask invalid) -> forced,
+        chk(22, c_adverse[0], 1'b1);     // M1's OWN book (ask invalid) -> forced,
         chk(23, c_forced, 1'b1);         // NOT M2's now-healthy book
         @(posedge clk); #1;              // let M2's pipeline finish (its verdict
         @(posedge clk); #1;              // commits one posedge after this)

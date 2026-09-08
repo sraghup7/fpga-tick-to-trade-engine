@@ -227,6 +227,14 @@ def _compute_adverse_risk_stream(
             continue
 
         book = books[msg.symbol_id]
+        # D47 (ml_policy_per_symbol.md S4): the slot for this message --
+        # symbols' tuple order is the same slot ordering the RTL's
+        # SYMBOL_0..3 registers use (symbol_filter maps watched symbol IDs to
+        # slots by that position). classify()'s hysteresis is per-slot, so
+        # each message must carry its own symbol's slot; passing a wrong or
+        # absent slot would silently reintroduce the shared-scalar bug in
+        # this reference.
+        slot = symbols.index(msg.symbol_id)
 
         if msg.msg_type == MSG_QUOTE:
             if msg.side == SIDE_BID:
@@ -245,7 +253,7 @@ def _compute_adverse_risk_stream(
                 book.ask_price, book.ask_qty, book.ask_valid,
             )
             x = tuple(_norm8(v) for v in fv.as_tuple())   # feature_normalizer.v's job
-            res = clf.classify(x, book.bid_valid, book.ask_valid, book.crossed, seq_gap)
+            res = clf.classify(slot, x, book.bid_valid, book.ask_valid, book.crossed, seq_gap)
             if res.safe_forced:
                 safe_forced_count += 1
             out.append(bool(res.adverse_risk))
@@ -258,7 +266,7 @@ def _compute_adverse_risk_stream(
                 book.ask_price, book.ask_qty, book.ask_valid,
             )
             x = tuple(_norm8(v) for v in fv.as_tuple())   # feature_normalizer.v's job
-            res = clf.classify(x, book.bid_valid, book.ask_valid, book.crossed, seq_gap)
+            res = clf.classify(slot, x, book.bid_valid, book.ask_valid, book.crossed, seq_gap)
             if res.safe_forced:
                 safe_forced_count += 1
             out.append(bool(res.adverse_risk))

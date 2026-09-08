@@ -42,6 +42,11 @@ This is the single source of truth for the project. Requirements are numbered (`
 | `LINK_MODE` at bring-up | Raw Ethernet assumed lower-risk default | UDP (`LINK_MODE=1`) is the bring-up default; raw EtherType mode deferred (the reused MAC only dispatches ARP/IPv4/UDP) — D3 |
 | PHY management | Assumed reusable as-is | Hand-written `mdio_ctrl.v` replaces ALINX's borrowed MIIM block (license incompatibility + a PHY-address bug) — D4 |
 | Ethernet PHY identity | Micrel KSZ9031RNX (stated everywhere, incl. the board's own schematic) | JLSemi JL2121(D) — the schematic and every ALINX doc are wrong for the physically populated chip; corrected 2026-09-01 after re-reading `docs/refs/AX7035B_pinout_notes.md` (which already carries this correction from unrelated bring-up work) — D4 |
+| FR-3 UDP port match | Spec text (§6.1) reads as implemented | **Unimplemented.** `cfg_udp_port`/register `0x40` is not consumed anywhere in the datapath — no destination-UDP-port comparison exists in `rtl/` or the vendored MAC (D19). Any UDP datagram reaching the board's IP, on any port, whose length is a multiple of 16, is parsed as market data. `err_udp_port` and `err_ethertype` (§10) are structurally unable to increment as a direct consequence — flagged, not yet fixed; implementation-pending, `docs/contracts/fr3_udp_port_match.md` |
+| §11.4 `T26_soak` | Read as a 1,000,000-message full-datapath comparison | The 1,000,000-message soak that actually runs (`tb_parser_soak`, S2 gate) covers only `frame_classifier`+`md_parser` — no book, features, ML, risk, or egress. The full-datapath comparison that does exist (`tb/tb_top.v`, D44) runs 209 messages / 81 orders, not 1,000,000. `T26`'s row (§11.4) still describes the target, not the current state — README.md's own numbers are the honest, current ones |
+| §10 counter invariants | Read as "asserted in the testbench" | Not mechanically asserted anywhere as of D44. Invariant 1 (`cnt_msgs_rx = filtered + accepted + Σerr_*`) does not currently hold on its own terms either: `csr_block.v` taps the same byte stream as market data (D19), so every `0x20`/`0x21` CSR frame also increments `cnt_frames_rx`/`cnt_msgs_rx`/`err_msg_type` and (via `seq_monitor.v`) `cnt_seq_dup` — `tb_top.v`'s own expected-counter file only balances because `sim/gen_top_soak_vectors.py` models this exactly, not because the invariant is architecturally true. Separating the CSR read path from ingress counting and adding the five invariants as real testbench assertions are bundled as one pre-S11 contract (they're causally linked: the invariants can't hold, and therefore can't be asserted, until the CSR path stops polluting ingress counters) |
+| §9 `STATUS` bits 7:5 | Read as an implemented "side-valid map" | **Genuine spec arithmetic error, not implemented.** Four watched symbols need 8 bits (bid+ask validity each); the register only allocates 3. `csr_block.v` ties bits 7:5 to `0` (reserved) and says so in its own header comment (D19 item 4) — §9's row below is corrected to match |
+| ML hysteresis scope (`adverse_risk`, `ml_policy.v`, FR-28/29) | Unspecified — neither §5.4 nor §6.5 states per-symbol vs. per-feed | **Decision (2026-09-08): per-symbol.** The current implementation (and `sim/golden_model.py`'s matching model) is a single global register shared across all `NUM_SYMBOLS` feeds — bit-exact RTL-vs-golden-model agreement, but an adverse verdict on one symbol silently gates orders on every other symbol until some unrelated symbol's event clears it. Per-symbol is the correct reading of FR-28's "hold previous value" (a per-*instrument* risk estimate, not a per-*wire* one) and matches how `feature_extractor.v`'s own per-slot state already works. **Implemented**: `ml_policy.v`'s `adverse_risk` is now a `NUM_SYMBOLS`-wide state vector indexed by `ml_slot`, and `risk_engine.v`'s gate 0x09 reads `adverse_risk[sig_slot]` — see `docs/design_decisions.md` D47 |
 
 ---
 
@@ -89,7 +94,7 @@ A **simulated** trading system: never connects to a real exchange, never carries
 The project succeeds if all of the following are demonstrated and documented:
 
 1. Processes back-to-back market-data messages at Gigabit line rate without dropping or reordering, verified over ≥ 1,000,000 messages.
-2. Tick-to-trade latency, measured in hardware, is **fixed** — a single occupied histogram bucket for the accepting path, max == min.
+2. Tick-to-trade latency, measured in hardware, is **fixed** — a single occupied histogram bucket for the accepting path, max == min. This holds by construction for the engine's own pipeline (ingress → `order_valid` is a fixed cycle count, `docs/latency_budget.md` §3) at the sparse traffic NFR-1/2 describe. It is **not** claimed under sustained accepted-order rates denser than one per `ORDER_TX_CYCLES` (order_builder's TX serialization window) — at that density, later orders legitimately queue behind an earlier one still transmitting, which is TX contention, not a pipeline-depth regression (see T25 vs. the dense soak's own latency report, `tb/tb_top.v`).
 3. Every risk gate — including the ML gate `0x09` — is individually demonstrated blocking (or reducing) an order that would otherwise have been sent, with a counter recording each rejection and reason.
 4. The full RTL output (orders **and** ML score `z` and `adverse_risk`) matches a bit-exact Python golden model on every message of a randomized soak test.
 5. The hls4ml IP output (`z`) matches the Python fixed-point golden model bit-exactly for every regression vector.
@@ -402,7 +407,7 @@ Each requirement is numbered, independently testable, and mapped to tests in §1
 | ID | Requirement |
 | :-- | :-- |
 | FR-7 | Maintain configurable `NUM_SYMBOLS` (default 4) watched `symbol_id`s; forward only matching messages. Non-matching → `cnt_filtered`, no other effect. |
-| FR-8 | Discard messages with `msg_type` outside the defined set; increment `err_msg_type`. |
+| FR-8 | Discard messages with `msg_type` outside the defined set; increment `err_msg_type`. **CSR frame types `0x20`/`0x21` (§9) are excluded from this** — they share `md_parser.v`'s byte stream by design (D19) and are not malformed traffic; `err_msg_type`/`cnt_msgs_rx`/`seq_monitor.v`'s duplicate tracking must not count them (implementation-pending as of this entry, see `docs/contracts/csr_ingress_separation.md` and §0's reconciliation row). |
 | FR-9 | Discard messages with reserved `flags` bits set; increment `err_flags`. |
 | FR-10 | Track expected next `seq_num` per feed. Larger than expected → increment `cnt_seq_gap` by the gap, set sticky `seq_gap`, assert stale. |
 | FR-11 | `seq_num` less than expected (dup/reorder) → drop message, increment `cnt_seq_dup`, no book modification. |
@@ -437,7 +442,7 @@ Each requirement is numbered, independently testable, and mapped to tests in §1
 | ID | Requirement |
 | :-- | :-- |
 | FR-27 | Compute `z = b + Σ_{i=0..7} w_i·x_i` with exact `int8 × int8 → int32` accumulation, no overflow at 32 bits. |
-| FR-28 | Set `adverse_risk = 1` when `z ≥ T_high`; clear to 0 when `z ≤ T_low`; hold previous value when `T_low < z < T_high` (hysteresis). |
+| FR-28 | Set `adverse_risk = 1` when `z ≥ T_high`; clear to 0 when `z ≤ T_low`; hold previous value when `T_low < z < T_high` (hysteresis). **Per-symbol**: with `NUM_SYMBOLS` watched feeds, `adverse_risk` is a per-symbol state (indexed by `ml_slot`), not a single value shared across all feeds — see §0's reconciliation row (decided 2026-09-08; implemented, `docs/design_decisions.md` D47, `docs/contracts/ml_policy_per_symbol.md`). |
 | FR-29 | `T_high > T_low`, both runtime-configurable; hysteresis prevents oscillation near the threshold. |
 | FR-30 | The ML path (`feature_extractor → normalizer → classifier → policy`) is a fixed-depth pipeline with no stalls and data-independent latency. |
 | FR-31 | On invalid/crossed/locked book, sequence gap, or staleness, `adverse_risk` is forced to 1 regardless of `z` (fail-safe). |
@@ -599,7 +604,7 @@ Accessed via CSR frames (`0x20` write, `0x21` read request, `0x22` read response
 | Addr | Name | Default | Description |
 | :-- | :-- | :-- | :-- |
 | `0x00` | `CTRL` | `0x0` | bit0 engine enable, bit1 kill clear (self-clearing), bit2 counter clear, bit3 seq-gap clear, bit4 reject reporting |
-| `0x04` | `STATUS` | — | bit0 kill latched, bit1 seq gap, bit2 crossed, bit3 stale, bit4 ML-adverse, bits 7:5 side-valid map |
+| `0x04` | `STATUS` | — | bit0 kill latched, bit1 seq gap, bit2 crossed, bit3 stale, bit4 ML-adverse, bits 7:5 reserved (tied 0 — 4 symbols need 8 side-valid bits, this field only has 3; genuine spec arithmetic error, see §0 and `docs/design_decisions.md` D19 item 4) |
 | `0x08`–`0x14` | `SYMBOL_0..3` | `1,2,3,4` | Watched symbol IDs |
 | `0x18` | `SYMBOL_EN` | `0xF` | Per-slot enable |
 | `0x1C` | `MIN_SPREAD` | `2` | Min spread in ticks for signal |
@@ -759,15 +764,37 @@ Simulation is necessary but not sufficient; §1.6 claims are about hardware.
 | MAC TX contribution | | |
 | **Wire-to-wire** | | |
 
-Report min, median, p99, max for each. **p99 == max == min is the result being claimed.**
+Report min, median, p99, max for each. **p99 == max == min is the result being claimed for the engine's own tick-to-trade pipeline (ingress → `order_valid`), under NFR-1/2's sparse-traffic condition.** Wire-to-wire latency additionally includes TX serialization (`order_builder`'s `ORDER_TX_CYCLES`-cycle window) and is single-bucket only while the accepted-order rate stays below one per `ORDER_TX_CYCLES`; above that, later orders queue behind TX contention by construction, not by a pipeline-depth regression. Publish both the sparse-traffic (single-bucket) measurement and, separately, a dense-traffic histogram showing the queueing — do not present the dense case as a violation of criterion 2.
 
 ### 12.2 Utilization
 
 LUT, FF, BRAM, DSP per module and total (post-implementation), as a percentage of the XC7A35T's 20,800 LUTs / 41,600 FFs / 50 BRAM36 / 90 DSPs. Report the classifier's DSP usage separately (NFR-7).
 
+**Measured** (post-implementation/routed, `xc7a35tfgg484-2`, `results/build/utilization.rpt`, generated into `results/utilization.md` by `scripts/report.py`; D40's gate-passing build):
+
+| Resource | Used | Available | Utilization |
+| :-- | --: | --: | --: |
+| Slice LUTs | 9,511 | 20,800 | 45.73% |
+| Slice Registers (FF) | 11,156 | 41,600 | 26.82% |
+| Block RAM Tile | 2.5 | 50 | 5.00% |
+| DSPs | 0 | 90 | 0.00% |
+
+DSP usage is 0 for the whole design including the classifier — this is a placeholder-classifier artifact (`w_i=1`, bias=0), not a demonstrated DSP budget; expect nonzero DSP usage once S4's real trained model lands. `csr_block.v` is the single largest hand-written LUT contributor at 2,335 LUTs / 11.2% of the part (D41, per-module breakdown not yet re-measured on this exact netlist). Full per-module breakdown remains a follow-up (D41's open question); this table is whole-design only.
+
 ### 12.3 Timing
 
 WNS, TNS, achieved Fmax, top five critical paths with a sentence each on what limits it. A critical path you can explain is worth more than a slack number you cannot.
+
+**Measured** (post-implementation/routed, `results/build/timing_summary.rpt`, generated into `results/timing.md` by `scripts/report.py`; D40's gate-passing build, `rx_clk` 8.000 ns / 125 MHz constraint):
+
+| Metric | Value |
+| :-- | --: |
+| WNS (setup) | +0.141 ns |
+| WHS (hold) | +0.043 ns |
+| Failing endpoints | 0 / 31,058 (setup), 0 / 31,058 (hold) |
+| Achieved Fmax | 127.243 MHz |
+
+All user-specified constraints are met. Worst setup path: `u_ob/tx_payload_reg[8]/C` → `u_hist/hist_mem_reg_r1_0_63_27_29/RAMB/I` (order_builder's TX payload register into the latency histogram's distributed-RAM write port) — see `docs/design_decisions.md` D26 through D40 for the five-bottleneck history that closed this. **Caveat:** 0.141 ns on an 8 ns period is 1.8% margin — real, but thin enough that any further change (S4's real classifier included) is likely to reopen it. `constraints/tob_timing.xdc` sets no `set_input_delay`/`set_output_delay` on RGMII, so these 31,058 timed endpoints are internal paths only; the source-synchronous PHY interface is unconstrained and unmeasured here, and is the most likely place S11 stalls.
 
 ### 12.4 ML quality (honest framing)
 

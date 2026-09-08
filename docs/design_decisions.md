@@ -2704,6 +2704,287 @@ sim` / CI push from here on, not just this session.
 
 ---
 
+## D45 — Gate 0x08's token bucket underflows and permanently disables itself under back-to-back-cycle accepts; one-line clamp fix
+
+**Status: fixed and regression-tested.** Found by an external review (a
+second Opus-model pass over the repo, prompted with the master spec and
+`docs/design_decisions.md` and pointed at the RTL). Independently
+confirmed by tracing the actual RTL (not taken on the review's word) and
+reproduced with a new directed testbench case before the fix, then shown
+fixed after it.
+
+**Decision:** `rtl/risk_engine.v`'s token-bucket decrement (~line 447,
+inside the same free-running always-block D38 already documents) is
+clamped at 0 instead of subtracting unconditionally:
+```verilog
+if (accepted_c) token_bucket <= (token_after_refill == 32'd0)
+                                 ? 32'd0 : token_after_refill - 32'd1;
+else            token_bucket <= token_after_refill;
+```
+
+**Why this was broken:** D34 split gate evaluation (stage 1,
+`gate_throttle_fired_c = (token_after_refill == 0)`, combinational on the
+LIVE `token_bucket`) from the accept decision (stage 2, `accepted_c`,
+registered one cycle later) so the priority mux wouldn't sit on the same
+cycle as the slow gate arithmetic. A side effect neither D34 nor D38
+accounted for: `gate_throttle_fired_c` for message N+1 is evaluated
+BEFORE message N's decrement (driven by message N's OWN stage-2
+`accepted_c`) has committed. Two or more aligned intents on truly
+back-to-back cycles each read the SAME not-yet-decremented `token_bucket`
+value and can each see "tokens available" — with `cfg_token_max=2` and
+three back-to-back accepts, the third message's decrement then subtracts
+from an already-zero `token_bucket`, wrapping to `32'hFFFFFFFF`. Refill is
+guarded by `token_bucket_eff < cfg_token_max`, and `0xFFFFFFFF` is never
+less than any realistic `cfg_token_max` — so gate 0x08 (FR-41, a
+non-bypassable pre-trade risk control) silently and permanently disables
+itself for the rest of the run. Directly contradicts FR-41's own premise
+and NFR-5's "one message per cycle" internal-pipeline claim.
+
+**Reachability today is low** — `NFR-4`'s nominal message spacing is 16
+cycles, far apart enough that this never triggers in the existing S2-S10
+soaks (`cnt_rej_throttle`/`gate_throttle_fired`-driven counters in
+`tb/tb_top.v`'s soak never exercise it) — but low reachability is not the
+same as unreachable, and the failure mode (a risk gate that silently goes
+inert forever, instead of failing loudly or recovering) is exactly the
+kind FR-41 exists to prevent. Worth fixing now, cheaply, rather than
+carrying it into S11.
+
+**What this fix does NOT address (deliberately, scope-limited):** the
+clamp stops the PERMANENT DISABLE but does not stop the underlying
+OVER-ADMISSION — on a back-to-back burst, `gate_throttle_fired_c` can
+still admit more messages in one burst than there were real tokens
+available, because stage 1's check is fundamentally reading a value that
+lags the true committed count by up to one pipeline stage. Opus's
+suggested proper fix — move `gate_throttle_fired_c` onto a reservation
+made at stage 1 (decrement a shadow counter combinationally, ahead of
+`accepted_c`, so the very next back-to-back check sees the reservation)
+— is a larger, separate change, deferred: it changes the gate's timing
+shape (same class of change as D34/D28) and isn't needed to close the
+FR-41 hole this entry fixes. Track as a follow-up if dense-burst
+admission accuracy (as opposed to gate 0x08 never going permanently
+inert) ever becomes a requirement.
+
+**Regression test** (`tb/tb_risk_engine.v`, block M / tag 400): three
+aligned intents on three different slots, driven with `sig_valid_raw`
+held high across three consecutive posedges (no gap between them, same
+low-level style as the existing T300/T301 D34 spacing cases) against
+`cfg_token_max=2` and a refill period long enough that no refill can
+occur before the check. Asserts `dut.token_bucket` (hierarchical,
+white-box — matches the existing `dut.gate_snap_out_valid` D28 check's
+style) never exceeds `cfg_token_max` at any cycle during or after the
+burst (i.e., never wraps), then confirms a fourth intent immediately
+afterward (still no refill) is correctly rejected with reason 8 — proving
+gate 0x08 is still alive, not permanently disabled. Does not assert how
+many of the three burst messages themselves were accepted (the
+over-admission behavior above is a known, separate, undocumented-no-more
+limitation, not this fix's job).
+
+**Independently verified:** `iverilog -g2001 -Wall` compiles clean, no
+new warnings; `tb_risk_engine` (both `TB_ALIGN_DEPTH=4` and `=5`) passes
+including the new T400 case; reverted the clamp on a scratch copy of
+`risk_engine.v` and confirmed T400 fails with the wrap (`token_bucket`
+observed at `0xfffffffe`/`0xffffffff` mid-burst) — the regression
+actually catches the bug it targets. Full `bash scripts/run_sim.sh`
+regression passes.
+
+---
+
+## D46 — Spec-vs-reality reconciliation (§0/§1.6/§9/§12) and `scripts/report.py`, prompted by the same external review as D45
+
+**Status: done.** Same review pass as D45 (§0's own reconciliation
+mechanism is exactly the tool this project built for this kind of finding,
+and it had four rows outstanding). Doc-only except for `scripts/report.py`,
+which is new, real infrastructure, not a stub.
+
+**§0 reconciliation table — four new rows:**
+1. **FR-3 UDP port match is unimplemented.** `cfg_udp_port`/register `0x40`
+   is not consumed anywhere in the datapath (already known at the RTL
+   decision level, D19 item 1 and the "newly discovered" note at the end of
+   D19 — but never propagated back to §0/§6.1/§9, which still read as if
+   implemented). Any UDP datagram to the board's IP, on any port, is parsed
+   as market data; `err_udp_port`/`err_ethertype` are structurally unable
+   to increment. Flagged, not fixed — real RTL work (port comparator +
+   wiring the vendored MAC's existing internal checks to the error
+   counters), scoped for a pre-S11 contract, not done here.
+2. **`T26_soak`'s spec row overclaims relative to the repo.** The actual
+   1,000,000-message soak (`tb_parser_soak`) covers only
+   `frame_classifier`+`md_parser`; the full-datapath comparison that exists
+   (`tb/tb_top.v`, D44) is 209 messages/81 orders. README.md's own numbers
+   were already honest about this (the project's stated posture, CLAUDE.md);
+   the master spec's test-list row was the one still describing the target
+   as if it were the current state.
+3. **§10's counter invariants are not asserted anywhere**, and invariant 1
+   does not currently hold on its own terms: `csr_block.v` taps the same
+   byte stream as market data (D19), so CSR read/write frames inflate
+   `cnt_frames_rx`/`cnt_msgs_rx`/`err_msg_type`/`cnt_seq_dup`.
+   `tb_top.v`'s expected-counter file only balances because
+   `sim/gen_top_soak_vectors.py` models the CSR traffic explicitly (D44 item
+   1), not because the invariant is architecturally true yet. Separating
+   the CSR path from ingress counting and adding the five invariants as
+   real assertions are bundled as one pre-S11 contract — deliberately
+   bundled, not two separate ones, because the assertions can't be added
+   truthfully until the thing they'd assert stops being false.
+4. **§9 `STATUS` bits 7:5** were already correctly identified as a genuine
+   spec arithmetic error and tied to 0 in `csr_block.v` (D19 item 4) — but
+   §9's own register-map row still read as an implemented "side-valid map".
+   Corrected to say "reserved" and point at D19.
+
+**Fifth row, a decision rather than a gap:** ML hysteresis scope
+(`adverse_risk`, `ml_policy.v`) was unspecified in §5.4/§6.5 — the current
+single global register (bit-exact with `sim/golden_model.py`'s matching
+model) means an adverse verdict on one symbol gates orders on every other
+watched symbol. Decided per-symbol (matches FR-28's "hold previous value"
+read as a per-instrument estimate, and how `feature_extractor.v` already
+keeps per-slot state). §0, FR-28, and a new `docs/contracts/
+ml_policy_per_symbol.md` record the decision; RTL implementation is
+handed off, not done in this entry.
+
+**§1.6 criterion 2 / §12.1's latency claim, made precise, not changed:**
+the single-occupied-histogram-bucket claim was always true only under
+NFR-1/2's sparse-traffic condition — `tb/tb_top.v`'s own dense soak
+already knows this and deliberately reports (does not fail) multi-bucket
+latency under dense stimulus, with a correct, already-written explanation
+(order_builder's `ORDER_TX_CYCLES`-cycle TX serialization queueing later
+orders behind an earlier one, which `sim/golden_model.py`'s
+`record_latency()` doesn't model). The spec text just didn't say this
+condition out loud, so it read as an unconditional claim. §1.6 and §12.1
+now state the condition explicitly and ask for both a sparse-traffic
+(single-bucket) measurement and a dense-traffic one to be published side
+by side, instead of only the favorable one.
+
+**§12.2/§12.3 populated with real numbers** from the D40 gate-passing
+routed build (`results/build/{timing_summary,utilization}.rpt`, both
+already on disk, gitignored per §13): WNS +0.141 ns / WHS +0.043 ns /
+0 failing endpoints (setup and hold) / 127.243 MHz achieved Fmax; 9,511
+LUTs (45.73%) / 11,156 FF (26.82%) / 2.5 BRAM36 (5.00%) / 0 DSP. Carries
+forward D41's already-measured `csr_block.v` hierarchical figure (2,335
+LUTs, 11.2% of the part) as prose context, not re-measured in this entry.
+
+**New: `scripts/report.py`**, the file `scripts/README.md` had listed as
+"planned... needs S10 first" since that section was written — S10 is done,
+so this is the right time. Parses
+`results/build/timing_summary.rpt`/`utilization.rpt` (regex over Vivado's
+own fixed-format report tables — the "Design Timing Summary" one-line
+totals row and the "Slice Logic"/"Memory"/"DSP" summary rows) into
+`results/timing.md`/`results/utilization.md`, matching the layout
+`results/README.md` already declared. Run after any `make synth`/`make
+bit`. Deliberately does **not** invent numbers for the three `results/`
+entries that have nothing real yet (`latency_histogram.csv`/
+`ila_captures/` need S11 hardware; `ml_metrics.md` needs S4's real
+model) — `results/README.md` now says so per-entry instead of one blanket
+"nothing here yet" that was already stale for two of five entries.
+
+**Also fixed: README.md was directly violating CLAUDE.md's own stated
+rule** ("measured numbers... go in the §12 tables only — never asserted
+in prose elsewhere in the spec or README") — it restated the WNS/WHS
+numbers in three places in prose while §12.3 sat empty. With §12.3 now
+populated, those three spots point at `results/timing.md`/§12.3 instead
+of repeating the figures, so there is exactly one place these numbers
+live and future runs can't let them drift out of sync with the actual
+report.
+
+**Independently verified:** `python scripts/report.py` run against the
+real, already-on-disk `results/build/*.rpt` from the D40 build; output
+tables cross-checked by hand against the source `.rpt` files (WNS, WHS,
+failing-endpoint counts, LUT/FF/BRAM/DSP used/available/percent all
+match verbatim). No RTL touched by this entry; `bash scripts/run_sim.sh`
+unaffected (re-run as part of D45's own verification, same session).
+
+---
+
+## D47 — `ml_policy.v`'s `adverse_risk` was a single shared register across all `NUM_SYMBOLS` feeds; made per-symbol (the D46 fifth-row decision, implemented)
+
+**Status: fixed and regression-tested.** Implements the decision recorded
+in D46's fifth row and the master spec's §0 table (2026-09-08): ML
+hysteresis scope is per-symbol. `docs/contracts/ml_policy_per_symbol.md`
+is the handoff contract for this entry; this is its landing.
+
+**The bug (S0 of that contract):** `rtl/ml_policy.v` had exactly one
+`adverse_risk` register shared across every watched symbol. `tob_top.v`
+runs `NUM_SYMBOLS` (4) independent feeds through the same classifier
+pipeline, each producing its own `ml_valid`/`ml_slot`/`z` event — but the
+hysteresis hold state was not per-slot. An adverse verdict computed for
+symbol 1's event overwrote the SAME register a benign or hold-band verdict
+for symbol 3 would next read, so symbol 3's order could be gated by
+symbol 1's unrelated state (gate 0x09, FR-48). This was not an
+RTL-vs-golden-model discrepancy: `sim/ml_golden.py`'s `MLClassifier`
+was the identical single-scalar design, so the two agreed — just on the
+wrong thing. Both needed the fix in lockstep.
+
+**Decision (from D46/§0, not re-made here):** per-symbol is correct.
+FR-28's "hold previous value" is a per-*instrument* risk estimate; every
+other piece of per-message state in this pipeline (`feature_extractor.v`'s
+window history, `risk_engine.v`'s position ledger) already keys off slot.
+
+**The fix, per file (contract S1-S4):**
+* `rtl/ml_policy.v`: `adverse_risk` is now `output reg
+  [NUM_SYMBOLS-1:0]`, reset to `{NUM_SYMBOLS{1'b0}}`; each event's verdict
+  writes only `adverse_risk[ml_slot]` (`<= 1'b1` / `<= 1'b0` /
+  `<= adverse_risk[ml_slot]` hold, reading the event's OWN slot's bit), and
+  the hold-band `ml_adverse_pulse`/`ml_benign_pulse` follow that same
+  slot's own pre-update bit. `score_raw`/`risk_level`/pulses stay scalar
+  (last ML event across any symbol — no per-symbol addressing in the §9
+  register map, deliberately out of scope).
+* `rtl/risk_engine.v`: `adverse_risk` input is now `[NUM_SYMBOLS-1:0]`;
+  both consumers index this message's own slot: `gate_ml_fired_c =
+  adverse_risk[sig_slot] & ~cfg_ml_action;` and `reduced_qty_c =
+  (adverse_risk[sig_slot] & cfg_ml_action) ? ...`.
+* `rtl/tob_top.v`: internal `adverse_risk` wire widened to `[3:0]`
+  (`ml_policy` output -> `risk_engine` input; both connections are
+  plain-name, no other change).
+* `sim/ml_golden.py`: `MLClassifier.adverse_risk` is now a per-slot dict
+  (`self.adverse_risk: dict[int, int]`, a never-seen slot defaults to 0,
+  matching the RTL's all-zero reset — the same lazy-default-dict pattern
+  `FeatureTracker._states` already uses); `classify()` takes the event's
+  `slot` as its first argument and the hold-branch read/write touches only
+  that slot's own stored bit.
+* `sim/gen_top_soak_vectors.py`: `_compute_adverse_risk_stream` passes
+  `symbols.index(msg.symbol_id)` (the RTL's slot ordering, same as the
+  `SYMBOL_0..3` registers) into both `clf.classify(...)` call sites.
+* `sim/test_ml_golden_handcase.py`: call sites pass slot 0 (steps s1-s6
+  are single-symbol); new steps s7-s9 assert the actual per-symbol
+  isolation.
+* `tb/tb_ml_policy.v`: DUT wire widened; scalar-era checks converted to
+  per-slot bit checks; new P4 regression (tags 230+, the S0 scenario):
+  genuine adverse on slot 0, then a hold-band event on a NEVER-BEFORE-SEEN
+  slot 1 must stay benign (not inherit slot 0's bit), then a hold-band
+  event back on slot 0 must hold ITS OWN adverse.
+* `tb/tb_risk_engine.v`: `d_adv` widened to 4 bits and threaded through the
+  tb's own `u_tb_align` delay-line payload (WIDTH 76 -> 79); ML call sites
+  drive explicit vectors; new N1/N2/N3 cases prove a slot-1/slot-2 order is
+  NOT gated/reduced by slot 0's adverse bit while slot 0's own orders are.
+* `tb/tb_ml_chain.v`: verdict wire widened, checks index the fired event's
+  slot (the module's output width changed; this tb needed the same ripple).
+
+**Deliberately out of scope (contract S5):** `score_raw`/`risk_level`/
+`ml_event_valid`/pulses stay scalar; `feature_extractor.v`/
+`feature_normalizer.v`/`ml_classifier_wrap.v`/`csr_block.v` untouched;
+the D28-class fail-safe snapshot mechanism untouched; `ml_slot`'s
+`[1:0]` width / `NUM_SYMBOLS=4` unchanged.
+
+**Mutation checks** (same discipline as D45; each regression was shown to
+catch its own bug):
+* Reverted the `ml_policy.v` hold-branch to read `adverse_risk[0]` instead
+  of `adverse_risk[ml_slot]` on a scratch copy: the new P4 regression fails
+  with the exact S0 symptom (`FAIL: 233: got 1, expected 0` — slot 1's
+  never-seen hold-band event inherited slot 0's adverse bit; the pulse
+  checks 235/236 and the full-vector checks 237/240 fail the same way).
+* Reverted `risk_engine.v` to read `adverse_risk[0]` instead of
+  `adverse_risk[sig_slot]` on a scratch copy: N1 (`T500`) and N3 (`T520`)
+  fail with slot-1/slot-2 orders wrongly blocked reason 9, and N2 (`T510`)
+  fails with slot 1's order wrongly reduced to 50 — i.e. every case that
+  puts the order on a slot whose own bit is clear while another slot's is
+  set.
+
+**Regression:** both `tb_ml_policy` (TB_SNAPSHOT_DEPTH 3 and 4) and
+`tb_risk_engine` (TB_ALIGN_DEPTH 4, 5, 6) pass including the new cases;
+full `bash scripts/run_sim.sh` passes (the `tb_top` soak stimulus was
+regenerated from the fixed `sim/gen_top_soak_vectors.py`, and `tb_top`
+still passes — the RTL and the golden model stay bit-exact through the
+whole pipeline after the lockstep change).
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |

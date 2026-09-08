@@ -10,8 +10,13 @@
 //   0x01 kill      kill_latched                0x06 seq gap  seq_gap (input)
 //   0x02 size      sig_qty > cfg_max_order_qty 0x07 crossed  crossed[sig_slot]
 //   0x03 position  |pos +- sig_qty| > max      0x08 throttle token bucket empty
-//   0x04 band      |sig_price - mid| > band    0x09 ML       adverse & ~ml_action
+//   0x04 band      |sig_price - mid| > band    0x09 ML       adverse[sig_slot] & ~ml_action
 //   0x05 stale     arrival gap > cfg_max_age
+//
+// Gate 0x09 is per-symbol (D47): it reads only THIS message's own slot's
+// adverse_risk bit (adverse_risk[sig_slot]), not a single register shared
+// across every watched feed -- an unrelated symbol's ML verdict must not
+// gate this symbol's order (docs/contracts/ml_policy_per_symbol.md).
 //
 // Reject-reason priority is lowest gate number wins (FR-43), but EVERY gate
 // that fired gets its own gate_*_fired pulse (registered TWO cycles after
@@ -145,8 +150,12 @@ module risk_engine #(
     // from seq_monitor.v -- feed-wide sticky bit (gate 0x06)
     input  wire         seq_gap,
 
-    // ML verdict, external -- ml_policy.v does not exist yet (S6)
-    input  wire         adverse_risk,
+    // ML verdict, external -- ml_policy.v. D47
+    // (docs/design_decisions.md D47): a NUM_SYMBOLS-wide vector, one
+    // hysteresis bit per watched symbol; this message's own slot's bit is
+    // the one that gates it (gate_ml_fired_c / reduced_qty_c index
+    // adverse_risk[sig_slot] below).
+    input  wire [NUM_SYMBOLS-1:0] adverse_risk,
 
     // free-running cycle counter, external (must be monotonically
     // incrementing; only subtracted differences are used)
@@ -340,7 +349,10 @@ module risk_engine #(
     wire gate_seqgap_fired_c   = seq_gap;
     wire gate_crossed_fired_c  = a_crossed;                               // D28
     wire gate_throttle_fired_c = (token_after_refill == 32'd0);
-    wire gate_ml_fired_c       = adverse_risk & ~cfg_ml_action;
+    // D47 (ml_policy_per_symbol.md S2): gate 0x09 reads THIS message's own
+    // slot's adverse bit (sig_slot = the aligned intent's slot, the same
+    // index gate 0x03/0x07 already use), never some other slot's.
+    wire gate_ml_fired_c       = adverse_risk[sig_slot] & ~cfg_ml_action;
 
     // ---- D34 (stage 2): reject_reason/accepted_c are now computed from the
     //      REGISTERED gate vector (r1_gate_*), one cycle after the gates
@@ -364,7 +376,8 @@ module risk_engine #(
     wire accepted_c = r1_valid & (reject_reason_c == 8'd0);
 
     // ---- ML reduce (D16): max(1, sig_qty >> shift) when reducing ----
-    wire [31:0] reduced_qty_c = (adverse_risk & cfg_ml_action)
+    // D47: reduce only when THIS message's own slot is adverse.
+    wire [31:0] reduced_qty_c = (adverse_risk[sig_slot] & cfg_ml_action)
         ? ((sig_qty >> cfg_ml_reduce_shift) == 32'd0
                ? 32'd1
                : (sig_qty >> cfg_ml_reduce_shift))
@@ -443,8 +456,23 @@ module risk_engine #(
             refill_ctr <= refill_ctr_next;
             boot_done  <= 1'b1;
             // single next-state expression: refill combined with any
-            // same-cycle consumption -- never two separate NBA writes
-            if (accepted_c) token_bucket <= token_after_refill - 32'd1;
+            // same-cycle consumption -- never two separate NBA writes.
+            // D45: clamp at 0 instead of letting the subtraction wrap.
+            // gate_throttle_fired_c (stage 1, above) samples token_bucket
+            // one cycle before THIS decrement commits, so back-to-back
+            // aligned intents on consecutive cycles can each see the same
+            // not-yet-decremented value and all pass the gate -- accepted_c
+            // can therefore still be 1 here when token_after_refill is
+            // already 0. Without the clamp, token_bucket wraps to
+            // 32'hFFFFFFFF, which is not zero, so gate_throttle_fired_c
+            // never fires again for the rest of the run (FR-41's
+            // non-bypassable gate 0x08 silently and permanently disabled).
+            // This guard fixes ONLY that permanent-disable failure mode --
+            // it does not fix the underlying over-admission on a
+            // back-to-back burst (docs/design_decisions.md D45), which is a
+            // separate, larger change deliberately deferred.
+            if (accepted_c) token_bucket <= (token_after_refill == 32'd0)
+                                             ? 32'd0 : token_after_refill - 32'd1;
             else            token_bucket <= token_after_refill;
         end
     end

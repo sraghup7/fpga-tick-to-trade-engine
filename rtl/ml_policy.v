@@ -3,19 +3,33 @@
 // rtl/ml_policy.v
 //
 // ML policy stage (master spec S3.1 [Q], S5.4/S5.5, FR-28/29/31/33; contract
-// docs/contracts/ml_integration.md S4). Turns ml_classifier_wrap.v's raw
-// score z into the 1-bit adverse_risk verdict that risk_engine.v's gate 0x09
-// consumes, via a hysteresis threshold (FR-28/29), plus partial fail-safe
-// forcing (FR-26/31) and the FR-33 telemetry pulses feeding csr_block.v's
-// counters.
+// docs/contracts/ml_integration.md S4; per-symbol adverse_risk decision
+// docs/design_decisions.md D47 + docs/contracts/ml_policy_per_symbol.md).
+// Turns ml_classifier_wrap.v's raw score z into the per-symbol adverse_risk
+// verdict vector that risk_engine.v's gate 0x09 consumes, via a hysteresis
+// threshold (FR-28/29), plus partial fail-safe forcing (FR-26/31) and the
+// FR-33 telemetry pulses feeding csr_block.v's counters.
 //
-// Hysteresis (FR-28/29): adverse_risk sets when z >= cfg_ml_th_high, clears
-// when z <= cfg_ml_th_low, and HOLDS its current value in the band
-// cfg_ml_th_low < z < cfg_ml_th_high (no chatter around the threshold).
+// Per-symbol (D47, FR-28, §0 decision 2026-09-08): adverse_risk is a
+// NUM_SYMBOLS-wide vector indexed by ml_slot -- one hysteresis bit per
+// watched instrument, NOT a single register shared across every feed. Each
+// event updates only its own slot's bit; every other slot's bit holds. (This
+// was a single shared scalar: an adverse verdict computed for one symbol's
+// event was read by the next event on ANY symbol, so an unrelated symbol's
+// order could be gated by this one's state -- silent cross-contamination
+// between feeds that are supposed to be independent. risk_engine.v's gate
+// 0x09 reads adverse_risk[sig_slot], this module's ml_slot-indexed bit.)
+//
+// Hysteresis (FR-28/29), per slot s: adverse_risk[s] sets when z >=
+// cfg_ml_th_high, clears when z <= cfg_ml_th_low, and HOLDS its current
+// value in the band cfg_ml_th_low < z < cfg_ml_th_high (no chatter around
+// the threshold). The hold-band pulse (below) follows the EVENT'S OWN slot's
+// held bit -- a hold-band event on a slot that has never been adverse stays
+// benign and pulses ml_benign_pulse, regardless of what other slots hold.
 //
 // Fail-safe forcing (FR-26/31, contract S1.4): when the addressed slot's book
 // is invalid on either side, crossed, or the feed has a sticky sequence gap,
-// adverse_risk is forced to 1 regardless of z. Staleness forcing is
+// adverse_risk[ml_slot] is forced to 1 regardless of z. Staleness forcing is
 // deliberately NOT implemented here -- risk_engine.v's own gate 0x05 already
 // independently blocks any stale order, and per-event staleness would need a
 // duplicate of risk_engine.v's pend_* timestamp mechanism (contract S1.4,
@@ -27,8 +41,9 @@
 // pulses drive csr_block.v's cnt_ml_events/cnt_ml_adverse/cnt_ml_benign/
 // cnt_ml_safe_forced. Exactly one of ml_adverse_pulse/ml_benign_pulse fires
 // per event -- including the hold zone, where the pulse follows the HELD
-// adverse_risk -- so S10's invariant cnt_ml_events = cnt_ml_adverse +
-// cnt_ml_benign holds on every event. safe_state_c forces both
+// adverse_risk[ml_slot] of the event's OWN slot (its pre-update bit) -- so
+// S10's invariant cnt_ml_events = cnt_ml_adverse + cnt_ml_benign holds on
+// every event. safe_state_c forces both
 // ml_safe_forced_pulse and ml_adverse_pulse, satisfying cnt_ml_safe_forced
 // <= cnt_ml_adverse by construction.
 //
@@ -106,8 +121,10 @@ module ml_policy #(
     input  wire [31:0] cfg_ml_score_offset,     // 0x54
     input  wire [31:0] cfg_ml_score_shift,      // 0x58
 
-    // to risk_engine.v -- persisting hysteresis level, valid every cycle
-    output reg          adverse_risk,
+    // to risk_engine.v -- persisting per-symbol hysteresis level, valid every
+    // cycle. D47: one bit per watched symbol, indexed by ml_slot on update;
+    // risk_engine.v's gate 0x09 reads adverse_risk[sig_slot].
+    output reg [NUM_SYMBOLS-1:0] adverse_risk,
 
     // telemetry (FR-33) -- no consumer wired yet (S1.4), reserved
     output reg  signed [31:0] score_raw,
@@ -188,7 +205,7 @@ module ml_policy #(
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            adverse_risk        <= 1'b0;
+            adverse_risk        <= {NUM_SYMBOLS{1'b0}};
             score_raw           <= 32'sd0;
             risk_level          <= 8'd0;
             ml_event_valid      <= 1'b0;
@@ -199,28 +216,33 @@ module ml_policy #(
             ml_event_valid <= 1'b1;
             score_raw      <= z;
             risk_level     <= sat_risk_level(z, cfg_ml_score_offset, cfg_ml_score_shift);
+            // D47 (ml_policy_per_symbol.md S1): only the addressed slot's bit
+            // changes; every other slot's bit holds. score_raw/risk_level/
+            // pulses stay scalar (last ML event across any symbol).
             if (safe_state_c) begin
-                adverse_risk         <= 1'b1;
+                adverse_risk[ml_slot] <= 1'b1;
                 ml_safe_forced_pulse <= 1'b1;
                 ml_adverse_pulse     <= 1'b1;
                 ml_benign_pulse      <= 1'b0;
             end else if (z >= cfg_ml_th_high) begin
-                adverse_risk         <= 1'b1;
+                adverse_risk[ml_slot] <= 1'b1;
                 ml_adverse_pulse     <= 1'b1;
                 ml_benign_pulse      <= 1'b0;
                 ml_safe_forced_pulse <= 1'b0;
             end else if (z <= cfg_ml_th_low) begin
-                adverse_risk         <= 1'b0;
+                adverse_risk[ml_slot] <= 1'b0;
                 ml_adverse_pulse     <= 1'b0;
                 ml_benign_pulse      <= 1'b1;
                 ml_safe_forced_pulse <= 1'b0;
             end else begin
-                // hysteresis hold: adverse_risk keeps its current value; the
-                // pulse still fires on exactly one of the two buckets so
+                // hysteresis hold: THIS slot's own bit keeps its current
+                // value (NOT some other slot's -- the crux of the D47 fix);
+                // the pulse still fires on exactly one of the two buckets,
+                // following the event's own slot's pre-update bit, so
                 // cnt_ml_events = cnt_ml_adverse + cnt_ml_benign holds.
-                adverse_risk         <= adverse_risk;
-                ml_adverse_pulse     <= adverse_risk;
-                ml_benign_pulse      <= ~adverse_risk;
+                adverse_risk[ml_slot] <= adverse_risk[ml_slot];
+                ml_adverse_pulse     <= adverse_risk[ml_slot];
+                ml_benign_pulse      <= ~adverse_risk[ml_slot];
                 ml_safe_forced_pulse <= 1'b0;
             end
         end else begin

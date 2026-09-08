@@ -18,10 +18,10 @@
 // signal_engine's order intent by ALIGN_DEPTH cycles (tob_top.v's u_align)
 // so it reaches risk_engine on the same cycle the ML verdict's registered
 // value reflects the SAME triggering event. This tb mirrors that with its
-// own delay_line (u_tb_align, WIDTH 76 = slot+side+price+qty+seq_gap+
-// adverse), keyed on the tb's sig_valid_raw -- the raw signal_engine-style
-// pulse, one cycle after the triggering message's msg_applied edge. Every
-// directed test therefore drives:
+// own delay_line (u_tb_align, WIDTH 79 = slot+side+price+qty+seq_gap+
+// adverse(4, D47 per-symbol vector)), keyed on the tb's sig_valid_raw -- the
+// raw signal_engine-style pulse, one cycle after the triggering message's
+// msg_applied edge. Every directed test therefore drives:
 //   * the message arrival (msg_applied/applied_slot + book state) and
 //   * a RAW sig_valid/sig_slot (mimicking signal_engine), then samples the
 //     registered decision ALIGN_DEPTH+1 cycles later, when the aligned
@@ -97,6 +97,21 @@
 //            update in gate 0x03 (accepted anyway, ledger corrupted --
 //            deliberate, documented window) while 2 cycles apart SEES it
 //            (rejected reason 3).
+//   M/T400   D45 token-bucket underflow regression: three aligned intents
+//            (different slots) with sig_valid_raw held high for three
+//            consecutive posedges, cfg_token_max=2 -- token_bucket must
+//            clamp at 0 (never wrap above cfg_token_max), and a fourth
+//            intent right after (still no refill) must still be throttled
+//            (reason 8), proving gate 0x08 was not permanently disabled.
+//   N/T500+  D47 per-symbol adverse_risk (docs/design_decisions.md D47 /
+//            contract ml_policy_per_symbol.md S2/S6): gate 0x09 reads
+//            adverse_risk[sig_slot] -- THIS message's own slot's bit, not a
+//            single register shared across symbols. Block mode: an order on
+//            slot 1 with only slot 0's bit set must be ACCEPTED (N1), while
+//            an order on slot 0 with the same vector is blocked reason 9;
+//            reduce mode: slot 1 order with only slot 0's bit set is NOT
+//            reduced (N2); slot 2 order with only slot 0's bit set is
+//            accepted (N3).
 //
 // On any mismatch a FAIL line names the case/field and expected vs actual;
 // final PASS/FAIL. Verilog-2001 only.
@@ -122,7 +137,7 @@ module tb_risk_engine;
     reg [31:0] d_price = 32'd0;
     reg [31:0] d_qty = 32'd0;
     reg        d_sg = 1'b0;
-    reg        d_adv = 1'b0;
+    reg [3:0]  d_adv = 4'b0000;   // D47: per-symbol adverse_risk vector
     // message-arrival inputs
     reg        msg_applied = 1'b0;
     reg [1:0]  applied_slot = 2'd0;
@@ -148,17 +163,17 @@ module tb_risk_engine;
     // ---- ALIGNED intent into the DUT, from u_tb_align (mirrors the top
     //      level's u_align: sig_valid + payload delayed ALIGN_DEPTH) ----
     wire        w_sig_valid;
-    wire [75:0] w_dly;
-    wire [1:0]  w_sig_slot  = w_dly[75:74];
-    wire [7:0]  w_sig_side  = w_dly[73:66];
-    wire [31:0] w_sig_price = w_dly[65:34];
-    wire [31:0] w_sig_qty   = w_dly[33:2];
-    wire        w_seq_gap   = w_dly[1];
-    wire        w_adverse   = w_dly[0];
+    wire [78:0] w_dly;
+    wire [1:0]  w_sig_slot  = w_dly[78:77];
+    wire [7:0]  w_sig_side  = w_dly[76:69];
+    wire [31:0] w_sig_price = w_dly[68:37];
+    wire [31:0] w_sig_qty   = w_dly[36:5];
+    wire        w_seq_gap   = w_dly[4];
+    wire [3:0]  w_adverse   = w_dly[3:0];   // D47: per-symbol vector
 
     delay_line #(
-        .WIDTH (76),   // sig_slot(2) + sig_side(8) + sig_price(32) +
-                       // sig_qty(32) + seq_gap(1) + adverse(1)
+        .WIDTH (79),   // sig_slot(2) + sig_side(8) + sig_price(32) +
+                       // sig_qty(32) + seq_gap(1) + adverse(4, D47)
         .DEPTH (ALIGN_DEPTH)
     ) u_tb_align (
         .clk       (clk),
@@ -195,6 +210,19 @@ module tb_risk_engine;
             if (order_valid)           cnt_orders = cnt_orders + 1;
             if (reject_reason == 8'd3) cnt_rj3    = cnt_rj3 + 1;
         end
+    end
+
+    // ---- D45 token-bucket underflow watch: hierarchical (white-box) peek
+    //      at dut.token_bucket, same style as the existing D28
+    //      dut.gate_snap_out_valid check below. Tracks the max value seen
+    //      while enabled so a wrap (token_bucket jumping to something near
+    //      32'hFFFFFFFF) is caught even though it self-corrects on the next
+    //      accept/refill and might not be visible if only sampled once. ----
+    reg        tb_watch_en = 1'b0;
+    reg [31:0] tb_max_seen = 32'd0;
+    always @(posedge clk) begin
+        if (tb_watch_en && dut.token_bucket > tb_max_seen)
+            tb_max_seen = dut.token_bucket;
     end
 
 
@@ -330,7 +358,7 @@ module tb_risk_engine;
             @(negedge clk);
             sig_valid_raw = 1'b0; msg_applied = 1'b0;
             sig_slot_raw = 2'd0; d_side = 8'd0; d_price = 32'd0;
-            d_qty = 32'd0; d_sg = 1'b0; d_adv = 1'b0;
+            d_qty = 32'd0; d_sg = 1'b0; d_adv = 4'b0000;   // D47: all slots benign
             kill_sw_n = 1'b1; cfg_kill_clear = 1'b0;
             for (k = 0; k < 4; k = k + 1) begin
                 mbp[k] = 32'd0; map[k] = 32'd0; m_cr[k] = 1'b0;
@@ -392,7 +420,7 @@ module tb_risk_engine;
         input [31:0] oprice;
         input [31:0] oqty;
         input        sg;
-        input        adv;
+        input [3:0]  adv;   // D47: full per-symbol adverse_risk vector
         begin
             mbp[slot] = bp; map[slot] = ap; m_cr[slot] = cr;
             drive_bus;
@@ -448,7 +476,7 @@ module tb_risk_engine;
             sig_valid_raw = 1'b0;
             sig_slot_raw  = slot;
             d_side = side; d_price = oprice; d_qty = oqty;
-            d_sg = 1'b0; d_adv = 1'b0;
+            d_sg = 1'b0; d_adv = 4'b0000;   // D47: all slots benign
             @(posedge clk);             // arrival
             #1;
             @(negedge clk);
@@ -729,7 +757,7 @@ module tb_risk_engine;
         do_reset;
         intent(2'd0, 1'b1, 1'b0, 32'd1000, 32'd0, 1'b0, SIDE_BID, 32'd0, 32'd0, 1'b0, 1'b0);  // n1
         ck(80, 1'b0, 2'd0, SIDE_BID, 32'd0, 32'd0, 8'd0, 9'b000000000);
-        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b1);  // n2 adverse
+        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 4'b0001);  // n2 adverse, slot 0 only (D47)
         ck(81, 1'b1, 2'd0, SIDE_BID, 32'd1010, 32'd50, 8'd0, 9'b000000000);  // D16: order_qty reduced to 50
         ck_pos(81, 2'd0, 50);   // D16: position updated by 50, not 100
 
@@ -740,7 +768,7 @@ module tb_risk_engine;
         do_reset;
         intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b0);
         ck(82, 1'b1, 2'd0, SIDE_BID, 32'd1010, 32'd100, 8'd0, 9'b000000000);   // non-adverse: position 100
-        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b1);
+        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 4'b0001);   // adverse slot 0 only (D47)
         ck(83, 1'b0, 2'd0, SIDE_BID, 32'd1010, 32'd100, 8'd3, 9'b000000100);   // gate saw 100, not 50
 
         // D18 (docs/design_decisions.md): a REJECTED intent must report the
@@ -760,7 +788,7 @@ module tb_risk_engine;
         cfg_ml_reduce_shift = 4'd1;
         cfg_max_position = 32'd1000;
         do_reset;
-        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b1);
+        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 4'b0001);   // adverse slot 0 only (D47)
         ck(90, 1'b0, 2'd0, SIDE_BID, 32'd1010, 32'd100, 8'd9, 9'b100000000);   // ML blocks, no order
 
         // ================= K: sig_valid=0 =================
@@ -784,6 +812,59 @@ module tb_risk_engine;
         ck_pos(95, 2'd0, 0); ck_pos(95, 2'd1, 0); ck_pos(95, 2'd2, 0); ck_pos(95, 2'd3, 0);
         intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b0);
         ck(96, 1'b1, 2'd0, SIDE_BID, 32'd1010, 32'd100, 8'd0, 9'b000000000);
+
+        // ====================================================================
+        // N: D47 per-symbol adverse_risk gate (ml_policy_per_symbol.md S2/S6).
+        // risk_engine's gate 0x09 reads adverse_risk[sig_slot] -- THIS
+        // message's own slot's bit -- not a single register shared across
+        // every watched symbol. These cases drive the FULL 4-bit
+        // adverse_risk vector through u_tb_align with a deliberate bit
+        // pattern (the slot under test's own bit set/clear vs. the others
+        // opposite) so a wrong-index implementation -- always reading bit 0,
+        // or reading some other fixed slot -- is caught, not just a
+        // scalar-vs-vector wiring slip.
+        // ====================================================================
+
+        // ---- N1: block mode, slot 1 order must NOT be gated by slot 0's
+        //      adverse bit ----
+        cfg_ml_action       = 1'b0;      // block mode
+        cfg_ml_reduce_shift = 4'd1;
+        cfg_max_position    = 32'd1000;
+        do_reset;
+        // order on slot 1 with adverse_risk = 4'b0001 (slot 0 only). Gate
+        // 0x09 reads adverse_risk[sig_slot=1] = 0 -> the order must pass.
+        // A scalar-era or always-bit-0 implementation would wrongly block it.
+        intent(2'd1, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 4'b0001);
+        ck(500, 1'b1, 2'd1, SIDE_BID, 32'd1010, 32'd100, 8'd0, 9'b000000000);   // slot 1 accepted
+        // order on slot 0 with the same vector: slot 0's OWN bit is set, so
+        // THIS one must be blocked -- proves the vector is actually live and
+        // the indexing is per-slot, not "read whatever slot 1 is".
+        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 4'b0001);
+        ck(501, 1'b0, 2'd0, SIDE_BID, 32'd1010, 32'd100, 8'd9, 9'b100000000);   // slot 0 blocked (0x09)
+
+        // ---- N2: reduce mode, slot 1 order with slot 0 adverse must NOT be
+        //      reduced ----
+        cfg_ml_action       = 1'b1;      // reduce mode
+        cfg_ml_reduce_shift = 4'd1;
+        cfg_max_position    = 32'd1000;
+        do_reset;
+        intent(2'd1, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 4'b0001);
+        ck(510, 1'b1, 2'd1, SIDE_BID, 32'd1010, 32'd100, 8'd0, 9'b000000000);   // full 100, NOT reduced
+        ck_pos(510, 2'd1, 100);
+        // slot 0 order, same vector, reduce mode: slot 0's own bit IS set ->
+        // reduced to 50 (D16), and position reflects 50.
+        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 4'b0001);
+        ck(511, 1'b1, 2'd0, SIDE_BID, 32'd1010, 32'd50, 8'd0, 9'b000000000);
+        ck_pos(511, 2'd0, 50);
+
+        // ---- N3: block mode, cross-check the DELIBERATELY OPPOSITE pattern
+        //      (slot under test benign, another slot adverse) is the one that
+        //      passes -- a buggy "OR all bits" implementation would block ----
+        cfg_ml_action       = 1'b0;
+        cfg_max_position    = 32'd1000;
+        do_reset;
+        intent(2'd2, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 4'b0001);
+        ck(520, 1'b1, 2'd2, SIDE_BID, 32'd1010, 32'd100, 8'd0, 9'b000000000);   // slot 2 accepted
 
         // ====================================================================
         // D28 poison-message regression (docs/design_decisions.md D28,
@@ -894,7 +975,7 @@ module tb_risk_engine;
         msg_applied = 1'b1; applied_slot = 2'd0;
         sig_valid_raw = 1'b0; sig_slot_raw = 2'd0;
         d_side = SIDE_BID; d_price = 32'd1010; d_qty = 32'd100;
-        d_sg = 1'b0; d_adv = 1'b0;
+        d_sg = 1'b0; d_adv = 4'b0000;   // D47: all slots benign
         @(posedge clk);            // E_A: A arrival
         #1;
         @(negedge clk);
@@ -939,7 +1020,7 @@ module tb_risk_engine;
         msg_applied = 1'b1; applied_slot = 2'd0;
         sig_valid_raw = 1'b0; sig_slot_raw = 2'd0;
         d_side = SIDE_BID; d_price = 32'd1010; d_qty = 32'd100;
-        d_sg = 1'b0; d_adv = 1'b0;
+        d_sg = 1'b0; d_adv = 4'b0000;   // D47: all slots benign
         @(posedge clk);            // E_A: A arrival
         #1;
         @(negedge clk);
@@ -972,6 +1053,66 @@ module tb_risk_engine;
             fail = 1'b1;
         end
         ck_pos(301, 2'd0, 100);
+
+        // ====================================================================
+        // D45 token-bucket underflow regression (docs/design_decisions.md
+        // D45). gate_throttle_fired_c (stage 1) samples token_bucket one
+        // cycle before its own decrement (driven by stage-2 accepted_c)
+        // commits, so back-to-back aligned intents on consecutive cycles can
+        // each see the SAME not-yet-decremented value. cfg_token_max=2 with
+        // three back-to-back accepts (different slots, so gate 0x03/spacing
+        // are not the thing under test) drives the decrement below 0 on the
+        // pre-fix RTL, wrapping token_bucket to ~32'hFFFFFFFF and latching
+        // gate 0x08 off for good. This case does NOT assert how many of the
+        // three burst messages were themselves accepted -- that over-
+        // admission is a known, separate, deliberately-out-of-scope
+        // limitation (D45) -- only that token_bucket never exceeds
+        // cfg_token_max (no wrap) and that gate 0x08 is still alive
+        // immediately afterward.
+        // ====================================================================
+
+        // ---- M / T400: three back-to-back accepts, cfg_token_max=2 ----
+        cfg_token_max           = 32'd2;
+        cfg_token_refill_cycles = 32'd1000000;   // refill cannot land inside this case
+        cfg_max_position        = 32'd1000;
+        cfg_max_order_qty       = 32'd500;
+        cfg_price_band          = 32'd50;
+        cfg_max_age             = 32'd1250000;
+        do_reset;
+        mbp[0] = 32'd1000; map[0] = 32'd1010; m_cr[0] = 1'b0;
+        mbp[1] = 32'd1000; map[1] = 32'd1010; m_cr[1] = 1'b0;
+        mbp[2] = 32'd1000; map[2] = 32'd1010; m_cr[2] = 1'b0;
+        drive_bus;
+        tb_max_seen = 32'd0;
+        tb_watch_en = 1'b1;
+        // sig_valid_raw held high across three consecutive posedges, no gap
+        // -- slot 0, slot 1, slot 2, each at the book's own mid (1005) so no
+        // gate but throttle can possibly fire.
+        @(negedge clk);
+        sig_valid_raw = 1'b1; sig_slot_raw = 2'd0;
+        d_side = SIDE_BID; d_price = 32'd1005; d_qty = 32'd100;
+        d_sg = 1'b0; d_adv = 4'b0000;   // D47: all slots benign
+        @(posedge clk); #1;                    // slot 0 raw captured
+        @(negedge clk);
+        sig_slot_raw = 2'd1;
+        @(posedge clk); #1;                    // slot 1 raw captured
+        @(negedge clk);
+        sig_slot_raw = 2'd2;
+        @(posedge clk); #1;                    // slot 2 raw captured
+        @(negedge clk);
+        sig_valid_raw = 1'b0;
+        @(posedge clk); #1;
+        idle_cycles(ALIGN_DEPTH + 10);         // let all three decisions drain
+        tb_watch_en = 1'b0;
+        if (tb_max_seen > cfg_token_max) begin
+            $display("FAIL: T400: token_bucket max observed=%0d (0x%h) during/after a 3-message back-to-back burst, expected <= cfg_token_max=%0d -- underflow wrap", tb_max_seen, tb_max_seen, cfg_token_max);
+            fail = 1'b1;
+        end
+        // Immediately after, still inside the same (huge) refill period: a
+        // fourth intent must still be throttled -- gate 0x08 must not have
+        // been permanently disabled by a wrapped bucket.
+        intent(2'd3, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1005, 32'd100, 1'b0, 1'b0);
+        ck(400, 1'b0, 2'd3, SIDE_BID, 32'd1005, 32'd100, 8'd8, 9'b010000000);
 
         if (fail) begin
             $display("FAIL");

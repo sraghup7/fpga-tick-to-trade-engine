@@ -43,6 +43,18 @@
 // the window (P3). An always-on check asserts u_dut.fs_snap_out_valid
 // coincides with ml_valid on every cycle (S2.3 consistency note).
 //
+// New D47 per-symbol regression (P4, tags 230+, docs/design_decisions.md
+// D47 / docs/contracts/ml_policy_per_symbol.md S6): adverse_risk is now a
+// NUM_SYMBOLS-wide vector indexed by ml_slot, NOT a single scalar shared
+// across every watched symbol. The existing scalar-era checks (which fire
+// only slot 0, or one slot at a time) still pass because single-slot
+// behavior is a special case of per-slot behavior -- but a test that only
+// ever drives one slot cannot catch the shared-scalar bug this fix removes.
+// P4 drives the actual cross-slot scenario from the contract's S0: a genuine
+// adverse event on slot 0, then a SEPARATE hold-band event on a fresh
+// slot 1 (which must NOT inherit slot 0's adverse bit), then a hold-band
+// event back on slot 0 (whose OWN prior adverse bit must persist).
+//
 // Thresholds cfg_ml_th_high=20 / cfg_ml_th_low=-20 throughout; every
 // expected verdict below is hand-derived from the hysteresis + fail-safe
 // rules, not copied from a run.
@@ -100,7 +112,7 @@ module tb_ml_policy;
     reg [31:0] cfg_ml_score_offset = 32'd0;
     reg [31:0] cfg_ml_score_shift  = 32'd0;
 
-    wire        adverse_risk;
+    wire [3:0]  adverse_risk;   // D47: per-symbol vector, one bit per slot
     wire signed [31:0] score_raw;
     wire [7:0]  risk_level;
     wire        ml_event_valid, ml_adverse_pulse, ml_benign_pulse, ml_safe_forced_pulse;
@@ -157,6 +169,19 @@ module tb_ml_policy;
         begin
             if (got !== exp) begin
                 $display("FAIL: %0d: got %0d, expected %0d", tag, got, exp);
+                fail = 1'b1;
+            end
+        end
+    endtask
+
+    // D47: whole-vector compare for the per-symbol adverse_risk output.
+    task chk4;
+        input integer tag;
+        input [3:0]  got;
+        input [3:0]  exp;
+        begin
+            if (got !== exp) begin
+                $display("FAIL: %0d: adverse_risk=%b, expected %b", tag, got, exp);
                 fail = 1'b1;
             end
         end
@@ -260,38 +285,38 @@ module tb_ml_policy;
         ask_valid = 4'b1111;
         crossed   = 4'b0000;
         seq_gap   = 1'b0;
-        chk(0, adverse_risk, 1'b0);
+        chk4(0, adverse_risk, 4'b0000);   // D47: all slots benign out of reset
         chk(1, ml_event_valid, 1'b0);
 
-        // ---- rising through T_high: z=25 -> adverse ----
+        // ---- rising through T_high: z=25 -> adverse (slot 0) ----
         fire(2'd0, 32'sd25);
-        chk(10, adverse_risk, 1'b1);
+        chk(10, adverse_risk[0], 1'b1);   // D47: per-slot bit
         chk(11, ml_adverse_pulse, 1'b1);
         chk(12, ml_benign_pulse, 1'b0);
         chk(13, ml_safe_forced_pulse, 1'b0);
         settle;
 
-        // ---- falling through T_low: z=-25 -> benign ----
+        // ---- falling through T_low: z=-25 -> benign (slot 0) ----
         fire(2'd0, -32'sd25);
-        chk(14, adverse_risk, 1'b0);
+        chk(14, adverse_risk[0], 1'b0);
         chk(15, ml_benign_pulse, 1'b1);
         chk(16, ml_adverse_pulse, 1'b0);
         settle;
 
         // ---- hold zone (from adverse): z=0 in (-20,20) -> holds 1 ----
         fire(2'd0, 32'sd25);
-        settle;                              // adverse_risk now 1
+        settle;                              // adverse_risk[0] now 1
         fire(2'd0, 32'sd0);
-        chk(20, adverse_risk, 1'b1);         // held
+        chk(20, adverse_risk[0], 1'b1);      // held
         chk(21, ml_adverse_pulse, 1'b1);     // pulse follows held state
         chk(22, ml_benign_pulse, 1'b0);
         settle;
 
         // ---- hold zone (from benign): z=0 -> holds 0 ----
         fire(2'd0, -32'sd25);
-        settle;                              // adverse_risk now 0
+        settle;                              // adverse_risk[0] now 0
         fire(2'd0, 32'sd0);
-        chk(23, adverse_risk, 1'b0);         // held
+        chk(23, adverse_risk[0], 1'b0);      // held
         chk(24, ml_benign_pulse, 1'b1);
         chk(25, ml_adverse_pulse, 1'b0);
         settle;
@@ -300,7 +325,7 @@ module tb_ml_policy;
         // crossed[slot]
         crossed[0] = 1'b1;
         fire(2'd0, -32'sd25);
-        chk(30, adverse_risk, 1'b1);
+        chk(30, adverse_risk[0], 1'b1);
         chk(31, ml_safe_forced_pulse, 1'b1);
         chk(32, ml_adverse_pulse, 1'b1);
         settle;
@@ -309,7 +334,7 @@ module tb_ml_policy;
         // ~bid_valid[slot]
         bid_valid[0] = 1'b0;
         fire(2'd0, -32'sd25);
-        chk(33, adverse_risk, 1'b1);
+        chk(33, adverse_risk[0], 1'b1);
         chk(34, ml_safe_forced_pulse, 1'b1);
         settle;
         bid_valid[0] = 1'b1;
@@ -317,7 +342,7 @@ module tb_ml_policy;
         // ~ask_valid[slot]
         ask_valid[0] = 1'b0;
         fire(2'd0, -32'sd25);
-        chk(35, adverse_risk, 1'b1);
+        chk(35, adverse_risk[0], 1'b1);
         chk(36, ml_safe_forced_pulse, 1'b1);
         settle;
         ask_valid[0] = 1'b1;
@@ -325,7 +350,7 @@ module tb_ml_policy;
         // seq_gap
         seq_gap = 1'b1;
         fire(2'd0, -32'sd25);
-        chk(37, adverse_risk, 1'b1);
+        chk(37, adverse_risk[0], 1'b1);
         chk(38, ml_safe_forced_pulse, 1'b1);
         settle;
         seq_gap = 1'b0;
@@ -338,11 +363,11 @@ module tb_ml_policy;
         settle;
         crossed[2] = 1'b1;
         fire(2'd2, -32'sd25);   // same benign z, addressed slot crossed
-        chk(40, adverse_risk, 1'b1);
+        chk(40, adverse_risk[2], 1'b1);   // D47: this event was on slot 2
         chk(41, ml_safe_forced_pulse, 1'b1);
         settle;
         fire(2'd0, -32'sd25);   // slot 0 still healthy
-        chk(42, adverse_risk, 1'b0);
+        chk(42, adverse_risk[0], 1'b0);   // D47: slot 0's own bit is benign
         settle;
         crossed[2] = 1'b0;
 
@@ -353,12 +378,12 @@ module tb_ml_policy;
         // ask-invalid on the SAME slot during the SNAPSHOT_DEPTH-cycle gap
         // before ml_valid arrives. The verdict must reflect the triggering
         // message's snapshot, not the poison.
-        fire(2'd0, -32'sd25);   // leave adverse_risk benign (0) first
+        fire(2'd0, -32'sd25);   // leave adverse_risk[0] benign (0) first
         settle;
         pulse_book(2'd0);                       // capture: slot 0 healthy
         ask_valid[0] = 1'b0;                    // poison slot 0 after capture
         fire_ml(2'd0, -32'sd25);                // benign z: NOT forced
-        chk(200, adverse_risk, 1'b0);
+        chk(200, adverse_risk[0], 1'b0);
         chk(201, ml_safe_forced_pulse, 1'b0);
         chk(202, ml_benign_pulse, 1'b1);
         settle;
@@ -372,7 +397,7 @@ module tb_ml_policy;
         pulse_book(2'd0);                       // capture: ask invalid
         ask_valid[0] = 1'b1;                    // heal slot 0 after capture
         fire_ml(2'd0, -32'sd25);                // benign z, forced on snapshot
-        chk(210, adverse_risk, 1'b1);
+        chk(210, adverse_risk[0], 1'b1);
         chk(211, ml_safe_forced_pulse, 1'b1);
         chk(212, ml_adverse_pulse, 1'b1);
         settle;
@@ -384,10 +409,54 @@ module tb_ml_policy;
         pulse_book(2'd0);                       // capture: slot 0 healthy
         seq_gap = 1'b1;                         // gap asserted after capture
         fire_ml(2'd0, -32'sd25);
-        chk(220, adverse_risk, 1'b1);
+        chk(220, adverse_risk[0], 1'b1);
         chk(221, ml_safe_forced_pulse, 1'b1);
         settle;
         seq_gap = 1'b0;
+
+        // ---- D47 per-symbol adverse_risk regression (ml_policy_per_symbol
+        //      .md S6). The minimum case that distinguishes per-symbol-correct
+        //      from shared-scalar-bug: three events across TWO slots. Slot 1
+        //      has never had an event before this block, so its held value is
+        //      the reset 0; slot 0 (and slot 2, adversed by the tag-40
+        //      applied-slot block above) are restored to a benign baseline
+        //      first. A shared-scalar design would let slot 0's adverse
+        //      verdict bleed into slot 1's hold-band event (that event would
+        //      read the shared register = 1, hold it, and pulse adverse) --
+        //      which is exactly the S0 cross-contamination this regression
+        //      exists to catch. Book is healthy for every slot throughout
+        //      (bid/ask all valid, nothing crossed, seq_gap cleared above).
+        fire(2'd2, -32'sd25);   // clear slot 2's tag-40 adverse, benign baseline
+        chk(229, adverse_risk[2], 1'b0);
+        settle;
+        fire(2'd0, -32'sd25);   // slot 0 benign baseline
+        chk4(230, adverse_risk, 4'b0000);   // all four slots benign now
+        settle;
+
+        // A: genuine adverse on slot 0 (z >= cfg_ml_th_high, healthy book)
+        fire(2'd0, 32'sd25);
+        chk(231, adverse_risk[0], 1'b1);   // slot 0 now adverse
+        chk4(232, adverse_risk, 4'b0001);  // and only slot 0 is
+        settle;
+
+        // B: SEPARATE hold-band event on slot 1 (z = 0 in (-20,20), healthy
+        //    book). Slot 1's OWN prior value is the reset 0 -- it must NOT
+        //    inherit slot 0's just-set adverse bit.
+        fire(2'd1, 32'sd0);
+        chk(233, adverse_risk[1], 1'b0);   // slot 1 stays benign -- the crux
+        chk(234, adverse_risk[0], 1'b1);   // slot 0's bit untouched by slot 1's event
+        chk(235, ml_benign_pulse, 1'b1);   // pulse follows slot 1's OWN bit
+        chk(236, ml_adverse_pulse, 1'b0);
+        chk4(237, adverse_risk, 4'b0001);  // still only slot 0 adverse
+        settle;
+
+        // C: hold-band event back on slot 0: slot 0's OWN prior adverse must
+        //    persist (its own hold reads its own bit).
+        fire(2'd0, 32'sd0);
+        chk(238, adverse_risk[0], 1'b1);   // slot 0 holds ITS OWN verdict
+        chk(239, ml_adverse_pulse, 1'b1);  // pulse follows slot 0's held 1
+        chk4(240, adverse_risk, 4'b0001);
+        settle;
 
         // ---- risk_level saturation (FR-33 / S5.4) ----
         cfg_ml_score_offset = 32'd0;
