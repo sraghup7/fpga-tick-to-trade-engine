@@ -3166,6 +3166,103 @@ full `bash scripts/run_sim.sh` passes.
 
 ---
 
+## D50 — `csr_block.v` LUT reduction (D41's open question): investigated and declined — the shared-RAM-bank hypothesis does not survive the project's own exclusivity bar at any scale that would pay for itself
+
+**Status: investigated, declined, no RTL change (per explicit user
+decision).** Closes the loop D41 deliberately left open ("root-causing *why*
+a register/counter block costs this many LUTs is a real investigation, not
+a quick fix"). `docs/contracts/csr_block_lut_reduction.md` (lowest-priority,
+exploratory item of the D47-D49 review pass) proposed two fixes: (S1/S2) a
+shared distributed-RAM bank with one read-modify-write incrementer replacing
+the ~32 independent saturating-counter incrementers, and (S3) a pipelined
+read mux. Both were examined against the actual RTL and the testbench that
+pins its externally-observable behavior. Neither survives; the reasons are
+recorded here so this never has to be re-derived.
+
+**Why S1/S2 fails — the exclusivity bar is the whole ballgame, and it only
+binds harder as you merge more counters.** The contract's own S0 rule
+carves out the nine `cnt_rej_*` counters (FR-43 multi-gate simultaneity,
+proven by `tb_risk_engine.v` T21/block G) and the four ML counters (2- and
+3-way simultaneity on every single event, `ml_policy.v`) — 13 of ~32
+counters already unmovable. For the remaining ~19 the contract demands, per
+PAIR merged, either a structural exclusivity proof cited to the RTL or an
+adversarial test. Reading the actual trigger conditions shows the pool is
+far smaller than the contract's "~19 plausible candidates" framing:
+
+* `cnt_msgs_rx` **co-fires by design** with `cnt_err_msg_type` and
+  `cnt_err_flags` — its increment condition is
+  `md_msg_valid | err_msg_type | err_flags` (`csr_block.v:484-485`), the
+  same cycle those two counters increment (`csr_block.v:493-494`). Three of
+  the "shareable" candidates are one event, not three.
+* `cnt_crossed` **co-fires** with `cnt_trades` and `cnt_heartbeats`: a TRADE
+  or HEARTBEAT applied to an already-crossed book leaves `nb_* == s_*`, so
+  `cnt_crossed_pulse = msg_applied & addr_crossed_next` re-fires on top of
+  the type pulse (`tob_engine.v:235-237`, `278-285`). `cnt_book_clear` is
+  the only tob_engine pulse structurally exclusive with it (a CLEAR forces
+  `nb_bv/nb_av = 0`, so `addr_crossed_next = 0`).
+* The genuinely provable same-module exclusive groups are tiny:
+  `{err_msg_type, err_flags}` (one-hot `complete_d`, `md_parser.v:146-148`,
+  and D48's `is_csr_type` keeps CSR frames out of both), `{cnt_signal_buy,
+  cnt_signal_sell}` (a single `sig_valid` with `sig_side` selecting one of
+  two arms, `csr_block.v:502-503`), and `{cnt_book_clear, cnt_trades,
+  cnt_heartbeats}` (one `p_msg_type` per `msg_applied`). That is ~7
+  counters, not ~19 — and the two big co-firing families above plus the
+  S0 carve-out mean a bank of any real size is exactly where simultaneity
+  becomes provable-to-exist, not provable-to-be-absent.
+* **Cross-module pairs are worse than unprovable: they are provably
+  co-firing.** Frame-level errors (`err_fcs`, `err_ethertype`, `err_ip`,
+  `err_udp_port`, `err_frame_len`) are raised on the frame *being received*
+  while message-level pulses (`md_msg_valid`/`err_*`, `filt_*`, tob/signal
+  pulses) belong to the frame *being drained*; the classifier rejects a
+  frame in the same cycle md_parser/tob_engine is finishing the previous
+  one's last message. A shared write port between any frame-level and any
+  message-level counter is a real undercount, not a theoretical one.
+
+**Why the shared bank would not pay even where it is safe.** A
+distributed-RAM RMW bank amortizes one incrementer over N counters, but only
+when N is large enough to outweigh the RAM read-mux it adds (the incrementer
+reads the fired entry back before adding). At the N=2-3 scale S1's
+exclusivity bar actually leaves, the added 2:1/3:1 × 32-bit read mux
+(~32-64 LUTs) roughly cancels the incrementers removed — LUT-neutral at
+best, plausibly LUT-negative once the address decode and the now-indexed
+CSR-read arms are counted. D41's "~1,500+ LUTs" hypothesis implicitly
+assumed the ~19-counter bank; the correct number of safely-mergeable
+counters is ~7, and 7 in two-or-three-entry banks does not amortize. The
+honest conclusion is D41's own framing applied to itself: a smaller recovery
+with zero correctness risk beats an estimate, and here even the smaller
+recovery is roughly a wash on the metric it targets.
+
+**Why S3 fails — it is not a "pure timing/LUT change on the READ path," it
+is a one-cycle-latency change to a response protocol that `tb_csr_block.v`
+pins to the cycle.** `rd32(csr_addr_r)` is resolved combinationally in the
+same cycle `issue_resp` builds `resp_payload` (`csr_block.v:681-685`), and
+`tb_csr_block.v`'s `csr_read` task asserts `resp_start` is high exactly one
+posedge after the read frame ends and low on the next (`tb/tb_csr_block.v:438-458`).
+Registering `csr_addr` and resolving the case a cycle later pushes
+`resp_start` out one cycle and fails the UNMODIFIED testbench — which is
+S5's primary acceptance bar ("tb_csr_block.v passes UNMODIFIED in its
+externally-observable behavior"). The contract itself flags this exact case
+("if you find a place that assumes same-cycle `rd32` validity, say so
+explicitly"); this is that place. A CSR response is serialized multi-cycle
+on the TX side *after* `resp_start`, but the read request → `resp_start`
+interval is same-cycle-ish today and is load-bearing in the test.
+
+**Resolution (per explicit user decision):** no RTL change. This entry
+records the exclusivity proofs (so a future attempt starts from the real
+grouping, not the ~19-count guess), the S3 timing constraint, and the
+scale-vs-payoff analysis. If csr_block's LUT count is ever chased for real,
+the lever is not counter-mergeing: it is (a) actually measuring with Vivado
+whether the 35 satinc/SATADD always-branch increments or the ~60-arm read
+`case` dominates (the S6 measurement this contract deferred, still open —
+`report_utilization -hierarchical -hierarchical_depth 2` against D41's
+2,335-LUT baseline), and (b) only then deciding whether restructuring the
+read `case` into a registered two-stage decode is compatible with the
+D19/tb response timing (it is only if the testbench's read-response timing
+assertion is intentionally relaxed first, which is an interface-contract
+change, not an internal refactor).
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |
