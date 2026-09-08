@@ -136,6 +136,15 @@ module csr_block #(
     input  wire         filt_dropped,        // symbol_filter.v -> filtered
     input  wire         err_seq_dup,         // seq_monitor.v
     input  wire         seq_gap_pulse,       // seq_monitor.v
+    // D44: the actual gap size (msg_seq_num - expected_seq), combinational
+    // with seq_gap_pulse -- FR-10 requires cnt_seq_gap to increment BY THE
+    // GAP, not once per gap event. seq_monitor.v already computes this
+    // (seq_gap_amount) and its own header already says so ("must add
+    // seq_gap_amount, not just increment by 1"); it was wired out to
+    // tob_top.v but never actually connected here -- found by tb/tb_top.v's
+    // full-system comparison against sim/golden_model.py (which already
+    // implements FR-10 correctly), docs/design_decisions.md D44.
+    input  wire [31:0]  seq_gap_amount,      // seq_monitor.v
     input  wire         cnt_book_clear_pulse, // tob_engine.v
     input  wire         cnt_trades_pulse,
     input  wire         cnt_heartbeats_pulse,
@@ -378,6 +387,19 @@ module csr_block #(
         end
     endfunction
 
+    // D44: saturating add-by-amount, for cnt_seq_gap (FR-10) -- satinc
+    // above only ever adds exactly 1, wrong for a counter that must
+    // accumulate the actual gap size per event, not just the event count.
+    function [31:0] satadd;
+        input [31:0] v;
+        input [31:0] amt;
+        reg [32:0] sum;
+        begin
+            sum = {1'b0, v} + {1'b0, amt};
+            satadd = sum[32] ? 32'hFFFFFFFF : sum[31:0];
+        end
+    endfunction
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
             cnt_frames_rx          <= 32'd0;
@@ -471,7 +493,7 @@ module csr_block #(
             if (err_msg_type)                 cnt_err_msg_type   <= satinc(cnt_err_msg_type);
             if (err_flags)                    cnt_err_flags      <= satinc(cnt_err_flags);
             if (err_signal_conflict)          cnt_err_signal_conflict <= satinc(cnt_err_signal_conflict);
-            if (seq_gap_pulse)                cnt_seq_gap        <= satinc(cnt_seq_gap);
+            if (seq_gap_pulse)                cnt_seq_gap        <= satadd(cnt_seq_gap, seq_gap_amount);   // D44: by the gap, not by 1
             if (err_seq_dup)                  cnt_seq_dup        <= satinc(cnt_seq_dup);
             if (cnt_crossed_pulse)            cnt_crossed        <= satinc(cnt_crossed);
             if (cnt_book_clear_pulse)         cnt_book_clear     <= satinc(cnt_book_clear);

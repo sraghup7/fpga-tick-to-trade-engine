@@ -101,14 +101,24 @@ run_tb tb_signal_engine rtl/signal_engine.v
 run_tb tb_signal_tob_chain rtl/tob_engine.v rtl/signal_engine.v
 run_tb tb_feature_tob_chain rtl/tob_engine.v rtl/feature_extractor.v
 run_tb tb_ml_classifier_wrap rtl/ml_classifier_wrap.v
-run_tb tb_ml_policy rtl/ml_policy.v
-run_tb tb_ml_chain rtl/tob_engine.v rtl/feature_extractor.v rtl/feature_normalizer.v rtl/ml_classifier_wrap.v rtl/ml_policy.v
-run_tb tb_risk_engine rtl/risk_engine.v
+run_tb tb_ml_policy rtl/ml_policy.v rtl/common/delay_line.v
+run_tb tb_ml_chain rtl/tob_engine.v rtl/feature_extractor.v rtl/feature_normalizer.v rtl/ml_classifier_wrap.v rtl/ml_policy.v rtl/common/delay_line.v
+run_tb tb_risk_engine rtl/risk_engine.v rtl/common/delay_line.v
 run_tb tb_order_builder rtl/order_builder.v rtl/common/delay_line.v
 run_tb tb_order_builder_delay rtl/order_builder.v rtl/common/delay_line.v
 run_tb tb_csr_block rtl/csr_block.v
 run_tb tb_latency_histogram rtl/latency_histogram.v
 run_tb tb_tob_top rtl/tob_top.v rtl/frame_classifier.v rtl/md_parser.v \
+    rtl/symbol_filter.v rtl/seq_monitor.v rtl/tob_engine.v rtl/signal_engine.v \
+    rtl/risk_engine.v rtl/order_builder.v rtl/csr_block.v rtl/latency_histogram.v \
+    rtl/feature_extractor.v rtl/feature_normalizer.v rtl/ml_classifier_wrap.v \
+    rtl/ml_policy.v rtl/eth_mac_if.v rtl/common/sync_2ff.v rtl/common/mdio_ctrl.v \
+    rtl/common/delay_line.v tb/sim_models/tob_top_sim_leaves.v
+
+if [ ! -f tb/stimulus/tb_top_soak_in.mem ]; then
+    python sim/gen_top_soak_vectors.py --count 200 --seed 7 --out-prefix tb/stimulus/tb_top_soak
+fi
+run_tb tb_top rtl/tob_top.v rtl/frame_classifier.v rtl/md_parser.v \
     rtl/symbol_filter.v rtl/seq_monitor.v rtl/tob_engine.v rtl/signal_engine.v \
     rtl/risk_engine.v rtl/order_builder.v rtl/csr_block.v rtl/latency_histogram.v \
     rtl/feature_extractor.v rtl/feature_normalizer.v rtl/ml_classifier_wrap.v \

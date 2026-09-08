@@ -105,6 +105,7 @@ module tb_csr_block;
     reg        filt_dropped;
     reg        err_seq_dup;
     reg        seq_gap_pulse;
+    reg [31:0] seq_gap_amount;   // D44: real gap size, no longer a flat +1
     reg        cnt_book_clear_pulse;
     reg        cnt_trades_pulse;
     reg        cnt_heartbeats_pulse;
@@ -232,6 +233,7 @@ module tb_csr_block;
         .filt_dropped           (filt_dropped),
         .err_seq_dup            (err_seq_dup),
         .seq_gap_pulse          (seq_gap_pulse),
+        .seq_gap_amount         (seq_gap_amount),
         .cnt_book_clear_pulse   (cnt_book_clear_pulse),
         .cnt_trades_pulse       (cnt_trades_pulse),
         .cnt_heartbeats_pulse   (cnt_heartbeats_pulse),
@@ -331,6 +333,7 @@ module tb_csr_block;
             filt_dropped          = 1'b0;
             err_seq_dup           = 1'b0;
             seq_gap_pulse         = 1'b0;
+            seq_gap_amount        = 32'd0;
             cnt_book_clear_pulse  = 1'b0;
             cnt_trades_pulse      = 1'b0;
             cnt_heartbeats_pulse  = 1'b0;
@@ -639,7 +642,10 @@ module tb_csr_block;
                 C_ERR_MSG_TYPE: err_msg_type = 1'b1;
                 C_ERR_FLAGS:    err_flags = 1'b1;
                 C_ERR_SIG_CONF: err_signal_conflict = 1'b1;
-                C_SEQ_GAP:      seq_gap_pulse = 1'b1;
+                // D44: a distinctive non-1 amount (7), not 1 -- a mutant that
+                // reverts to a flat +1 per pulse must fail this check, not
+                // coincidentally pass it.
+                C_SEQ_GAP:      begin seq_gap_pulse = 1'b1; seq_gap_amount = 32'd7; end
                 C_SEQ_DUP:      err_seq_dup = 1'b1;
                 C_CROSSED:      cnt_crossed_pulse = 1'b1;
                 C_BOOK_CLEAR:   cnt_book_clear_pulse = 1'b1;
@@ -675,6 +681,7 @@ module tb_csr_block;
                                       ref[C_MSGS_RX]      = ref[C_MSGS_RX] + 1; end
                 C_ERR_FLAGS:    begin ref[C_ERR_FLAGS] = ref[C_ERR_FLAGS] + 1;
                                       ref[C_MSGS_RX]    = ref[C_MSGS_RX] + 1; end
+                C_SEQ_GAP:      ref[C_SEQ_GAP] = ref[C_SEQ_GAP] + 7;   // D44: by the gap (7), not by 1
                 default:        ref[idx] = ref[idx] + 1;
             endcase
         end
