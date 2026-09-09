@@ -119,22 +119,32 @@ def pick_thresholds(z_val: np.ndarray, y_val: np.ndarray) -> tuple[int, int]:
     Guard (docs/design_decisions.md D52): cumulative precision-at-k is only
     monotonically non-increasing in the well-behaved case. If the overall
     validation positive rate is itself >= TARGET_PRECISION, precision-at-k
-    can re-cross the target near k=N (all rows included), which would pick
-    t_high = z_val.min() -- a risk gate that fires on almost every row. The
-    search is restricted to the top half of the validation set by score so
-    t_high can never degenerate that far.
+    trivially clears the target almost everywhere (even for k=N, the full
+    set) purely because the base rate does -- this carries no real
+    discriminative signal and would otherwise let `hits[-1]` degenerate
+    t_high toward z_val.min(), a risk gate that fires on almost every row.
+    In that specific case, skip the precision-at-k search entirely and use
+    the percentile fallback directly. This guard is targeted at the actual
+    failure mode (base rate alone clearing the target) rather than an
+    arbitrary restriction on the search range, so it does not affect any
+    well-behaved case where the base rate is below target and precision-at-k
+    genuinely, monotonically crosses the target partway through the sorted
+    scores -- that search still runs over the FULL range unchanged.
     """
     order = np.argsort(-z_val)
     y_sorted = y_val[order]
-    cum_tp = np.cumsum(y_sorted)
-    cum_n = np.arange(1, len(y_sorted) + 1)
-    precision_at_k = cum_tp / cum_n
-    max_k = max(1, len(y_sorted) // 2)
-    hits = np.where(precision_at_k[:max_k] >= config.TARGET_PRECISION)[0]
-    if len(hits) > 0:
-        t_high = int(z_val[order][hits[-1]])
-    else:
+    base_rate = float(y_val.mean())
+    if base_rate >= config.TARGET_PRECISION:
         t_high = int(np.percentile(z_val, 95))
+    else:
+        cum_tp = np.cumsum(y_sorted)
+        cum_n = np.arange(1, len(y_sorted) + 1)
+        precision_at_k = cum_tp / cum_n
+        hits = np.where(precision_at_k >= config.TARGET_PRECISION)[0]
+        if len(hits) > 0:
+            t_high = int(z_val[order][hits[-1]])
+        else:
+            t_high = int(np.percentile(z_val, 95))
     t_low = t_high - config.HYSTERESIS_GAP
     return t_high, t_low
 
