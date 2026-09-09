@@ -14,7 +14,8 @@ sim:
 	bash scripts/run_sim.sh
 
 ml:
-	@echo "Owned by the ML collaborator -- see ml_engineer_brief.md."
+	cd model && python train.py
+	python scripts/gen_ml_bit_exact_vectors.py
 
 clean:
 	rm -rf results/build *.jou *.log .Xil
