@@ -176,24 +176,30 @@ def extract_features(
 
 
 def compute_labels(
-    mids: np.ndarray, horizon_h: int = config.LABEL_HORIZON_H
+    mids: np.ndarray, symbol_ids: np.ndarray, horizon_h: int = config.LABEL_HORIZON_H
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """y_buy[t] = 1 if mid[t+H] - mid[t] <= -1 else 0
        y_sell[t] = 1 if mid[t+H] - mid[t] >= +1 else 0
 
-    Events within H of the end of the stream have no valid future mid; their
-    `valid` flag is False and y_buy/y_sell are 0 (excluded from training/eval,
-    never treated as a real negative label).
+    A row is `valid` only if both an in-horizon future row exists AND that
+    future row belongs to the SAME symbol_id -- the dataset is many symbols'
+    scenarios concatenated back-to-back (simulator.generate_dataset), so
+    without the symbol check the lookahead for the last `horizon_h` rows of
+    every symbol would silently read a different, unrelated instrument's
+    freshly-reset price series (docs/design_decisions.md D52).
     """
     n = len(mids)
+    mids = np.asarray(mids, dtype=np.int64)
+    symbol_ids = np.asarray(symbol_ids)
     y_buy = np.zeros(n, dtype=np.int8)
     y_sell = np.zeros(n, dtype=np.int8)
     valid = np.zeros(n, dtype=bool)
-    for t in range(n - horizon_h):
-        delta = int(mids[t + horizon_h]) - int(mids[t])
-        y_buy[t] = 1 if delta <= -1 else 0
-        y_sell[t] = 1 if delta >= 1 else 0
-        valid[t] = True
+    if n > horizon_h:
+        delta = mids[horizon_h:] - mids[:-horizon_h]
+        same_symbol = symbol_ids[horizon_h:] == symbol_ids[:-horizon_h]
+        y_buy[:-horizon_h] = np.where(same_symbol & (delta <= -1), 1, 0)
+        y_sell[:-horizon_h] = np.where(same_symbol & (delta >= 1), 1, 0)
+        valid[:-horizon_h] = same_symbol
     return y_buy, y_sell, valid
 
 
@@ -258,7 +264,7 @@ if __name__ == "__main__":
 
     events = simulator.generate_dataset()
     seqs, mids, symbol_ids, sides, raw_feats = extract_features(events)
-    y_buy, y_sell, valid = compute_labels(mids, config.LABEL_HORIZON_H)
+    y_buy, y_sell, valid = compute_labels(mids, symbol_ids, config.LABEL_HORIZON_H)
     print(f"quote events with features: {len(seqs)}")
     print(f"labeled (valid) events: {valid.sum()} / {len(valid)}")
     print(f"events with a trading signal (side != 0): {(sides != 0).sum()} / {len(sides)}")

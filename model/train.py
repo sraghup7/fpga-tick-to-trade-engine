@@ -203,7 +203,7 @@ def main() -> None:
 
     events = simulator.generate_dataset()
     seqs, mids, symbol_ids, sides, raw_feats = ml_golden.extract_features(events)
-    y_buy, y_sell, horizon_valid = ml_golden.compute_labels(mids, config.LABEL_HORIZON_H)
+    y_buy, y_sell, horizon_valid = ml_golden.compute_labels(mids, symbol_ids, config.LABEL_HORIZON_H)
     if config.LABEL_COMBINE != "SIDE_CONDITIONED":
         raise ValueError(f"unknown LABEL_COMBINE {config.LABEL_COMBINE!r}")
     # y_adverse = y_buy where the signal rule would buy, y_sell where it would

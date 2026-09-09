@@ -137,7 +137,8 @@ def test_feature_extraction_hand_computed_case():
 
 def test_labels_horizon_and_validity():
     mids = np.array([100, 101, 102, 99, 95, 95, 95])
-    y_buy, y_sell, valid = ml_golden.compute_labels(mids, horizon_h=2)
+    symbol_ids = np.array([0, 0, 0, 0, 0, 0, 0])
+    y_buy, y_sell, valid = ml_golden.compute_labels(mids, symbol_ids, horizon_h=2)
     # t=0: mid[2]-mid[0] = 2  -> not <=-1, not >=1? it's >=1 -> y_sell=1
     assert valid[0] and y_sell[0] == 1 and y_buy[0] == 0
     # t=1: mid[3]-mid[1] = 99-101 = -2 -> y_buy=1
@@ -199,6 +200,29 @@ def test_extract_features_reports_sides():
     ]
     _, _, _, sides, _ = ml_golden.extract_features(events)
     assert list(sides) == [1, -1, 0]
+
+
+def test_labels_do_not_cross_symbol_boundary():
+    """mids[t+H] must never be read from a different symbol's series than
+    mids[t] -- the pre-fix bug computed a 'label' from an unrelated
+    instrument's freshly-reset price for the last H rows of every symbol."""
+    import numpy as np
+    import ml_golden
+
+    # symbol 0: constant mid=100 for 10 events (no real move -> label 0)
+    # symbol 1 starts immediately after with mid=100000 (huge jump) for 10 events
+    mids = np.array([100] * 10 + [100000] * 10, dtype=np.int64)
+    symbol_ids = np.array([0] * 10 + [1] * 10, dtype=np.int64)
+
+    y_buy, y_sell, valid = ml_golden.compute_labels(mids, symbol_ids, horizon_h=5)
+
+    # Rows 5..9 of symbol 0 would read mids[10..14] (symbol 1's huge jump) if
+    # the boundary weren't respected -- they must be marked invalid instead.
+    assert not valid[5:10].any(), "symbol-0 tail rows leaked into symbol 1's series"
+    # Rows 0..4 of symbol 0 stay in-bounds within symbol 0 and are valid,
+    # with a flat mid (no move) -> no buy/sell.
+    assert valid[0:5].all()
+    assert not y_buy[0:5].any() and not y_sell[0:5].any()
 
 
 if __name__ == "__main__":
