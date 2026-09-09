@@ -161,11 +161,33 @@ def export(
     y_val: np.ndarray,
 ) -> None:
     model_config = {
+        "status": (
+            "TRAINED (S4 pipeline, model/train.py). Replaces the master "
+            "spec Section 15 fallback placeholder (w_i=1, bias=0)."
+        ),
+        "notes": (
+            "PROXY LABEL: 'adverse' means the synthetic proxy defined in "
+            "ml_engineer_brief.md SS5 (mid moved >=1 tick against the "
+            "quoted side within LABEL_HORIZON_H future events) -- this is "
+            "NOT evidence about real market microstructure or real adverse "
+            "selection; simulated trading only. If CFG_MIN_SPREAD/"
+            "CFG_IMB_SHIFT (master spec SS9 registers 0x1C/0x20) are ever "
+            "retuned at runtime away from the values recorded below, this "
+            "model was trained against the OLD values and should be "
+            "re-trained -- see docs/design_decisions.md D52."
+        ),
+        "features": [
+            "F0_spread", "F1_mid_delta", "F2_imbalance", "F3_bid_chg",
+            "F4_ask_chg", "F5_update_rate", "F6_last_trade_dir", "F7_volatility",
+        ],
         "seed": config.SEED,
         "window_w": config.WINDOW_W,
         "window_includes_current": config.WINDOW_INCLUDES_CURRENT,
         "label_horizon_h": config.LABEL_HORIZON_H,
         "label_combine": config.LABEL_COMBINE,
+        "cfg_min_spread": config.CFG_MIN_SPREAD,
+        "cfg_imb_shift": config.CFG_IMB_SHIFT,
+        "weight_quant_headroom": config.WEIGHT_QUANT_HEADROOM,
         "num_features": config.NUM_FEATURES,
         "feature_range": [config.FEATURE_MIN, config.FEATURE_MAX],
         "weight_range": [config.WEIGHT_MIN, config.WEIGHT_MAX],
@@ -185,8 +207,22 @@ def export(
     }
     (MODEL_DIR / "model_config.json").write_text(json.dumps(model_config, indent=2) + "\n")
 
-    (MODEL_DIR / "weights.mem").write_text("\n".join(str(int(w)) for w in weights_i8) + "\n")
-    (MODEL_DIR / "bias.mem").write_text(f"{int(bias_i32)}\n")
+    # $readmemh-compatible hex: rtl/ml_classifier_wrap.v:59-60 and
+    # sim/ml_golden.py's _read_int8s/_read_int32 both parse these as
+    # two's-complement hex, NOT decimal (docs/design_decisions.md D52 --
+    # the pre-fix decimal export either fatal-errored $readmemh on the '-'
+    # character or silently mis-parsed unsigned-looking values as hex).
+    def _hex_i8(v: int) -> str:
+        return format(int(v) & 0xFF, "02x")
+
+    def _hex_i32(v: int) -> str:
+        return format(int(v) & 0xFFFFFFFF, "08x")
+
+    (MODEL_DIR / "weights.mem").write_text(
+        "\n".join(_hex_i8(w) for w in weights_i8) + "\n"
+    )
+    (MODEL_DIR / "bias.mem").write_text(_hex_i32(bias_i32) + "\n")
+
     with (MODEL_DIR / "normalization.mem").open("w") as f:
         for o, s in zip(offsets.tolist(), shifts.tolist()):
             f.write(f"{o} {s}\n")
@@ -200,8 +236,8 @@ def export(
             writer.writerow(list(int(v) for v in row_x) + [int(z), int(a), int(y)])
 
     print(
-        "\nexported model_config.json, weights.mem, bias.mem, normalization.mem, "
-        f"thresholds.mem, golden_vectors.csv ({len(y_val)} rows) to {MODEL_DIR}"
+        "\nexported model_config.json, weights.mem (hex), bias.mem (hex), "
+        f"normalization.mem, thresholds.mem, golden_vectors.csv ({len(y_val)} rows) to {MODEL_DIR}"
     )
 
 

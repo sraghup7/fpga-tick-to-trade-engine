@@ -12,4 +12,5 @@ normalization.mem        per-feature normalization constants
 golden_vectors.csv       exported vectors for hls4ml csim vs. ml_golden.py bit-exactness check
 ```
 
-Nothing here yet.
+Populated by `python model/train.py` (2026-09-09, docs/design_decisions.md D52). `weights.mem`/`bias.mem`
+are `$readmemh`-format hex, matching `rtl/ml_classifier_wrap.v`'s load contract exactly.
