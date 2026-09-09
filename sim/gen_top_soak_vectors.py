@@ -193,7 +193,11 @@ def _compute_adverse_risk_stream(
     it can and does track the count correctly itself."""
     books: dict[int, _ShadowBook] = {s: _ShadowBook() for s in symbols}
     tracker = FeatureTracker(window=16)
-    clf = MLClassifier(th_high=ML_TH_HIGH, th_low=ML_TH_LOW)
+    clf = MLClassifier(
+        th_high=ML_TH_HIGH, th_low=ML_TH_LOW,
+        weights_path="tb/stimulus/ml_placeholder_weights.mem",
+        bias_path="tb/stimulus/ml_placeholder_bias.mem",
+    )
     safe_forced_count = 0
 
     # Shadow seq-gap tracking -- same rule as golden_model.py's own
