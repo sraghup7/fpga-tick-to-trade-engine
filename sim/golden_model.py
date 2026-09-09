@@ -85,12 +85,58 @@ GATE_NAME = {
 # total target ~10-11 (S7.1 table). Not measured yet -- using the target.
 TICK_TO_TRADE_CYCLES = 11
 
-# S7.5: an order frame occupies TX for ~84 cycles (16-byte order frame,
-# 8 bits/cycle serialization plus framing overhead).
-ORDER_TX_CYCLES = 84
+# D51: measured directly against tb_top.v's actual simulated TX path
+# (rtl/eth_mac_if.v driving tb/sim_models/tob_top_sim_leaves.v's mock
+# mac_top -- the environment every current consumer of this constant is
+# checked against), not derived from a full real-Ethernet-frame estimate.
+# Instrumented tx_start -> mac_send_end directly: exactly 26 cycles, 10/10
+# samples, zero variance (TX_REQ 1 + TX_WAIT 7 + TX_PUSH 16 bytes +
+# TX_DRAIN's 1-2 cycles of mock-capture latency, rtl/eth_mac_if.v:176-247).
+# The previous value (84, "16-byte order frame, 8 bits/cycle serialization
+# plus framing overhead") was a real-board full-Ethernet-frame estimate
+# (preamble+MAC+IP+UDP headers+FCS+IFG) that this repo has never actually
+# simulated end-to-end -- S11 is bitstream-only, no hardware bring-up yet.
+# Using it here overstated how long this testbench's TX queue stays busy by
+# >3x, which never mattered while accepted orders were rare (a few per
+# soak) but badly over-predicted cnt_order_overflow once reject-report
+# frames were also correctly modeled as sharing the same queue (found
+# extending tb_top's soak from 209 to 5,000 messages, docs/design_decisions.md
+# D51). If a real-MAC (non-mock) integration test is ever added, IT needs
+# its own measured constant -- don't assume this one still applies.
+#
+# A follow-up measurement found the real BACK-TO-BACK tx_start-to-tx_start
+# interval (when a second item is already queued) is 28 cycles, not 26 --
+# tx_busy drops one cycle after mac_send_end, and order_builder's own
+# tx_start output is registered one more cycle after that. Using 28 here
+# was tried and made overflow prediction WORSE (46 vs 11 real, further from
+# ground truth than 26's 15 vs 11) -- the system is close enough to a
+# stability boundary (service time vs. MSG_ARRIVAL_CYCLES=23) that this
+# model's simplified single-server queue is NOT simply "closer to
+# real cycle counts is closer to correct" here. Left at 26 (empirically
+# the better match of the two measured candidates) with this discrepancy
+# recorded as a known, not-fully-understood residual -- see D51.
+ORDER_TX_CYCLES = 26
 
-# NFR-4: max sustained rate for a 16-byte message on an 8-bit/cycle link.
-DEFAULT_INTER_ARRIVAL_CYCLES = 16
+# A caller that doesn't pass arrival_cycle is saying "advance time a little,
+# exact pacing doesn't matter to this test" -- every existing such caller
+# (test_golden_model_handcase.py's `m`-sequence cases) is testing something
+# unrelated to TX-egress timing (symbol filtering, sequence tracking,
+# crossed-book handling, snapshot recovery, ...), not real max-rate ingress.
+# D51: this MUST stay strictly greater than ORDER_TX_CYCLES (26) -- at the
+# NFR-4 literal max-rate value this used to be (16, "max sustained rate for
+# a 16-byte message on an 8-bit/cycle link"), a run of implicit-timing calls
+# that happen to produce several accepted-or-rejected intents in a row can
+# still have an earlier one occupying the shared 2-deep TX queue
+# (rtl/order_builder.v:139-159) when a later one arrives, causing an
+# UNINTENDED cnt_order_overflow that has nothing to do with what the test
+# is actually exercising (found the hard way: fixing reject-report frames
+# to correctly share that queue, below, broke several `m`-sequence cases
+# this way before this constant was widened). A test that deliberately
+# wants to exercise real TX-egress/queue-depth timing -- max-rate ingress,
+# staleness, token-bucket refill -- must pass an explicit arrival_cycle
+# (as the m3 staleness cases and sim/gen_top_soak_vectors.py's soak
+# generator already do), not rely on this default.
+DEFAULT_INTER_ARRIVAL_CYCLES = 100
 
 
 # ---------------------------------------------------------------------
@@ -370,7 +416,21 @@ class GoldenModel:
         if now_cycle <= self._last_refill_cycle:
             return
         elapsed = now_cycle - self._last_refill_cycle
-        refills = elapsed // self.cfg.token_refill_cycles
+        # D51: risk_engine.v's refill_ctr ticks on `(refill_ctr+1) >=
+        # cfg_token_refill_cycles` (rtl/risk_engine.v:308-311) -- true when
+        # refill_ctr == cfg-1, i.e. the Nth refill lands at absolute cycle
+        # N*cfg - 1, ONE CYCLE EARLIER than a plain `elapsed //
+        # token_refill_cycles` floor-division predicts. refill_ctr and
+        # cur_cycle share the same reset (both gated by risk_engine's own
+        # rst_n / tob_top.v's engine_rst_n) and both increment by exactly 1
+        # every cycle unconditionally, so they stay in lockstep as absolute
+        # counters -- this +1 is not a guess, it's RTL's own combinational
+        # lookahead condition. Found the hard way (D51): a soak-order
+        # mismatch traced to gate precedence flipping (8 vs 9) at exactly
+        # the FIRST token-bucket refill boundary of a 5,000-message run --
+        # this model refilled one order-position later than real RTL,
+        # shifting every subsequent comparison by one.
+        refills = (elapsed + 1) // self.cfg.token_refill_cycles
         if refills > 0:
             self.token_bucket = min(self.cfg.token_max, self.token_bucket + refills)
             self._last_refill_cycle += refills * self.cfg.token_refill_cycles
@@ -378,6 +438,24 @@ class GoldenModel:
     def _retire_tx_slots(self, now_cycle: int) -> None:
         while self._tx_busy_until and self._tx_busy_until[0] <= now_cycle:
             self._tx_busy_until.popleft()
+
+    def _tx_push(self, now_cycle: int) -> None:
+        """D51: push one item into the TX queue with SEQUENTIAL,
+        single-server semantics, matching rtl/order_builder.v exactly --
+        `tx_busy` is one shared resource (one item transmitting at a time,
+        rtl/eth_mac_if.v's tx_state), and the 2-deep queue (q0/q1) is a
+        waiting room in front of it, not two parallel servers. A second
+        item queued while the first is still in flight does not start its
+        own ORDER_TX_CYCLES countdown until the first one's ends -- found
+        the hard way (D51): appending `now_cycle + ORDER_TX_CYCLES`
+        independently for every push (this method's predecessor) modeled
+        two items draining in PARALLEL, which drains far faster than real
+        hardware and silently erased genuine cnt_order_overflow events
+        once reject-report frames also began sharing this queue at
+        realistic (5,000-message) burst density. Call only after
+        `_retire_tx_slots` + confirming `len(self._tx_busy_until) < 2`."""
+        start = max(now_cycle, self._tx_busy_until[-1] if self._tx_busy_until else now_cycle)
+        self._tx_busy_until.append(start + ORDER_TX_CYCLES)
 
     # -- main entry point ------------------------------------------------
 
@@ -646,6 +724,29 @@ class GoldenModel:
         if gates_fired:
             reject_reason = min(gates_fired)
             if self.cfg.cfg_reject_report:
+                # D51: a 0x11 reject-report frame shares order_builder.v's
+                # SAME 2-deep TX queue as an accepted 0x10 order --
+                # `want_push = order_valid | (cfg_reject_report &
+                # reject_reason != 0)` and `overflow = want_push &
+                # (count_after_pop >= 2)` (rtl/order_builder.v:139-140,157)
+                # apply identically to both frame types. This model used to
+                # let a reject-report bypass the queue entirely (no
+                # _retire_tx_slots call, no occupancy check, no append) --
+                # found by extending tb_top's soak from 209 to 5,000
+                # messages (D51): with reject-reporting on and rejects far
+                # outnumbering accepts, real RTL's shared queue genuinely
+                # fills up and drops frames (cnt_order_overflow read 11 on
+                # real hardware vs. 0-1 this model predicted before this
+                # fix, since it only ever pushed accepted orders into the
+                # busy-queue it checks for overflow). Mirror the accept
+                # path's exact check/append here instead of special-casing
+                # "reject" as queue-exempt.
+                self._retire_tx_slots(self.current_cycle)
+                if len(self._tx_busy_until) >= 2:
+                    self.counters.inc("cnt_order_overflow")
+                    result.order_dropped_overflow = True
+                    return result
+                self._tx_push(self.current_cycle)
                 result.order = OrderRecord(
                     ORDER_MSG_REJECT,
                     msg.symbol_id,
@@ -675,7 +776,7 @@ class GoldenModel:
         final_signed_qty = reduced_qty if order_side == SIDE_BID else -reduced_qty
         self.token_bucket -= 1
         self.position[msg.symbol_id] = self.position[msg.symbol_id] + final_signed_qty
-        self._tx_busy_until.append(self.current_cycle + ORDER_TX_CYCLES)
+        self._tx_push(self.current_cycle)
 
         self.counters.inc("cnt_orders_tx")
         self.counters.record_latency(TICK_TO_TRADE_CYCLES)

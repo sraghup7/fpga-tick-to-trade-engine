@@ -3263,6 +3263,173 @@ change, not an internal refactor).
 
 ---
 
+## D51 — T26 soak extended 209→5,000 messages; found and fixed five latent golden-model timing bugs; one dense-burst TX-queue discrepancy remains open
+
+**Status: soak extended, five real bugs fixed, one residual investigated and
+documented as a known limitation (not fixed).** Closes the §0 `T26_soak`
+gap's most actionable half: a literal 1,000,000-message *full-datapath*
+soak was measured directly and found infeasible (see below) and is
+explicitly NOT pursued; the *full-datapath* comparison (`tb/tb_top.v`,
+previously 209 messages) is raised to 5,000 — a genuine ~24x increase in
+state-space coverage — while the existing 1,000,000-message soak
+(`tb_parser_soak`) correctly continues to cover only `frame_classifier`+
+`md_parser`, which is cheap enough at that depth for a reason (below).
+
+**Why not literal 1,000,000 messages through the full datapath (measured,
+not assumed):** timed `tb_top`'s full-datapath soak directly at 200,000
+messages — **16m47s wall-clock**, vs. the existing parser-only 1,000,000-message
+soak's ~3 minutes for a 2-module pipeline. Extrapolating linearly, a literal
+1,000,000-message full-datapath run is on the order of **80-90 minutes**,
+untenable for `make sim`/CI on every push and a poor use of even occasional
+manual verification time. 5,000 messages runs in **~15-30 seconds** — a wide margin below the point this stops being routine.
+
+**Five real, latent bugs found and fixed in `sim/golden_model.py` while
+raising the soak size (a 209-message soak was never dense/long enough to
+expose any of them — all five are genuine fidelity gaps, not new bugs
+introduced by this work):**
+
+1. **Default arrival-cycle timing never matched any real testbench pacing.**
+   `DEFAULT_INTER_ARRIVAL_CYCLES` (used whenever a caller passes
+   `arrival_cycle=None`) was 16 — an NFR-4 "theoretical max ingress rate"
+   figure, not `tb_top.v`'s actual per-message cadence. `sim/gen_top_soak_vectors.py`
+   now passes an EXPLICIT `arrival_cycle`, measured directly against real
+   RTL (not derived from reading Verilog — a first attempt at hand-counting
+   `rx_frame_paced`/`csr_write`'s cycle cost got both wrong): instrumenting
+   `dut.cur_cycle` at each of the first 20 real message injections showed
+   the first message lands at `cur_cycle=495`, every subsequent one exactly
+   23 cycles later, 19/19 samples, zero variance. New constants
+   `MSG_ARRIVAL_CYCLES=23`/`CSR_SETUP_CYCLES=495` in `gen_top_soak_vectors.py`
+   encode this measurement, with the hand-counting attempt's wrong values
+   (24/66) documented inline as a caution against re-deriving from source
+   instead of measuring.
+2. **Reject-report (`0x11`) frames were completely exempt from TX-queue
+   overflow modeling.** `rtl/order_builder.v:139-140` : `want_push =
+   order_valid | (cfg_reject_report & reject_reason != 0)` — a reject
+   report shares the exact same 2-deep TX queue as an accepted order, and
+   `overflow` is judged against the combined occupancy (line 157). The
+   model's `process_message` reject path used to build an `OrderRecord` and
+   return with zero interaction with `_tx_busy_until` at all. With
+   reject-reporting on and rejects vastly outnumbering accepts (a realistic
+   soak condition, not a corner case), real RTL's queue genuinely fills and
+   drops frames — `cnt_order_overflow` read 11 on real RTL at 5,000
+   messages vs. 0-1 this model predicted before the fix. Fixed: the reject
+   path now runs through the identical `_retire_tx_slots`/occupancy-check/
+   `_tx_push` sequence the accept path already used.
+3. **The TX queue was modeled as two independent parallel timers, not a
+   correct single-server sequential queue.** The old `_tx_busy_until.append(now
+   + ORDER_TX_CYCLES)` gave every queued item its OWN clock starting at ITS
+   OWN push time — modeling two items draining in PARALLEL. Real
+   `order_builder.v`/`eth_mac_if.v` serve one item at a time (`tx_busy` is a
+   single shared resource); a second queued item's own service window does
+   not start until the first one's ends. New `GoldenModel._tx_push()`
+   computes each item's start as `max(now_cycle, <previous item's end>)`,
+   correctly chaining service times. Directly unit-tested against a
+   synthetic 100%-fire-rate burst (23-cycle arrivals, 26-cycle service):
+   overflow first appears at push #14, matching the closed-form prediction
+   exactly (drift of `ORDER_TX_CYCLES - MSG_ARRIVAL_CYCLES` cycles/push
+   crosses one whole service period after `⌈period / drift⌉` pushes).
+4. **`ORDER_TX_CYCLES=84` was a real-board full-Ethernet-frame estimate,
+   never validated against what this repo actually simulates.** The comment
+   said "16-byte order frame, 8 bits/cycle serialization plus framing
+   overhead" — a preamble+MAC+IP+UDP+FCS+IFG estimate for a REAL PHY, which
+   this repo has never simulated end-to-end (S11 is bitstream-only, no
+   hardware bring-up yet). `tb_top.v`'s actual environment
+   (`rtl/eth_mac_if.v` driving `tb/sim_models/tob_top_sim_leaves.v`'s mock
+   `mac_top`) only captures the 16 payload bytes and signals done — nowhere
+   near 84 cycles. Instrumented `tx_start`→`mac_send_end` directly: 26
+   cycles, 10/10 samples, zero variance. Corrected `ORDER_TX_CYCLES` to 26.
+   (A follow-up measurement found the real back-to-back tx_start-to-tx_start
+   interval is 28, not 26 — `tx_busy` drops one cycle after `mac_send_end`,
+   and `order_builder.v`'s own `tx_start` output is registered one cycle
+   after `pop_this_cycle`. Trying 28 instead of 26 was tested and made
+   overflow prediction WORSE — 46 vs. 11 real, versus 26's 15 vs. 11 — the
+   system sits close enough to a stability boundary between
+   `MSG_ARRIVAL_CYCLES` and the service period that "closer to the real
+   per-event cycle count" is not simply "closer to correct" for this
+   simplified closed-form queue model. Left at 26, empirically the better
+   of the two measured candidates, with this open question recorded below.)
+5. **Token-bucket refill boundary was off by one cycle.**
+   `rtl/risk_engine.v:308-311`: `refill_tick = (refill_ctr+1) >=
+   cfg_token_refill_cycles` — true when `refill_ctr == cfg-1`, i.e. the Nth
+   refill lands at absolute cycle `N*cfg - 1`, one cycle EARLIER than the
+   model's plain `elapsed // token_refill_cycles` floor-division predicted.
+   `refill_ctr` and `cur_cycle` share the same reset and both increment by
+   exactly 1 every cycle, so they stay in lockstep as absolute counters —
+   confirmed directly (not assumed) by tracing `dut.u_risk.token_bucket`
+   through the soak's first refill boundary. Fixed:
+   `refills = (elapsed + 1) // token_refill_cycles` in `_refill_tokens`.
+   This is real and correct on its own terms, but — see below — turned out
+   not to be what was causing the specific divergence it was first found
+   investigating; a **verification mistake** (below) briefly credited it
+   with fixing that divergence.
+
+**One real testbench bug found and fixed (`tb/tb_top.v`), independent of
+the golden-model fixes above:** §10 invariant 2's reject-frame count
+(`reject_frames`) was tallied over `for (k = 0; k < soak_expected_count;
+...)` — the GOLDEN MODEL's predicted order count — instead of
+`captured_count`, the REAL number of frames RTL actually transmitted. This
+invariant's entire point is to check real RTL against ITSELF, independent
+of golden-model accuracy (the block's own header comment says so) — using
+the model's count as the loop bound silently truncated the scan whenever
+the two disagree, manufacturing a spurious "invariant violation" that was
+actually just the wrong loop bound (found at 5,000 messages, where
+`captured_count=1640 > soak_expected_count=1636` left the last 4 real
+frames uncounted). Fixed by bounding the loop on `captured_count`; this
+resolved invariant 2 cleanly, with no need to relax it.
+
+**One residual discrepancy, root-caused but not fixed — recorded as a
+known limitation, not silently hidden:** at the densest bursts this soak's
+"trigger" scenario produces, `cnt_order_overflow` still reads differently
+between real RTL and the (now much-improved) model — 11 real vs. 15
+predicted at seed=7, cascading into an order-index misalignment from order
+#199 onward once printed order-by-order (root cause for #199 specifically:
+confirmed a real reject-reason gate-precedence flip, gate 8/throttle vs.
+gate 9/ML — the model believes the token bucket is empty one intent earlier
+or later than real RTL does at that exact point, most likely from an
+earlier, still-unidentified token-CONSUMPTION-count divergence rather than
+the refill-boundary fix above, since neither the old nor the fixed refill
+formula changes behavior at that specific message's arrival cycle — traced
+this far and stopped; a full fix needs diffing the complete accept/reject
+decision sequence from message 0 forward, out of scope for this pass).
+Two attempts to close this via more accurate TX-service timing (D51 item 4
+above) made it WORSE, not better, suggesting the real gap is upstream of
+TX-queue timing entirely (in the earlier token-consumption history) rather
+than in the queue model itself.
+
+**Verification mistake made and corrected during this investigation, noted
+for process reasons:** twice concluded a mismatch was fixed by checking
+only the TAIL of a mismatch report capped at "stop after 20 mismatches" —
+in a report with over 20 total mismatches plus several trailing summary
+lines, `tail -N` truncates the EARLIEST mismatches, not the latest,
+silently hiding an early divergence (order #199) while a later one (order
+#396) remained visible. Re-verified with the cap raised to effectively
+unlimited before drawing any conclusion from then on. Left as a note here
+because it directly caused an incorrect claim mid-investigation (that the
+refill-boundary fix, item 5 above, had resolved order #199 — it had not).
+
+**Resolution for the residual (explicit user decision):** ship the five
+real golden-model fixes and the testbench loop-bound fix — all independently
+verified, all regression-tested (full `bash scripts/run_sim.sh`, including
+the 1,000,000-message parser soak, passes). For the 5,000-message soak
+specifically, the order-by-order comparison and the two counters it traces
+to (`cnt_rej_throttle` index 31, `cnt_order_overflow` index 34) are demoted
+from `FAIL` to `WARN (D51)` in `tb/tb_top.v` — reported in full (no
+truncation now that the display cap only limits detail lines, not the
+counted total), not silently dropped — while every other counter (33/35),
+invariants 1/3/4/5, and the message-level counts stay hard failures. A
+genuine future regression in anything else this task covers is still
+caught; this one known, root-caused-as-far-as-practical gap is not
+allowed to block `make sim`/CI on every push.
+
+**Independently verified:** full `bash scripts/run_sim.sh` (including the
+1,000,000-message `tb_parser_soak`) passes; every Python hand-case
+(`test_golden_model_handcase.py`, `test_feature_golden_handcase.py`,
+`test_ml_golden_handcase.py`) passes unchanged after each of the five
+golden-model fixes, confirming none of them regressed any smaller-scale,
+already-verified behavior.
+
+---
+
 ## Summary — §17 open question disposition
 
 | # | Question | Resolution |

@@ -119,7 +119,7 @@ run_tb tb_tob_top rtl/tob_top.v rtl/frame_classifier.v rtl/md_parser.v \
     rtl/common/delay_line.v tb/sim_models/tob_top_sim_leaves.v
 
 if [ ! -f tb/stimulus/tb_top_soak_in.mem ]; then
-    python sim/gen_top_soak_vectors.py --count 200 --seed 7 --out-prefix tb/stimulus/tb_top_soak
+    python sim/gen_top_soak_vectors.py --count 5000 --seed 7 --out-prefix tb/stimulus/tb_top_soak
 fi
 run_tb tb_top rtl/tob_top.v rtl/frame_classifier.v rtl/md_parser.v \
     rtl/symbol_filter.v rtl/seq_monitor.v rtl/tob_engine.v rtl/signal_engine.v \

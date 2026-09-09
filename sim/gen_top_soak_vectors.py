@@ -33,8 +33,11 @@ Directed per-gate coverage (reject reasons 0x01-0x09) is NOT generated
 here -- it lives directly in tb/tb_top.v as hand-written cases, matching
 tb_tob_top.v's own proven style (docs/contracts/tb_top_integration.md S3.5).
 This generator only produces the broader randomized-soak stream: a realistic
-mix of feed_gen.py's normal/crossed/gaps/trigger scenarios at normal
-(16-cycle) message cadence, default Config() (== RTL reset defaults,
+mix of feed_gen.py's normal/crossed/gaps/trigger scenarios at
+tb/tb_top.v's own real, MEASURED message cadence (see MSG_ARRIVAL_CYCLES/
+CSR_SETUP_CYCLES below -- not golden_model.py's generic
+DEFAULT_INTER_ARRIVAL_CYCLES, which is deliberately for callers that don't
+care about exact timing), default Config() (== RTL reset defaults,
 cross-checked against rtl/csr_block.v's own reset assignments), with ML
 thresholds widened so gate 0x09 doesn't dominate every other gate's
 coverage (mirroring tb_tob_top.v's own T1 rationale for why default
@@ -98,8 +101,6 @@ from feed_gen import iter_scenario
 # actually fires too, not just SET.
 ML_TH_HIGH = 250
 ML_TH_LOW = -100
-
-DEFAULT_INTER_ARRIVAL_CYCLES = 16  # matches golden_model.py's own default
 
 # Fixed output order for tb_top_soak_expected_counters.txt -- one integer
 # per line, NO names, matching rtl/csr_block.v's own register-map order
@@ -303,6 +304,42 @@ def _warmup_messages(symbols: tuple[int, ...]) -> list[Message]:
     return out
 
 
+# D51: tb/tb_top.v's rx_frame_paced (its real per-message injection task for
+# this soak) advances the RTL a fixed number of cycles per message -- NOT
+# golden_model.py's generic DEFAULT_INTER_ARRIVAL_CYCLES=16 (an NFR-4
+# "theoretical max wire rate" approximation, never this testbench's actual
+# pacing). At a few hundred messages the resulting drift versus the model's
+# assumption is too small to matter -- rx_frame_paced's own comment says as
+# much, citing TOKEN_REFILL_CYCLES=12500. It stops being negligible once the
+# soak is long enough for the ACCUMULATED drift to cross a refill-period
+# boundary at a different message than the model expects: confirmed
+# directly raising this soak from 209 to 5,000 messages
+# (docs/design_decisions.md D51). Passing an explicit arrival_cycle here,
+# advancing by this soak's REAL per-message cycle cost, is not "deriving
+# the golden model from the RTL" (golden models are written from spec, not
+# RTL) -- it is calibrating the model's notion of elapsed wall-clock time to
+# match the fixed, deterministic pacing THIS testbench actually uses, which
+# is a property of the test harness, not the design under test.
+#
+# Both constants below are MEASURED, not hand-derived from reading
+# rx_frame_paced's/csr_write's Verilog source -- a first attempt at
+# hand-counting cycles from the task code got both wrong (24 instead of 23
+# for the steady-state spacing, 66 instead of 495 for the setup offset,
+# the latter because it missed bring_up's own reset-release delay and
+# undercounted csr_write's real negedge/posedge-crossing cost) and produced
+# a soak that still silently disagreed with real RTL starting a few hundred
+# messages in. Measured instead by instrumenting tb_top.v directly:
+# printing `dut.cur_cycle` (the same free-running absolute-cycle register
+# risk_engine.v's token-bucket refill counts against, tob_top.v:656-659) at
+# each of the first 20 real message injections. Message 0 landed at
+# cur_cycle=495; every subsequent message landed exactly 23 cycles after
+# the previous one, 19/19 samples, zero variance. If tb_top.v's bring_up/
+# csr_write/rx_frame_paced timing ever changes, these two constants must be
+# re-measured the same way, not re-derived by reading the Verilog.
+MSG_ARRIVAL_CYCLES = 23
+CSR_SETUP_CYCLES = 495
+
+
 def generate(count: int, seed: int) -> tuple[list[bytes], list[bytes], dict]:
     """Returns (input_frame_payloads, expected_order_record_bytes,
     expected_counters_dict)."""
@@ -389,9 +426,17 @@ def generate(count: int, seed: int) -> tuple[list[bytes], list[bytes], dict]:
         idx[0] += 1
         return v
 
+    # D51: explicit arrival_cycle, advancing by this soak's REAL per-message
+    # cadence (MSG_ARRIVAL_CYCLES, matching tb_top.v's rx_frame_paced) rather
+    # than relying on golden_model.py's generic 16-cycle default -- see the
+    # constants' own comment above for why this stopped being negligible
+    # once this soak got long enough to accumulate real refill-boundary
+    # drift.
+    arrival_cycle = CSR_SETUP_CYCLES
     expected_orders: list[bytes] = []
     for payload in payloads:
-        results = gm.process_frame(payload, arrival_cycle=None, adverse_risk_fn=adverse_risk_fn)
+        results = gm.process_frame(payload, arrival_cycle=arrival_cycle, adverse_risk_fn=adverse_risk_fn)
+        arrival_cycle += MSG_ARRIVAL_CYCLES
         for r in results:
             if r.order is not None:
                 expected_orders.append(r.order.encode())
