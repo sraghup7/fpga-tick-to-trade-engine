@@ -283,7 +283,7 @@ def main() -> None:
     print(f"thresholds: T_high={t_high} T_low={t_low}")
 
     y_pred = (z_val >= t_high).astype(np.int8)
-    adverse_risk = ml_golden.hysteresis_policy(z_val, t_high, t_low)
+    adverse_risk = ml_golden.hysteresis_policy(z_val, symbol_ids[val_idx], t_high, t_low)
 
     # --- Phase B baselines (brief SS6) ---
     rule_pred = threshold_rule_baseline(raw_feats[val_idx])

@@ -243,14 +243,24 @@ def classify(x_int8: np.ndarray, weights: np.ndarray, bias: int) -> np.ndarray:
     return z.astype(np.int32)
 
 
-def hysteresis_policy(z: np.ndarray, t_high: int, t_low: int) -> np.ndarray:
+def hysteresis_policy(
+    z: np.ndarray, symbol_ids: np.ndarray, t_high: int, t_low: int
+) -> np.ndarray:
     """Recommended ml_policy.v behavior (Schmitt trigger): adverse_risk goes
-    high once z >= t_high and stays high until z <= t_low. RTL implements the
-    actual gate; this is only the reference used to pick/evaluate thresholds.
+    high once z >= t_high and stays high until z <= t_low. Resets to 0 at
+    every symbol_id boundary, matching ml_policy.v's actual PER-SYMBOL
+    hysteresis state (docs/design_decisions.md D47) -- without this, a
+    validation symbol's first row could inherit a completely unrelated
+    symbol's latched state (D52). RTL implements the actual gate; this is
+    only the reference used to pick/evaluate thresholds.
     """
     out = np.zeros(len(z), dtype=np.int8)
     state = 0
-    for i, zi in enumerate(z):
+    prev_symbol = None
+    for i, (zi, sid) in enumerate(zip(z, symbol_ids)):
+        if sid != prev_symbol:
+            state = 0
+            prev_symbol = sid
         if state == 0 and zi >= t_high:
             state = 1
         elif state == 1 and zi <= t_low:

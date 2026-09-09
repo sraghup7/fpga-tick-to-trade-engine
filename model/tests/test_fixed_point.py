@@ -78,7 +78,8 @@ def test_classify_batch_shape():
 
 def test_hysteresis_policy_schmitt_trigger():
     z = np.array([0, 5, 15, 15, 4, 2, 15, 2])
-    out = ml_golden.hysteresis_policy(z, t_high=10, t_low=3)
+    symbol_ids = np.array([0, 0, 0, 0, 0, 0, 0, 0])
+    out = ml_golden.hysteresis_policy(z, symbol_ids, t_high=10, t_low=3)
     # rises to 1 once z hits 15 (idx2), stays 1 through idx3 (15) and idx4 (4,
     # above t_low), drops at idx5 (2 <= t_low), rises again at idx6 (15).
     assert list(out) == [0, 0, 1, 1, 1, 0, 1, 0]
@@ -223,6 +224,21 @@ def test_labels_do_not_cross_symbol_boundary():
     # with a flat mid (no move) -> no buy/sell.
     assert valid[0:5].all()
     assert not y_buy[0:5].any() and not y_sell[0:5].any()
+
+
+def test_hysteresis_resets_at_symbol_boundary():
+    import numpy as np
+    import ml_golden
+
+    # symbol 0 ends in the adverse (high) state; symbol 1 starts with a
+    # hold-zone score that should NOT inherit symbol 0's "already flagged"
+    # state.
+    z = np.array([0, 30, 30, 5, 5], dtype=np.int32)          # last two rows = symbol 1
+    symbol_ids = np.array([0, 0, 0, 1, 1], dtype=np.int64)
+    out = ml_golden.hysteresis_policy(z, symbol_ids, t_high=20, t_low=-20)
+
+    assert out[2] == 1, "symbol 0 should be latched adverse after z=30"
+    assert out[3] == 0, "symbol 1's first row (hold-zone z=5) must start at 0, not inherit symbol 0's state"
 
 
 if __name__ == "__main__":
