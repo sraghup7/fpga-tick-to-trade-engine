@@ -104,6 +104,8 @@ run_tb tb_signal_engine rtl/signal_engine.v
 run_tb tb_signal_tob_chain rtl/tob_engine.v rtl/signal_engine.v
 run_tb tb_feature_tob_chain rtl/tob_engine.v rtl/feature_extractor.v
 run_tb tb_ml_classifier_wrap rtl/ml_classifier_wrap.v
+python scripts/gen_ml_bit_exact_vectors.py
+run_tb tb_ml_bit_exact rtl/ml_classifier_wrap.v
 run_tb tb_ml_policy rtl/ml_policy.v rtl/common/delay_line.v
 run_tb tb_ml_chain rtl/tob_engine.v rtl/feature_extractor.v rtl/feature_normalizer.v rtl/ml_classifier_wrap.v rtl/ml_policy.v rtl/common/delay_line.v
 run_tb tb_risk_engine rtl/risk_engine.v rtl/common/delay_line.v
