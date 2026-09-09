@@ -115,13 +115,22 @@ def pick_thresholds(z_val: np.ndarray, y_val: np.ndarray) -> tuple[int, int]:
     precision. T_low sits HYSTERESIS_GAP below it (brief SS2/SS9.2: these are
     *recommended* values -- ml_policy.v in RTL owns the actual comparison and
     can retune them at runtime).
+
+    Guard (docs/design_decisions.md D52): cumulative precision-at-k is only
+    monotonically non-increasing in the well-behaved case. If the overall
+    validation positive rate is itself >= TARGET_PRECISION, precision-at-k
+    can re-cross the target near k=N (all rows included), which would pick
+    t_high = z_val.min() -- a risk gate that fires on almost every row. The
+    search is restricted to the top half of the validation set by score so
+    t_high can never degenerate that far.
     """
     order = np.argsort(-z_val)
     y_sorted = y_val[order]
     cum_tp = np.cumsum(y_sorted)
     cum_n = np.arange(1, len(y_sorted) + 1)
     precision_at_k = cum_tp / cum_n
-    hits = np.where(precision_at_k >= config.TARGET_PRECISION)[0]
+    max_k = max(1, len(y_sorted) // 2)
+    hits = np.where(precision_at_k[:max_k] >= config.TARGET_PRECISION)[0]
     if len(hits) > 0:
         t_high = int(z_val[order][hits[-1]])
     else:
