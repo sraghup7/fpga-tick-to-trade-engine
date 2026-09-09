@@ -17,8 +17,8 @@ normalization, and the score itself are pure integer arithmetic.
 """
 from __future__ import annotations
 
-from collections import deque
-from dataclasses import dataclass, field
+import importlib.util
+from pathlib import Path
 
 import numpy as np
 
@@ -26,104 +26,80 @@ import config
 
 NUM_FEATURES = config.NUM_FEATURES
 
-
 # ---------------------------------------------------------------------------
-# SS4: feature extraction
+# SS4: feature extraction -- delegates to sim/feature_golden.py, the RTL's
+# own bit-exact reference (docs/design_decisions.md D52). Loaded via
+# importlib rather than `sys.path` + `import` so this file never collides
+# with sim/ml_golden.py's own module name, and so model/ never needs to
+# become a package or add sim/ to sys.path globally.
 # ---------------------------------------------------------------------------
+import sys
 
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_fg_spec = importlib.util.spec_from_file_location(
+    "_rtl_feature_golden", _REPO_ROOT / "sim" / "feature_golden.py"
+)
+_rtl_feature_golden = importlib.util.module_from_spec(_fg_spec)
+sys.modules["_rtl_feature_golden"] = _rtl_feature_golden
+_fg_spec.loader.exec_module(_rtl_feature_golden)
 
-@dataclass
-class _SymbolState:
-    """Per-symbol running state needed to compute F0-F7 incrementally.
+_FeatureTracker = _rtl_feature_golden.FeatureTracker
+_MSG_QUOTE = _rtl_feature_golden.MSG_QUOTE
+_MSG_CLEAR = _rtl_feature_golden.MSG_CLEAR
+_SIDE_BID = _rtl_feature_golden.SIDE_BID
+_SIDE_ASK = _rtl_feature_golden.SIDE_ASK
 
-    Reset to these defaults on construction and on a 'clear' event -- this is
-    the brief's required initial-state convention (SS4): before the first
-    update, F1=F3=F4=F7=0 and last-trade-direction is 0 (none).
-    """
-
-    prev_mid: int | None = None
-    prev_bid_qty: int | None = None
-    prev_ask_qty: int | None = None
-    last_trade_dir: int = 0
-    # Sliding window of the last WINDOW_W events: (is_book_update, abs_mid_delta)
-    window: deque = field(default_factory=lambda: deque(maxlen=config.WINDOW_W))
+assert config.WINDOW_INCLUDES_CURRENT, (
+    "sim/feature_golden.py always includes the current event in the window "
+    "(D13, pinned) -- config.WINDOW_INCLUDES_CURRENT=False is no longer a "
+    "supported mode now that FeatureEngine delegates to it."
+)
 
 
 class FeatureEngine:
-    """Stateful, per-symbol feature extractor. One instance covers the whole
-    stream; call `process(event)` for every event in sequence-number order.
+    """Stateful, per-symbol feature extractor. Thin adapter around
+    sim.feature_golden.FeatureTracker -- the RTL's own bit-exact feature
+    extraction reference -- so model/ and rtl/feature_extractor.v compute
+    F0..F7 from the IDENTICAL implementation instead of two independently
+    maintained (and, before D52, independently buggy) copies.
 
-    Only 'quote' events produce a feature row (they are the "quote decision"
-    points the brief's features and labels are defined at). 'trade' events
-    update F6 state only; 'clear' events reset a symbol's state entirely.
+    Only 'quote' events produce a feature row; 'trade' events update F6 and
+    advance the shared window; 'clear' events reset a symbol's state.
     """
 
     def __init__(self, window_w: int = config.WINDOW_W):
-        self._window_w = window_w
-        self._states: dict[int, _SymbolState] = {}
-
-    def _state(self, symbol_id: int) -> _SymbolState:
-        if symbol_id not in self._states:
-            self._states[symbol_id] = _SymbolState(
-                window=deque(maxlen=self._window_w)
-            )
-        return self._states[symbol_id]
+        self._tracker = _FeatureTracker(window=window_w)
 
     def process(self, event: dict) -> tuple[int, ...] | None:
-        """Feed one event. Returns an (F0..F7) tuple for 'quote' events,
-        None for 'trade'/'clear' events (no decision point)."""
         symbol_id = event["symbol_id"]
-        st = self._state(symbol_id)
 
         if event["type"] == "clear":
-            self._states[symbol_id] = _SymbolState(
-                window=deque(maxlen=self._window_w)
+            # Call on_book_event to reset state and advance the window, but
+            # don't return the feature vector (CLEAR events don't produce
+            # output rows in the training data).
+            self._tracker.on_book_event(
+                symbol_id, _MSG_CLEAR,
+                bid_price=0, bid_qty=0, bid_valid=True,
+                ask_price=0, ask_qty=0, ask_valid=True,
             )
             return None
 
         if event["type"] == "trade":
-            st.last_trade_dir = event["trade_side"]
+            side = _SIDE_BID if event["trade_side"] == 1 else _SIDE_ASK
+            self._tracker.on_trade(symbol_id, side)
             return None
 
         assert event["type"] == "quote"
-        bid, ask = event["bid"], event["ask"]
-        bid_qty, ask_qty = event["bid_qty"], event["ask_qty"]
-        mid = (bid + ask) >> 1  # integer mid everywhere, floor (brief SS4)
-
-        f0 = ask - bid
-
-        if st.prev_mid is None:
-            f1 = 0
-        else:
-            f1 = mid - st.prev_mid
-
-        f2 = bid_qty - ask_qty
-
-        f3 = 0 if st.prev_bid_qty is None else bid_qty - st.prev_bid_qty
-        f4 = 0 if st.prev_ask_qty is None else ask_qty - st.prev_ask_qty
-
-        f6 = st.last_trade_dir
-
-        abs_delta = abs(f1)
-        # WINDOW_INCLUDES_CURRENT: the event being processed right now is
-        # pushed into the window before F5/F7 are read off it (brief SS4).
-        if config.WINDOW_INCLUDES_CURRENT:
-            st.window.append((1, abs_delta))
-            window_items = st.window
-        else:
-            window_items = list(st.window)
-            st.window.append((1, abs_delta))
-
-        f5 = sum(is_update for is_update, _ in window_items)
-        f7 = sum(d for _, d in window_items)
-
+        fv = self._tracker.on_book_event(
+            symbol_id, _MSG_QUOTE,
+            bid_price=event["bid"], bid_qty=event["bid_qty"], bid_valid=True,
+            ask_price=event["ask"], ask_qty=event["ask_qty"], ask_valid=True,
+        )
+        f0, f1, f2, f3, f4, f5, f6, f7 = fv.as_tuple()
+        # Raw-domain clip (brief SS4), independent of sim/feature_golden.py's
+        # own 32-bit saturation -- kept from the original model/ code.
         f5 = min(f5, config.RAW_FEATURE_CLIP)
         f7 = min(f7, config.RAW_FEATURE_CLIP)
-
-        st.prev_mid = mid
-        st.prev_bid_qty = bid_qty
-        st.prev_ask_qty = ask_qty
-
         return (f0, f1, f2, f3, f4, f5, f6, f7)
 
 

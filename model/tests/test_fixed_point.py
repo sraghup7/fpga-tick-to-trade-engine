@@ -86,13 +86,22 @@ def test_hysteresis_policy_schmitt_trigger():
 
 def test_feature_extraction_hand_computed_case():
     """A small, hand-computed sequence (roadmap Step 4). Verifies F0-F7
-    against manually worked-out values for the first few quote events."""
+    against manually worked-out values for the first few quote events.
+
+    Note: with FeatureEngine delegating to sim/feature_golden.FeatureTracker
+    (D52 fix), a CLEAR event is treated as the "first event after reset" (f1=0),
+    so the next QUOTE is NOT a first event and computes f1/f3/f4 as deltas.
+    """
     events = [
         {"seq": 0, "symbol_id": 0, "type": "clear", "gap": False},
-        # mid = (100+104)>>1 = 102; first event -> F1=F3=F4=F7=0, F6=0 (no trade yet)
+        # CLEAR resets prev_bid/prev_ask to 0 and is itself the "first event"
+        # seq=1: mid = (100+104)>>1 = 102; NOT a first event (CLEAR already was)
+        # F1 = 102 - (0+0)>>1 = 102, F3 = 50 - 0 = 50, F4 = 60 - 0 = 60
+        # window has 2 entries (CLEAR's + this QUOTE's) -> F5=2, F7=102
         {"seq": 1, "symbol_id": 0, "type": "quote", "bid": 100, "ask": 104,
          "bid_qty": 50, "ask_qty": 60, "gap": False},
-        # mid = (101+104)>>1 = 102 (unsigned floor); delta = 102-102 = 0
+        # seq=2: mid = (101+104)>>1 = 102; F1 = 102 - 102 = 0, F3 = 55 - 50 = 5, F4 = 58 - 60 = -2
+        # window has 3 entries -> F5=3, F7=102 (previous event's abs_mid_delta)
         {"seq": 2, "symbol_id": 0, "type": "quote", "bid": 101, "ask": 104,
          "bid_qty": 55, "ask_qty": 58, "gap": False},
         {"seq": 3, "symbol_id": 0, "type": "trade", "trade_side": 1, "gap": False},
@@ -106,21 +115,24 @@ def test_feature_extraction_hand_computed_case():
     assert list(mids) == [102, 102, 101]
     assert list(symbol_ids) == [0, 0, 0]
 
-    # Event seq=1 (first quote ever for this symbol): F0=4, F1=0, F2=50-60=-10,
-    # F3=0, F4=0, F6=0 (no trade seen yet), window has 1 entry -> F5=1, F7=0.
+    # Event seq=1: NOT first (CLEAR already was), F0=4, F1=102-0=102, F2=50-60=-10,
+    # F3=50-0=50, F4=60-0=60, F6=0 (no trade yet), window has 2 entries -> F5=2, F7=102
     f0, f1, f2, f3, f4, f5, f6, f7 = feats[0]
-    assert (f0, f1, f2, f3, f4, f6) == (4, 0, -10, 0, 0, 0)
-    assert f5 == 1 and f7 == 0
+    assert (f0, f1, f2, f3, f4, f6) == (4, 102, -10, 50, 60, 0)
+    assert f5 == 2 and f7 == 102
 
     # Event seq=2: F0=3, F1=102-102=0, F2=55-58=-3, F3=55-50=5, F4=58-60=-2,
-    # F6 still 0 (trade at seq=3 comes after this quote).
+    # F6 still 0 (trade at seq=3 comes after this quote), window has 3 entries -> F5=3, F7=102
     f0, f1, f2, f3, f4, f5, f6, f7 = feats[1]
     assert (f0, f1, f2, f3, f4, f6) == (3, 0, -3, 5, -2, 0)
+    assert f5 == 3 and f7 == 102
 
     # Event seq=4: comes after the trade_side=+1 at seq=3, so F6=1.
-    # F0=4, F1=101-102=-1, F2=40-70=-30, F3=40-55=-15, F4=70-58=12.
+    # F0=4, F1=101-102=-1, F2=40-70=-30, F3=40-55=-15, F4=70-58=12
+    # Window has 5 entries: CLEAR(0), seq=1(102), seq=2(0), seq=3_trade(0), seq=4(1) -> F5=4, F7=0+102+0+0+1=103
     f0, f1, f2, f3, f4, f5, f6, f7 = feats[2]
     assert (f0, f1, f2, f3, f4, f6) == (4, -1, -30, -15, 12, 1)
+    assert f5 == 4 and f7 == 103
 
 
 def test_labels_horizon_and_validity():
@@ -135,6 +147,10 @@ def test_labels_horizon_and_validity():
 
 
 def test_clear_resets_state():
+    """With FeatureEngine delegating to FeatureTracker (D52), a CLEAR event
+    resets prev_bid/prev_ask/window to zero state and is itself treated as a
+    'first event', so the next QUOTE computes deltas from zero. Window is
+    preserved across CLEAR (not emptied)."""
     events = [
         {"seq": 0, "symbol_id": 0, "type": "quote", "bid": 100, "ask": 104,
          "bid_qty": 50, "ask_qty": 60, "gap": False},
@@ -143,10 +159,13 @@ def test_clear_resets_state():
          "bid_qty": 10, "ask_qty": 10, "gap": False},
     ]
     _, _, _, _, feats = ml_golden.extract_features(events)
-    # After the clear, the next quote must look like a "first ever" event:
-    # F1=F3=F4=0.
+    # After CLEAR, prev_bid/prev_ask are reset to 0, so the next QUOTE
+    # computes f1/f3/f4 as deltas from zero (not f1/f3/f4=0).
+    # f0 = 210 - 200 = 10, f1 = 205 - 0 = 205, f3 = 10 - 0 = 10, f4 = 10 - 0 = 10
     f0, f1, f2, f3, f4, f5, f6, f7 = feats[1]
-    assert (f1, f3, f4) == (0, 0, 0)
+    assert (f0, f1, f3, f4) == (10, 205, 10, 10)
+    # Window should have 2 entries (CLEAR + this QUOTE)
+    assert f5 == 2
 
 
 def test_intended_side_buy_sell_and_no_signal():
