@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this repo is
 
-**Spec-only, pre-implementation** (as of this writing). There is no `rtl/`, `sim/`, `tb/`, `model/`, or `hls4ml/` yet, and no build/test/lint tooling exists — do not assume any command (`make`, `pytest`, Vivado, Vitis HLS, etc.) works, and do not invent Makefile targets or scripts that aren't there. Check current state with `ls` before assuming a directory from the planned layout below exists. The repo currently holds the specification, reference PDFs, and planning docs; RTL and Python tooling land on `develop` as implementation proceeds.
+**Pre-RTL** (as of this writing). `model/` exists on `develop` (ML track: golden model, simulator, training/quantization, `pytest` suite — see `ML_TRACK_STATUS.md`); there is still no `rtl/`, `sim/`, `tb/`, or `hls4ml/`, and no Vivado/Vitis build tooling exists yet — do not invent Makefile targets or scripts that aren't there. Check current state with `ls` before assuming a directory from the planned layout below exists.
 
 `fpga-tick-to-trade-engine`: a pipelined FPGA datapath (Artix-7 XC7A35T-2FGG484I, ALINX AX7035B board, Micrel KSZ9031RNX PHY) that receives a synthetic Gigabit-Ethernet market-data feed, parses and filters it, maintains top-of-book state, extracts fixed-point features, runs a quantized (hls4ml-generated) linear classifier that estimates adverse-selection risk, and gates the resulting order intent through nine non-bypassable pre-trade risk checks (including the ML verdict) before emitting a simulated order — all at a fixed, measured tick-to-trade cycle count, verified bit-exact against a Python golden model. Simulated trading only; never connects to a real exchange or handles money.
 
@@ -17,6 +17,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 5. **`fpga_top_of_book_engine_spec.md`** — **superseded historical document.** Never edit it as authoritative; if a change affects material also described here, make the change in the master spec and update its §0 reconciliation table instead.
 6. **`fpga_project_flow.md`** — general reference on the 9-stage FPGA project methodology (spec → environment → verification → RTL → integration → constraints/synth → implementation/timing → bring-up → release). Not project-specific, but explains *why* the repo is organized the way §13 of the master spec specifies (golden model before RTL, non-project-mode Vivado builds, lint→sim→synth→impl loop ordering, etc).
 7. **`PREREQUISITES.md`** — toolchain versions/paths actually verified on the dev machine (Vivado/Vitis HLS 2024.2, Python 3.11.15, Icarus 12.0, target part `xc7a35tfgg484-2`). Has the open items list that S0 needs to resolve, and a running verification log.
+8. **`ML_TRACK_STATUS.md`** — running status log for the ML track specifically (checkpoints, bugs found while actually running the pipeline and their fixes, current metrics, roadmap position). Update it when an ML-track checkpoint lands; it's a progress log, not a spec, so it doesn't need §0-style reconciliation.
 
 If a fact needs to change, change it at its source document and let the others reference it.
 

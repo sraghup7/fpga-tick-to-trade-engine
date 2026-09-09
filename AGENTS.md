@@ -1,7 +1,7 @@
 # AGENTS.md
 
 ## What this repo is
-- **Spec-only, pre-implementation.** There is no `rtl/`, `sim/`, `tb/`, `model/`, or `hls4ml/` yet. Nothing to build, run, or test — do not assume a build/test/lint command exists. The eventual code layout is defined in `fpga_tick_to_trade_master_spec.md` §13.
+- **Pre-RTL.** `model/` exists on `develop` (ML track — see `ML_TRACK_STATUS.md`); there is still no `rtl/`, `sim/`, `tb/`, or `hls4ml/`, and no Vivado/Vitis build tooling exists yet. The eventual code layout is defined in `fpga_tick_to_trade_master_spec.md` §13.
 - See `CLAUDE.md` for the full version of this guidance (project description, architecture diagram, toolchain, MCP servers) — this file mirrors it in short form; keep both in sync.
 
 ## Which file is authoritative
@@ -11,6 +11,7 @@
 - `README.md` is the public-facing deliverable (architecture, wire format, decision rule, results); update it when master-spec user-facing facts change.
 - `fpga_project_flow.md` is a general (non-project-specific) reference on the 9-stage FPGA methodology this repo follows.
 - `PREREQUISITES.md` tracks toolchain versions/paths verified on the dev machine and open S0 items.
+- `ML_TRACK_STATUS.md` is the ML track's running status log (checkpoints, bugs found by running the pipeline and their fixes, current metrics, roadmap position) — a progress log, not a spec.
 
 ## Spec conventions (when editing the master doc)
 - Requirements are numbered `FR-n` / `NFR-n`; every requirement must map to a test in §11.4. Adding a requirement without a test breaks the traceability model.
