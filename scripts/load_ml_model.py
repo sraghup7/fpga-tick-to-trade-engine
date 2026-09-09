@@ -60,14 +60,37 @@ def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--config", default=str(DEFAULT_CONFIG), help="path to model_config.json")
     ap.add_argument("--host", default="127.0.0.1", help="board IP (or sim host)")
-    ap.add_argument("--port", type=int, default=60000, help="cfg_udp_port (register 0x40 default)")
+    ap.add_argument(
+        "--port", type=int, default=60000,
+        help="cfg_udp_port (register 0x40 default -- matches rtl/csr_block.v:268's reset value)",
+    )
     ap.add_argument("--dry-run", action="store_true", help="print frames, send nothing")
     args = ap.parse_args()
 
-    with open(args.config) as f:
-        cfg = json.load(f)
+    try:
+        with open(args.config) as f:
+            cfg = json.load(f)
+    except (OSError, json.JSONDecodeError) as e:
+        raise SystemExit(f"failed to load {args.config}: {e}")
+
     if len(cfg["offsets"]) != 8 or len(cfg["shifts"]) != 8:
         raise SystemExit(f"expected 8 offsets/shifts, got {len(cfg['offsets'])}/{len(cfg['shifts'])}")
+
+    # cfg_ml_th_high/cfg_ml_th_low are signed 32-bit registers (rtl/csr_block.v);
+    # cfg_offset_i/cfg_shift_i are 32-bit registers that legitimately carry
+    # negative offsets (e.g. F1_mid_delta's mean can be negative) -- both are
+    # handled correctly by build_csr_write_frame's `& 0xFFFFFFFF` mask for any
+    # IN-RANGE value, but a genuinely out-of-range value (corrupted config,
+    # bad retrain) would silently wrap instead of erroring. Catch that here.
+    for name, val in [("t_high", cfg["t_high"]), ("t_low", cfg["t_low"])]:
+        if not (-(2**31) <= val <= 2**31 - 1):
+            raise SystemExit(f"{name}={val} does not fit in a signed 32-bit register")
+    for i, val in enumerate(cfg["offsets"]):
+        if not (-(2**31) <= val <= 2**32 - 1):
+            raise SystemExit(f"offsets[{i}]={val} does not fit in a 32-bit register")
+    for i, val in enumerate(cfg["shifts"]):
+        if not (0 <= val <= 2**32 - 1):
+            raise SystemExit(f"shifts[{i}]={val} does not fit in a 32-bit register (shift must be non-negative)")
 
     frames = build_frames(cfg)
 
