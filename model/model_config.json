@@ -1,7 +1,56 @@
 {
-  "status": "PLACEHOLDER - not trained. S4 has not run. This is the master spec Section 15 fallback classifier, wired in for S6 so the datapath and risk gate 0x09 close out in simulation without blocking on the ML collaborator. Replace weights.mem/bias.mem with S4's trained, quantized output when available -- no RTL or wiring change required elsewhere.",
-  "features": ["F0_spread", "F1_mid_delta", "F2_imbalance", "F3_bid_chg", "F4_ask_chg", "F5_update_rate", "F6_last_trade_dir", "F7_volatility"],
-  "weights": [1, 1, 1, 1, 1, 1, 1, 1],
-  "bias": 0,
-  "formula": "z = bias + sum(w_i * x_i), int8 features/weights, int16 exact products, int32 accumulator"
+  "seed": 20260901,
+  "window_w": 16,
+  "window_includes_current": true,
+  "label_horizon_h": 50,
+  "label_combine": "SIDE_CONDITIONED",
+  "num_features": 8,
+  "feature_range": [
+    -128,
+    127
+  ],
+  "weight_range": [
+    -128,
+    127
+  ],
+  "accum_bits": 32,
+  "offsets": [
+    11,
+    0,
+    657,
+    117,
+    -1,
+    16,
+    0,
+    60
+  ],
+  "shifts": [
+    0,
+    0,
+    7,
+    6,
+    1,
+    0,
+    0,
+    2
+  ],
+  "weights": [
+    -13,
+    -3,
+    -3,
+    -18,
+    5,
+    -114,
+    -29,
+    1
+  ],
+  "bias": 61,
+  "t_high": 60,
+  "t_low": 56,
+  "versions": {
+    "python": "3.12.10",
+    "numpy": "2.5.2",
+    "tensorflow": "2.21.0",
+    "keras": "3.15.1"
+  }
 }

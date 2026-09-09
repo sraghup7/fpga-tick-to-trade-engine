@@ -48,6 +48,8 @@ tb/stimulus/*.mem
 # Python
 __pycache__/
 *.pyc
+.pytest_cache/
+*.egg-info/
 
 # Vendor reference PDFs -- large, third-party, not versioned (PREREQUISITES.md §5)
 docs/refs/*.pdf
