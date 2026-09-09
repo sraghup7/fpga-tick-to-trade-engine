@@ -100,10 +100,11 @@ def test_feature_extraction_hand_computed_case():
         {"seq": 4, "symbol_id": 0, "type": "quote", "bid": 99, "ask": 103,
          "bid_qty": 40, "ask_qty": 70, "gap": False},
     ]
-    seqs, mids, feats = ml_golden.extract_features(events)
+    seqs, mids, symbol_ids, sides, feats = ml_golden.extract_features(events)
 
     assert list(seqs) == [1, 2, 4]
     assert list(mids) == [102, 102, 101]
+    assert list(symbol_ids) == [0, 0, 0]
 
     # Event seq=1 (first quote ever for this symbol): F0=4, F1=0, F2=50-60=-10,
     # F3=0, F4=0, F6=0 (no trade seen yet), window has 1 entry -> F5=1, F7=0.
@@ -141,11 +142,44 @@ def test_clear_resets_state():
         {"seq": 2, "symbol_id": 0, "type": "quote", "bid": 200, "ask": 210,
          "bid_qty": 10, "ask_qty": 10, "gap": False},
     ]
-    _, _, feats = ml_golden.extract_features(events)
+    _, _, _, _, feats = ml_golden.extract_features(events)
     # After the clear, the next quote must look like a "first ever" event:
     # F1=F3=F4=0.
     f0, f1, f2, f3, f4, f5, f6, f7 = feats[1]
     assert (f1, f3, f4) == (0, 0, 0)
+
+
+def test_intended_side_buy_sell_and_no_signal():
+    # default thresholds: min_spread=2, imb_shift=1 (master spec SS9 defaults)
+    # buy: spread>=2 and bid_qty > ask_qty<<1
+    assert ml_golden.intended_side(spread=2, bid_qty=201, ask_qty=100) == 1
+    assert ml_golden.intended_side(spread=2, bid_qty=200, ask_qty=100) == 0  # not strictly >
+    # sell: spread>=2 and ask_qty > bid_qty<<1
+    assert ml_golden.intended_side(spread=2, bid_qty=100, ask_qty=201) == -1
+    # spread too tight -> no signal even with a lopsided book
+    assert ml_golden.intended_side(spread=1, bid_qty=1000, ask_qty=1) == 0
+    # crossed/locked book (spread<=0) -> no signal
+    assert ml_golden.intended_side(spread=0, bid_qty=1000, ask_qty=1) == 0
+    assert ml_golden.intended_side(spread=-3, bid_qty=1000, ask_qty=1) == 0
+    # balanced book, adequate spread -> no signal
+    assert ml_golden.intended_side(spread=5, bid_qty=500, ask_qty=500) == 0
+
+
+def test_extract_features_reports_sides():
+    events = [
+        {"seq": 0, "symbol_id": 0, "type": "clear", "gap": False},
+        # spread=4, bid_qty=300 > ask_qty(100)<<1=200 -> buy signal
+        {"seq": 1, "symbol_id": 0, "type": "quote", "bid": 100, "ask": 104,
+         "bid_qty": 300, "ask_qty": 100, "gap": False},
+        # spread=4, ask_qty=300 > bid_qty(100)<<1=200 -> sell signal
+        {"seq": 2, "symbol_id": 0, "type": "quote", "bid": 100, "ask": 104,
+         "bid_qty": 100, "ask_qty": 300, "gap": False},
+        # balanced -> no signal
+        {"seq": 3, "symbol_id": 0, "type": "quote", "bid": 100, "ask": 104,
+         "bid_qty": 200, "ask_qty": 200, "gap": False},
+    ]
+    _, _, _, sides, _ = ml_golden.extract_features(events)
+    assert list(sides) == [1, -1, 0]
 
 
 if __name__ == "__main__":

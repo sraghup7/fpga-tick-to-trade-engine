@@ -127,16 +127,54 @@ class FeatureEngine:
         return (f0, f1, f2, f3, f4, f5, f6, f7)
 
 
-def extract_features(events: list[dict]) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+def intended_side(
+    spread: int,
+    bid_qty: int,
+    ask_qty: int,
+    min_spread: int = config.CFG_MIN_SPREAD,
+    imb_shift: int = config.CFG_IMB_SHIFT,
+) -> int:
+    """The master spec's actual signal rule (FR-35/FR-36/FR-37, SS6.6):
+    +1 = buy, -1 = sell, 0 = no signal at this event.
+
+    buy:  spread >= min_spread  and  bid_qty > (ask_qty << imb_shift)
+    sell: spread >= min_spread  and  ask_qty > (bid_qty << imb_shift)
+
+    Since min_spread >= 1 in any sane config, `spread < min_spread` already
+    rejects a crossed/locked book (spread <= 0) and an uninitialized 0/0 book
+    along with any spread that's merely too tight -- all are "not a valid,
+    non-crossed book with adequate spread" per FR-35's precondition, so one
+    comparison covers all three. FR-37 says both conditions firing at once is
+    impossible by construction; we still guard it defensively as no-signal
+    rather than trust that invariant blindly.
+    """
+    if spread < min_spread:
+        return 0
+    buy = bid_qty > (ask_qty << imb_shift)
+    sell = ask_qty > (bid_qty << imb_shift)
+    if buy and sell:
+        return 0
+    if buy:
+        return 1
+    if sell:
+        return -1
+    return 0
+
+
+def extract_features(
+    events: list[dict],
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Run the FeatureEngine over a full event stream.
 
     Returns:
-      seqs     : int array, shape (N,) -- sequence number of each quote event
-      mids     : int array, shape (N,) -- integer mid price at each quote event
-      features : int array, shape (N, 8) -- raw (pre-normalization) F0..F7
+      seqs      : int array, shape (N,) -- sequence number of each quote event
+      mids      : int array, shape (N,) -- integer mid price at each quote event
+      symbol_ids: int array, shape (N,) -- symbol_id of each quote event
+      sides     : int8 array, shape (N,) -- intended_side() at each quote event
+      features  : int array, shape (N, 8) -- raw (pre-normalization) F0..F7
     """
     engine = FeatureEngine()
-    seqs, mids, feats = [], [], []
+    seqs, mids, symbol_ids, sides, feats = [], [], [], [], []
     for event in events:
         result = engine.process(event)
         if result is None:
@@ -144,9 +182,15 @@ def extract_features(events: list[dict]) -> tuple[np.ndarray, np.ndarray, np.nda
         seqs.append(event["seq"])
         bid, ask = event["bid"], event["ask"]
         mids.append((bid + ask) >> 1)
+        symbol_ids.append(event["symbol_id"])
+        sides.append(intended_side(result[0], event["bid_qty"], event["ask_qty"]))
         feats.append(result)
-    return np.array(seqs, dtype=np.int64), np.array(mids, dtype=np.int64), np.array(
-        feats, dtype=np.int64
+    return (
+        np.array(seqs, dtype=np.int64),
+        np.array(mids, dtype=np.int64),
+        np.array(symbol_ids, dtype=np.int64),
+        np.array(sides, dtype=np.int8),
+        np.array(feats, dtype=np.int64),
     )
 
 
@@ -237,10 +281,11 @@ if __name__ == "__main__":
     import simulator
 
     events = simulator.generate_dataset()
-    seqs, mids, raw_feats = extract_features(events)
+    seqs, mids, symbol_ids, sides, raw_feats = extract_features(events)
     y_buy, y_sell, valid = compute_labels(mids, config.LABEL_HORIZON_H)
     print(f"quote events with features: {len(seqs)}")
     print(f"labeled (valid) events: {valid.sum()} / {len(valid)}")
+    print(f"events with a trading signal (side != 0): {(sides != 0).sum()} / {len(sides)}")
     print("first 5 raw feature rows (F0..F7):")
     for row in raw_feats[:5]:
         print(" ", row.tolist())

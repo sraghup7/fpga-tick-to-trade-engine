@@ -1,0 +1,56 @@
+{
+  "seed": 20260901,
+  "window_w": 16,
+  "window_includes_current": true,
+  "label_horizon_h": 50,
+  "label_combine": "SIDE_CONDITIONED",
+  "num_features": 8,
+  "feature_range": [
+    -128,
+    127
+  ],
+  "weight_range": [
+    -128,
+    127
+  ],
+  "accum_bits": 32,
+  "offsets": [
+    11,
+    0,
+    657,
+    117,
+    -1,
+    16,
+    0,
+    60
+  ],
+  "shifts": [
+    0,
+    0,
+    7,
+    6,
+    1,
+    0,
+    0,
+    2
+  ],
+  "weights": [
+    -13,
+    -3,
+    -3,
+    -18,
+    5,
+    -114,
+    -29,
+    1
+  ],
+  "bias": 61,
+  "t_high": 60,
+  "t_low": 56,
+  "versions": {
+    "python": "3.12.10",
+    "numpy": "2.5.2",
+    "tensorflow": "2.21.0",
+    "keras": "3.15.1"
+  }
+}

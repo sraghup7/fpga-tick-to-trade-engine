@@ -3,9 +3,7 @@
 # here plus in docs/hls4ml_flow.md when you do.
 numpy==2.5.2
 pytest==9.1.1
-
-# Added at roadmap Step 6 (training) -- uncomment when you get there:
-# tensorflow==2.16.*
+tensorflow-cpu==2.21.0
 
 # Added at roadmap Step 7 (hls4ml convert/export) -- uncomment when you get there:
 # hls4ml==...

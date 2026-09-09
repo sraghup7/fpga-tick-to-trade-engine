@@ -219,19 +219,30 @@ _SCENARIOS = [
 ]
 
 
-def generate_dataset(seed: int = config.SEED, gap_prob: float = 0.01) -> list[dict]:
+def generate_dataset(
+    seed: int = config.SEED,
+    gap_prob: float = 0.01,
+    repeats: int = config.SCENARIO_REPEATS,
+) -> list[dict]:
     """Generate the full deterministic synthetic dataset.
 
-    Each scenario runs on its own symbol_id and is preceded by a 'clear' event
-    so feature/label state never leaks across scenario boundaries.
+    The scenario set runs `repeats` times over; each pass gets fresh
+    symbol_ids (so no two runs of the same scenario share book-state history)
+    and is preceded by a 'clear' event. All repeats draw from one continuing
+    seeded rng stream, so the entire multi-pass dataset is still exactly
+    reproducible from `seed` alone (config.SCENARIO_REPEATS explains why more
+    than one pass is needed).
     """
     rng = np.random.default_rng(seed)
     seqc = _SeqCounter(rng, gap_prob=gap_prob)
     events: list[dict] = []
-    for symbol_id, scenario_fn in enumerate(_SCENARIOS):
-        seq, gapped = seqc.next()
-        events.append(_clear(seq, symbol_id, gap=gapped))
-        events.extend(scenario_fn(rng, seqc, symbol_id))
+    symbol_id = 0
+    for _ in range(repeats):
+        for scenario_fn in _SCENARIOS:
+            seq, gapped = seqc.next()
+            events.append(_clear(seq, symbol_id, gap=gapped))
+            events.extend(scenario_fn(rng, seqc, symbol_id))
+            symbol_id += 1
     return events
 
 
