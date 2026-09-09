@@ -1,9 +1,24 @@
 {
+  "status": "TRAINED (S4 pipeline, model/train.py). Replaces the master spec Section 15 fallback placeholder (w_i=1, bias=0).",
+  "notes": "PROXY LABEL: 'adverse' means the synthetic proxy defined in ml_engineer_brief.md SS5 (mid moved >=1 tick against the quoted side within LABEL_HORIZON_H future events) -- this is NOT evidence about real market microstructure or real adverse selection; simulated trading only. If CFG_MIN_SPREAD/CFG_IMB_SHIFT (master spec SS9 registers 0x1C/0x20) are ever retuned at runtime away from the values recorded below, this model was trained against the OLD values and should be re-trained -- see docs/design_decisions.md D52.",
+  "features": [
+    "F0_spread",
+    "F1_mid_delta",
+    "F2_imbalance",
+    "F3_bid_chg",
+    "F4_ask_chg",
+    "F5_update_rate",
+    "F6_last_trade_dir",
+    "F7_volatility"
+  ],
   "seed": 20260901,
   "window_w": 16,
   "window_includes_current": true,
   "label_horizon_h": 50,
   "label_combine": "SIDE_CONDITIONED",
+  "cfg_min_spread": 2,
+  "cfg_imb_shift": 1,
+  "weight_quant_headroom": 0.9,
   "num_features": 8,
   "feature_range": [
     -128,
@@ -15,41 +30,41 @@
   ],
   "accum_bits": 32,
   "offsets": [
-    11,
+    6,
+    124,
+    109,
+    5,
+    5,
+    14,
     0,
-    657,
-    117,
-    -1,
-    16,
-    0,
-    60
+    1912
   ],
   "shifts": [
     0,
-    0,
-    7,
     6,
-    1,
+    6,
+    5,
+    2,
     0,
     0,
-    2
+    8
   ],
   "weights": [
-    -13,
-    -3,
-    -3,
-    -18,
-    5,
+    4,
+    -80,
+    14,
+    44,
+    7,
     -114,
-    -29,
-    1
+    26,
+    -52
   ],
-  "bias": 61,
-  "t_high": 60,
-  "t_low": 56,
+  "bias": -1302,
+  "t_high": -454,
+  "t_low": -458,
   "versions": {
-    "python": "3.12.10",
-    "numpy": "2.5.2",
+    "python": "3.11.15",
+    "numpy": "2.4.6",
     "tensorflow": "2.21.0",
     "keras": "3.15.1"
   }
