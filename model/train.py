@@ -207,9 +207,7 @@ def main() -> None:
     if config.LABEL_COMBINE != "SIDE_CONDITIONED":
         raise ValueError(f"unknown LABEL_COMBINE {config.LABEL_COMBINE!r}")
     # y_adverse = y_buy where the signal rule would buy, y_sell where it would
-    # sell. Rows with no signal (sides==0) are not a "quote decision" at all
-    # -- gate 0x09 is moot if no order would ever be placed -- so they're
-    # dropped from training/eval the same way an out-of-horizon row is.
+    # sell.
     # y=0 (not adverse) for rows where the signal rule wouldn't trade at all
     # -- these are still real events the RTL's ML datapath scores
     # continuously (feature_extractor.v runs on every book update, not only
