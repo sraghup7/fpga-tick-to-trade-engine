@@ -62,7 +62,16 @@ module tob_top #(
     // default is the production value; the parameter exists so the Icarus
     // testbench can shorten the 10 ms hold -- simulation-only, default
     // behaviour is unchanged.
-    parameter integer PHY_RESET_HOLD_CYCLES = 500_000
+    parameter integer PHY_RESET_HOLD_CYCLES = 500_000,
+    // Pass-through to ml_classifier_wrap's own WEIGHTS_FILE/BIAS_FILE
+    // parameters (docs/design_decisions.md D52) -- same pattern as
+    // PHY_RESET_HOLD_CYCLES above: default is the production value
+    // (ml_classifier_wrap.v's own default), the parameter exists so the
+    // Icarus testbench can point at a fixed placeholder-weight fixture
+    // instead of the live, retrainable model/weights.mem -- simulation-only
+    // override, default (real) behaviour is unchanged.
+    parameter WEIGHTS_FILE = "model/weights.mem",
+    parameter BIAS_FILE    = "model/bias.mem"
 ) (
     input  wire        sys_clk,   // 50 MHz board oscillator
     input  wire        rst_n,     // active-low pushbutton reset
@@ -565,7 +574,10 @@ module tob_top #(
         .x4 (norm_x4), .x5 (norm_x5), .x6 (norm_x6), .x7 (norm_x7)
     );
 
-    ml_classifier_wrap u_ml (
+    ml_classifier_wrap #(
+        .WEIGHTS_FILE (WEIGHTS_FILE),
+        .BIAS_FILE    (BIAS_FILE)
+    ) u_ml (
         .clk        (gmii_rx_clk),
         .rst_n      (engine_rst_n),
         .norm_valid (norm_valid),

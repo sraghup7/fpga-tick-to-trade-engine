@@ -133,7 +133,10 @@ module tb_ml_chain;
         .x0(x0), .x1(x1), .x2(x2), .x3(x3), .x4(x4), .x5(x5), .x6(x6), .x7(x7)
     );
 
-    ml_classifier_wrap u_ml (
+    ml_classifier_wrap #(
+        .WEIGHTS_FILE("tb/stimulus/ml_placeholder_weights.mem"),
+        .BIAS_FILE("tb/stimulus/ml_placeholder_bias.mem")
+    ) u_ml (
         .clk(clk), .rst_n(rst_n),
         .norm_valid(norm_valid), .norm_slot(norm_slot),
         .x0(x0), .x1(x1), .x2(x2), .x3(x3), .x4(x4), .x5(x5), .x6(x6), .x7(x7),

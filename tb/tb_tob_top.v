@@ -72,8 +72,10 @@ module tb_tob_top;
     assign rgmii_rx_ctl = 1'b0;
 
     tob_top #(
-        .PHY_RESET_HOLD_CYCLES(16)   // shorten the 10 ms board-reset hold for
+        .PHY_RESET_HOLD_CYCLES(16),  // shorten the 10 ms board-reset hold for
                                      // simulation; production default 500_000
+        .WEIGHTS_FILE("tb/stimulus/ml_placeholder_weights.mem"),
+        .BIAS_FILE("tb/stimulus/ml_placeholder_bias.mem")
     ) dut (
         .sys_clk     (sys_clk),
         .rst_n       (rst_n),

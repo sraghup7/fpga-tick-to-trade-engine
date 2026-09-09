@@ -26,7 +26,10 @@ module tb_ml_classifier_wrap;
     wire [1:0]  ml_slot;
     wire signed [31:0] z;
 
-    ml_classifier_wrap u_dut (
+    ml_classifier_wrap #(
+        .WEIGHTS_FILE("tb/stimulus/ml_placeholder_weights.mem"),
+        .BIAS_FILE("tb/stimulus/ml_placeholder_bias.mem")
+    ) u_dut (
         .clk(clk), .rst_n(rst_n),
         .norm_valid(norm_valid), .norm_slot(norm_slot),
         .x0(x0), .x1(x1), .x2(x2), .x3(x3),

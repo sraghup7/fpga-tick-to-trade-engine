@@ -32,7 +32,9 @@ def check(label, actual, expected):
         failures.append(f"{label}: got {actual!r}, expected {expected!r}")
 
 
-m = MLClassifier(th_high=20, th_low=-20)
+m = MLClassifier(th_high=20, th_low=-20,
+                 weights_path="tb/stimulus/ml_placeholder_weights.mem",
+                 bias_path="tb/stimulus/ml_placeholder_bias.mem")
 HEALTHY = dict(bid_valid=True, ask_valid=True, crossed=False, seq_gap=False)
 
 # Step 1: all-zero features -> z = 0. First event, adverse_risk[0] resets to
