@@ -210,8 +210,18 @@ def main() -> None:
     # sell. Rows with no signal (sides==0) are not a "quote decision" at all
     # -- gate 0x09 is moot if no order would ever be placed -- so they're
     # dropped from training/eval the same way an out-of-horizon row is.
-    y = np.where(sides > 0, y_buy, y_sell).astype(np.int8)
-    valid = horizon_valid & (sides != 0)
+    # y=0 (not adverse) for rows where the signal rule wouldn't trade at all
+    # -- these are still real events the RTL's ML datapath scores
+    # continuously (feature_extractor.v runs on every book update, not only
+    # signal-firing ones), so they must stay in the training/eval
+    # distribution instead of being dropped (docs/design_decisions.md D52).
+    # The label is only meaningful where a side would trade, so no-signal
+    # rows get the well-defined negative label y=0 rather than being
+    # excluded.
+    y = np.zeros(len(sides), dtype=np.int8)
+    y[sides > 0] = y_buy[sides > 0]
+    y[sides < 0] = y_sell[sides < 0]
+    valid = horizon_valid
     print(
         f"events with a trading signal: {(sides != 0).sum()} / {len(sides)}  "
         f"({(sides == 1).sum()} buy, {(sides == -1).sum()} sell)"
