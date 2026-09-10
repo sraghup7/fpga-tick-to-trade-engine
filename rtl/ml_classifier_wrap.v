@@ -57,16 +57,47 @@ module ml_classifier_wrap #(
     output reg  signed [31:0] z
 );
 
+    // ACC_W bound (docs/superpowers/specs/2026-09-09-ml-classifier-timing-closure-design.md):
+    // the balanced-tree, narrowed accumulator below is bit-exact against
+    // the original wide/serial computation only if
+    // |bias| + SUM 128*|w_i| < 2^(ACC_W-1). Checked in simulation right
+    // after $readmemh below (ignored by synthesis, same as $readmemh's own
+    // initial-block convention); model/train.py's export() enforces the
+    // identical bound in Python before these .mem files are ever written,
+    // so this check should never actually fire -- it exists as a second,
+    // independent guard against a future retrain silently violating it.
+    localparam integer ACC_W = 20;
+
     reg signed [7:0]  w_mem    [0:7];
     reg signed [31:0] bias_mem [0:0];
-    initial begin
+    initial begin: load_and_check
+        integer i;
+        integer bound;
         $readmemh(WEIGHTS_FILE, w_mem);
         $readmemh(BIAS_FILE, bias_mem);
+        bound = (bias_mem[0] < 0) ? -bias_mem[0] : bias_mem[0];
+        for (i = 0; i < 8; i = i + 1) begin
+            bound = bound + 128 * ((w_mem[i] < 0) ? -w_mem[i] : w_mem[i]);
+        end
+        if (bound >= (1 << (ACC_W-1))) begin
+            $display("FATAL: ml_classifier_wrap ACC_W=%0d bound violated: |bias|+SUM128|w_i|=%0d >= 2^%0d",
+                      ACC_W, bound, ACC_W-1);
+            $finish;
+        end
     end
 
     wire signed [31:0] bias = bias_mem[0];
+    // Truncating bias to a dedicated signed wire (not a bare bit-select) --
+    // bit-selecting a signed vector directly (`bias[ACC_W-1:0]`) strips
+    // Verilog's `signed` attribute from the result, which would silently
+    // force unsigned arithmetic on this term (and, per Verilog's
+    // context-sensitive signed-expression rules, risks doing so for the
+    // WHOLE sum, not just this term) -- the same class of footgun
+    // feature_normalizer.v's own `>>>` note already warns about elsewhere
+    // in this codebase.
+    wire signed [ACC_W-1:0] bias_trunc = bias[ACC_W-1:0];
 
-    // Exact int8 x int8 -> int16 products (S5.4).
+    // Exact int8 x int8 -> int16 products (S5.4) -- unchanged.
     wire signed [15:0] p0 = $signed(x0) * $signed(w_mem[0]);
     wire signed [15:0] p1 = $signed(x1) * $signed(w_mem[1]);
     wire signed [15:0] p2 = $signed(x2) * $signed(w_mem[2]);
@@ -76,9 +107,18 @@ module ml_classifier_wrap #(
     wire signed [15:0] p6 = $signed(x6) * $signed(w_mem[6]);
     wire signed [15:0] p7 = $signed(x7) * $signed(w_mem[7]);
 
-    wire signed [31:0] z_c = bias
-        + $signed(p0) + $signed(p1) + $signed(p2) + $signed(p3)
-        + $signed(p4) + $signed(p5) + $signed(p6) + $signed(p7);
+    // Balanced-tree, narrowed-width sum (docs/design_decisions.md D53) --
+    // replaces the previous left-to-right 32-bit chain. Reassociation is
+    // exact in two's complement as long as no intermediate overflows its
+    // declared width, which the ACC_W bound above guarantees.
+    wire signed [ACC_W-1:0] s0 = $signed(p0) + $signed(p1);
+    wire signed [ACC_W-1:0] s1 = $signed(p2) + $signed(p3);
+    wire signed [ACC_W-1:0] s2 = $signed(p4) + $signed(p5);
+    wire signed [ACC_W-1:0] s3 = $signed(p6) + $signed(p7);
+    wire signed [ACC_W-1:0] t0 = s0 + s1;
+    wire signed [ACC_W-1:0] t1 = s2 + s3;
+    wire signed [ACC_W-1:0] acc = (t0 + t1) + bias_trunc;
+    wire signed [31:0] z_c = {{(32-ACC_W){acc[ACC_W-1]}}, acc};
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
