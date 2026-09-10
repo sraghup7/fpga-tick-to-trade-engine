@@ -4,7 +4,7 @@
 
 A pipelined FPGA that receives a synthetic Gigabit-Ethernet market-data feed, parses and filters it, maintains top-of-book state, extracts fixed-point features, runs a quantized ML classifier, gates the resulting order intent through deterministic risk checks (including the ML verdict), and emits a simulated order — at a **measured, fixed tick-to-trade latency**, verified bit-exact against a Python golden model.
 
-> **Status: implementation in progress — milestones S0–S3, S5–S10 done; S11 (hardware bring-up) has a real, gate-passing bitstream for the first time, not yet tried on physical hardware** (2026-09-08). Every RTL stage through board-level integration (`tob_top.v`) is built and self-checking: parser, book/feature-extraction, signal engine, the ML fallback classifier + hysteresis policy (gate `0x09`), all nine risk gates, egress, the latency histogram, and the CSR control plane, each with a passing Icarus testbench, a full-system integration test (`tb/tb_top.v`), and a 1,000,000-message parser soak at zero loss. Real Vivado synthesis now closes timing at 125 MHz with 0 inferred latches (see `results/timing.md` / master spec §12.3 for the measured WNS/WHS) and `write_bitstream` completes — see `docs/design_decisions.md` D26–D44 for the full trace, including three real bugs the process found and fixed (a stale-alignment bug in the risk/ML gating, a mis-wired feed-health counter, and 15 of 22 board pins that were silently unconstrained). S4's training/quantization pipeline has landed (`docs/design_decisions.md` D52) -- gate `0x09` runs `ml_classifier_wrap.v` (still a hand-written fallback, not a real hls4ml IP) loaded with real trained weights, not the old `w_i=1` placeholder. See [Roadmap](#roadmap).
+> **Status: implementation in progress — milestones S0–S3, S5–S10 done; S11 (hardware bring-up) had a real, gate-passing bitstream as of 2026-09-08, not yet tried on physical hardware, but that specific artifact does not currently exist** (2026-09-10). Every RTL stage through board-level integration (`tob_top.v`) is built and self-checking: parser, book/feature-extraction, signal engine, the ML fallback classifier + hysteresis policy (gate `0x09`), all nine risk gates, egress, the latency histogram, and the CSR control plane, each with a passing Icarus testbench, a full-system integration test (`tb/tb_top.v`), and a 1,000,000-message parser soak at zero loss. Real Vivado synthesis (0 inferred latches) originally closed timing at 125 MHz and `write_bitstream` completed — see `docs/design_decisions.md` D26–D44 for that trace, including three real bugs the process found and fixed (a stale-alignment bug in the risk/ML gating, a mis-wired feed-health counter, and 15 of 22 board pins that were silently unconstrained). That closed-timing state broke afterward for reasons unrelated to `build.tcl`: D52's real trained ML weights turned a previously constant-folded-away multiply-accumulate into real logic and broke build-wide timing; D53 closed the ML classifier's own path (balanced-tree reassociation + narrowed accumulator + 2-stage pipelining), but two other, ML-unrelated timing violations remain open (an async-reset-fanout recovery path, and the `risk_engine` token-bucket path), so `build.tcl`'s own WNS gate currently refuses to write a bitstream — see `docs/design_decisions.md` D53 for the full accounting; **do not assume `results/build/tob_top.bit` exists without checking `results/build/` directly.** S4's training/quantization pipeline has landed (`docs/design_decisions.md` D52) -- gate `0x09` runs `ml_classifier_wrap.v` (still a hand-written fallback, not a real hls4ml IP) loaded with real trained weights, not the old `w_i=1` placeholder. See [Roadmap](#roadmap).
 
 ---
 
@@ -139,13 +139,13 @@ The ML engineer's self-contained brief is `ml_engineer_brief.md`.
 ├── fpga_tick_to_trade_master_spec.md   # single source of truth (design + traceability)
 ├── ml_engineer_brief.md                # ML collaborator handoff (Python/hls4ml only)
 ├── AGENTS.md                           # instructions for AI-assisted development
-├── docs/                               # design_decisions.md (44 entries), contracts/ (per-module handoffs)
+├── docs/                               # design_decisions.md (53 entries), contracts/ (per-module handoffs)
 ├── rtl/                                # Verilog-2001; every stage through board-level tob_top.v is built, incl. ML fallback + risk gate 0x09
 ├── sim/                                # golden_model.py, feature_golden.py, ml_golden.py, order_rx.py, gen_top_soak_vectors.py + hand-case tests; compare.py not yet
 ├── model/                              # weights.mem/bias.mem: real trained, quantized weights (S4 landed, D52) -- hls4ml export itself is still not done, so `ml_classifier_wrap.v`'s hand-written fallback is what actually runs them
 ├── tb/                                 # self-checking testbenches, one per landed module, plus tb_top.v (full-system integration test)
 ├── hls4ml/                             # (not yet — generated project, rebuilt by script once S4 lands)
-├── scripts/  constraints/  results/    # build.tcl (Vivado, non-project mode)/run_sim.sh done; build_hls4ml.py/report.py not yet; results/build/ has a real, passing timing report and tob_top.bit
+├── scripts/  constraints/  results/    # build.tcl (Vivado, non-project mode)/run_sim.sh done; build_hls4ml.py/report.py not yet; results/build/ has a real timing report but currently no tob_top.bit -- ML classifier path closed (D53), two other unrelated timing violations still block write_bitstream
 ```
 
 ---
@@ -158,9 +158,13 @@ The datapath through egress (parser → book → features → signal → risk �
 make sim          # everything: golden models, RTL lint, every testbench, 1M-message soak
 RUN_SIM_FAST=1 make sim   # same, skipping the slow 1M-message soak
 
-make synth        # real Vivado synth+impl via scripts/build.tcl (non-project mode) -- now
-                  # closes timing with 0 latches (measured numbers: results/timing.md)
-make bit          # same target as synth; writes results/build/tob_top.bit once the gates pass -- they do
+make synth        # real Vivado synth+impl via scripts/build.tcl (non-project mode) -- 0 inferred
+                  # latches; the ML classifier's own path is closed (D53), but two other,
+                  # unrelated timing violations remain open (see D53 for detail) -- this is
+                  # NOT yet a build-wide WNS >= 0 pass (measured numbers: results/timing.md)
+make bit          # same target as synth; writes results/build/tob_top.bit only once build.tcl's
+                  # own WNS>=0 gate passes -- it currently does not (see above), so this
+                  # target currently exits without producing a bitstream
 python scripts/report.py   # (after a build) refreshes results/timing.md and results/utilization.md
 
 # or decode an order capture directly:
@@ -168,9 +172,9 @@ python sim/order_rx.py --in some_capture.hex
 python sim/order_rx.py --udp 5006   # live, once S11 hardware bring-up sends real traffic
 ```
 
-`make ml` runs the real training pipeline (`model/train.py`, then regenerates RTL bit-exactness vectors). `make synth`/`make bit` are real and now pass their own gates (zero latches, non-negative setup/hold slack) end to end — `results/build/tob_top.bit` is a real, gate-passing bitstream, produced for the first time this session. It has not yet been loaded onto physical hardware.
+`make ml` runs the real training pipeline (`model/train.py`, then regenerates RTL bit-exactness vectors). Because classifier weights are elaboration-time constants baked into `rtl/ml_classifier_wrap.v` via `$readmemh`, different weight values synthesize to different logic and can change synthesis timing with no RTL change at all (`docs/design_decisions.md` D53) — **re-run `make synth` and re-check its timing report after any retrain; don't assume a previously-passing build stays valid.** `make synth`/`make bit` are real and run the actual Vivado flow end to end (0 inferred latches), but do not currently pass their own build-wide WNS gate: the ML classifier's own path is closed (D53), while two other, ML-unrelated timing violations remain open (an async-reset-fanout recovery path, and the `risk_engine` token-bucket path — see D53). `results/build/tob_top.bit` does not currently exist; it was produced once, earlier (2026-09-08, D26-D40), before D52's real trained weights broke build-wide timing closure again. It has not yet been loaded onto physical hardware.
 
-Success criteria (defined in the master spec §1.6): line-rate processing of ≥ 1,000,000 messages with zero drops — **met** for the parser stage; a **single-occupancy latency histogram** (max == min) — histogram module built and tested in simulation (S9), not yet measured on real hardware; every risk gate individually demonstrated blocking — **met** in simulation for all nine gates, including `0x09` (ML), now against real trained weights (D52), verified bit-exact against `model/golden_vectors.csv` via `tb/tb_ml_bit_exact.v`; bit-exact RTL vs. golden model on a randomized soak — **met** in simulation for the 1,000,000-message parser-stage soak; the full-system pass (`tb/tb_top.v`) now runs 5,000 messages (up from 209, D51) and is bit-exact on 33/35 counters with one known, documented, non-blocking discrepancy in dense-burst TX-queue-overflow prediction (see `docs/design_decisions.md` D51); WNS ≥ 0 at 125 MHz — **met** after place-and-route (measured value: `results/timing.md` / master spec §12.3, not restated here — it's thin margin, worth reading in full rather than skimming a headline number); one-command reproduction from a clean clone — **met for simulation** (`make sim`), and `make synth`/`make bit` now run the real, reproducible Vivado flow through a passing bitstream.
+Success criteria (defined in the master spec §1.6): line-rate processing of ≥ 1,000,000 messages with zero drops — **met** for the parser stage; a **single-occupancy latency histogram** (max == min) — histogram module built and tested in simulation (S9), not yet measured on real hardware; every risk gate individually demonstrated blocking — **met** in simulation for all nine gates, including `0x09` (ML), now against real trained weights (D52), verified bit-exact against `model/golden_vectors.csv` via `tb/tb_ml_bit_exact.v`; bit-exact RTL vs. golden model on a randomized soak — **met** in simulation for the 1,000,000-message parser-stage soak; the full-system pass (`tb/tb_top.v`) now runs 5,000 messages (up from 209, D51) and is bit-exact on 33/35 counters with one known, documented, non-blocking discrepancy in dense-burst TX-queue-overflow prediction (see `docs/design_decisions.md` D51); WNS ≥ 0 at 125 MHz — **not currently met build-wide** (the ML classifier's own path is closed per D53, but two other, ML-unrelated violations remain open — measured value: `results/build/timing_summary.rpt`, `docs/design_decisions.md` D53); one-command reproduction from a clean clone — **met for simulation** (`make sim`); `make synth`/`make bit` run the real, reproducible Vivado flow, but currently stop short of a passing bitstream for the reason above.
 
 ## Honest limitations
 
@@ -199,7 +203,7 @@ Success criteria (defined in the master spec §1.6): line-rate processing of ≥
 | S6 | ML integration (`ml_classifier_wrap`, `ml_policy`, alignment register) | Done — built ahead of S4, against the fallback classifier |
 | S9 | Instrumentation (`latency_histogram`, `csr_block`, stats) | Done |
 | S10 | Board-level integration (`tob_top.v`) | Done |
-| S11 | Timing closure, hardware bring-up | Timing closed, first real gate-passing bitstream produced (`results/build/tob_top.bit`) — not yet tried on physical hardware |
+| S11 | Timing closure, hardware bring-up | First real gate-passing bitstream produced 2026-09-08 (D26-D40), not yet tried on physical hardware; that build-wide closure broke again when D52 landed real trained ML weights. D53 closed the ML classifier's own path, but two other, ML-unrelated timing violations remain open — no current `.bit` file until those are independently fixed |
 | S12 | Publish: README, results tables, demo video | Not started |
 
 ## License
