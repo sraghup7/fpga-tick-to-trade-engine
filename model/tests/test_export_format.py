@@ -48,6 +48,36 @@ def test_weights_and_bias_export_as_hex(tmp_path=None):
         train.MODEL_DIR = orig_model_dir
 
 
+def test_export_rejects_weights_violating_acc_w_bound():
+    """model/train.py's export() must reject a weight/bias combination that
+    would violate rtl/ml_classifier_wrap.v's ACC_W=20 accumulator bound
+    (|bias| + SUM 128*|w_i| < 2**19) -- this is the Python-side half of the
+    two-independent-guards requirement from docs/design_decisions.md D53;
+    the RTL-side half is ml_classifier_wrap.v's own initial-block check.
+    """
+    import pytest
+
+    # All 8 weights at the int8 extreme (-128) plus a large bias: clearly
+    # violates the bound (8*128*128 + a huge bias is nowhere near 2**19... use
+    # an intentionally-broken huge bias to force the violation unambiguously).
+    weights_i8 = np.array([-128, -128, -128, -128, -128, -128, -128, -128], dtype=np.int8)
+    bias_i32 = np.int32(2_000_000)  # forces |bias|+SUM128|w_i| well past 2**19
+
+    with pytest.raises(ValueError, match=r"(?i)acc_w|bound|accumulator"):
+        train.export(
+            offsets=np.zeros(8, dtype=np.int64),
+            shifts=np.zeros(8, dtype=np.int64),
+            weights_i8=weights_i8,
+            bias_i32=bias_i32,
+            t_high=10,
+            t_low=5,
+            threshold_source="percentile_fallback_95",
+            x_val_i8=np.zeros((1, 8), dtype=np.int8),
+            z_val=np.array([0], dtype=np.int32),
+            y_val=np.array([0], dtype=np.int8),
+        )
+
+
 if __name__ == "__main__":
     test_weights_and_bias_export_as_hex()
     print("PASS")

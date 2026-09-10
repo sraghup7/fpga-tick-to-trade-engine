@@ -164,6 +164,19 @@ def export(
     z_val: np.ndarray,
     y_val: np.ndarray,
 ) -> None:
+    # ACC_W bound (rtl/ml_classifier_wrap.v, docs/design_decisions.md D53):
+    # the RTL's balanced-tree accumulator is only bit-exact if
+    # |bias| + SUM 128*|w_i| < 2**19 (ACC_W=20). Checked here, independent
+    # of the RTL's own initial-block check, so a bad retrain fails loudly
+    # in Python before ever producing a .mem file.
+    ACC_W = 20
+    bound = int(abs(int(bias_i32))) + sum(128 * abs(int(w)) for w in weights_i8)
+    if bound >= 2 ** (ACC_W - 1):
+        raise ValueError(
+            f"weights/bias violate the ml_classifier_wrap.v ACC_W={ACC_W} accumulator "
+            f"bound: |bias|+sum(128*|w_i|)={bound} >= 2**{ACC_W - 1}"
+        )
+
     model_config = {
         "status": (
             "TRAINED (S4 pipeline, model/train.py). Replaces the master "
