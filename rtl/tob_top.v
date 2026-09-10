@@ -28,12 +28,13 @@
 //   * ML path (S6, contract docs/contracts/ml_integration.md): the full
 //     feature_extractor -> feature_normalizer -> ml_classifier_wrap ->
 //     ml_policy chain is wired; risk_engine's adverse_risk comes from
-//     ml_policy.v, and the signal branch is delayed ALIGN_DEPTH=4 cycles so
+//     ml_policy.v, and the signal branch is delayed ALIGN_DEPTH=5 cycles so
 //     the order intent and the ML verdict arrive at u_risk on the same cycle
 //     (D26/D27 v2 timing patch bumped this from 3 to 5; D40 rebalanced it to
-//     4 when signal_engine.v gained its own pipeline stage; risk_engine.v's
-//     own D28 fix keys its internal book-state snapshot to the same
-//     ALIGN_DEPTH).
+//     4 when signal_engine.v gained its own pipeline stage; D53 bumped it to
+//     5 when ml_classifier_wrap.v gained a second pipeline stage;
+//     risk_engine.v's own D28 fix keys its internal book-state snapshot to
+//     the same ALIGN_DEPTH).
 //   * err_fcs/err_ip are wired from mac_top's D5 outputs
 //     (mac_rec_error / udp_checksum_error). D49 (FR-2/FR-3):
 //     err_ethertype now comes from mac_top's new mac_rx.v pulse (a frame
@@ -497,15 +498,20 @@ module tob_top #(
     // (docs/contracts/ml_integration.md S1.3). u_csr's own sig_valid/sig_side
     // connections below stay on the RAW (unaligned) u_sig outputs -- they
     // count signals as generated, not as risk-gated.
-    localparam ALIGN_DEPTH = 4;   // feature_extractor.v takes 3 cycles to
+    localparam ALIGN_DEPTH = 5;   // feature_extractor.v takes 3 cycles to
                                   // feat_valid (D26/D27 v2 timing patch: F1
                                   // split across 2 stages + incremental
-                                  // F5/F7 accumulator); ML branch is 6
-                                  // cycles total, signal branch now 2 (D40:
-                                  // signal_engine.v gained its own pipeline
-                                  // stage to close a timing violation
-                                  // exposed by D39 -- was 5 when the signal
-                                  // branch was 1 cycle)
+                                  // F5/F7 accumulator); ML branch is now 7
+                                  // cycles total (was 6), signal branch
+                                  // still 2 (D40: signal_engine.v gained its
+                                  // own pipeline stage to close a timing
+                                  // violation exposed by D39 -- was 5 when
+                                  // the signal branch was 1 cycle). D53:
+                                  // ml_classifier_wrap.v split into 2
+                                  // pipeline stages (was 1) to close its own
+                                  // remaining timing violation, so the ML
+                                  // branch total grew by 1 and ALIGN_DEPTH
+                                  // grows 4->5 to match.
     wire        sig_valid_aligned;
     wire [73:0] sig_data_aligned;
     wire [1:0]  sig_slot_aligned  = sig_data_aligned[73:72];
@@ -741,8 +747,14 @@ module tob_top #(
                                             // register (D36, +1) + signal_engine
                                             // (2, D40) + risk_engine's 2-cycle
                                             // gate pipeline (D34), plus S6's
-                                            // alignment delay -- total stays 9
-                                            // (was 4+5): D40 moved one cycle
+                                            // alignment delay -- total is now
+                                            // 10 (was 9): D53 bumped
+                                            // ALIGN_DEPTH 4->5 when
+                                            // ml_classifier_wrap.v gained a
+                                            // second pipeline stage, which
+                                            // auto-propagates here via this
+                                            // same formula. Historically:
+                                            // D40 moved one cycle
                                             // from ALIGN_DEPTH into
                                             // signal_engine's own latency, net
                                             // zero change (docs/design_decisions.md D25, D40)

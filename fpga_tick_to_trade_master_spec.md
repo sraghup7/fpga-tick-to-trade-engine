@@ -516,13 +516,13 @@ Design-target latency budget — the **critical path runs through the ML branch*
 | Book update | 1 | register write |
 | Feature extraction | 1 | F0–F7, register history |
 | Feature normalization | 1 | shift/subtract/saturate |
-| ML classifier (hls4ml Dense) | 2–3 | parallel MAC + adder tree |
+| ML classifier (hls4ml Dense) | 2–3 (hand-written fallback: 2, `docs/design_decisions.md` D53) | parallel MAC + adder tree |
 | ML policy (hysteresis) | 1 | threshold compare |
 | Risk (all 9 gates, incl. ML verdict) | 1 | parallel |
 | Order builder → first byte | 1 | serialize |
 | **Engine total (tick-to-trade)** | **~10–11 (target ≤ 22)** | single fixed value |
 
-The **signal branch** (`book → signal → order intent`, 1 cycle) runs in parallel with the ML branch and is delayed through a fixed-depth alignment register so its order intent arrives at the risk engine in the same cycle as `adverse_risk`. Alignment depth ≈ 4–5 cycles = (ML-branch depth) − (signal-branch depth), a compile-time constant (NFR-14).
+The **signal branch** (`book → signal → order intent`, 1 cycle) runs in parallel with the ML branch and is delayed through a fixed-depth alignment register so its order intent arrives at the risk engine in the same cycle as `adverse_risk`. Alignment depth ≈ 4–5 cycles = (ML-branch depth) − (signal-branch depth), a compile-time constant (NFR-14) — the hand-written fallback classifier's own `tob_top.v` value is now 5 (`ALIGN_DEPTH`, D53: bumped from 4 when `ml_classifier_wrap.v` was split into 2 pipeline stages to close a synthesis timing violation).
 
 ### 7.2 Throughput
 

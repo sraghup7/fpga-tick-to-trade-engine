@@ -92,42 +92,66 @@ module tb_ml_classifier_wrap;
         end
     endtask
 
+    // No-op settle: holds norm_valid=0 for exactly one clock cycle. Reuses
+    // `drive` with v=0, the same idiom already used below for the
+    // "norm_valid=0 produces no pulse" case -- inserted once between a
+    // drive() and its own check so the 2-cycle pipeline (D53: split into 2
+    // registered stages) has settled before sampling ml_valid/ml_slot/z.
+    task settle;
+        begin
+            drive(1'b0, 2'd0, 0, 0, 0, 0, 0, 0, 0, 0);
+        end
+    endtask
+
     initial begin
         do_reset;
         chk(0, ml_valid, 1'b0);
 
         // ---- all-zero features: z = 0 ----
         drive(1'b1, 2'd0, 0, 0, 0, 0, 0, 0, 0, 0);
+        settle;   // D53: 2nd of 2 pipeline cycles
         chk(10, ml_valid, 1'b1);
         chk(11, ml_slot, 2'd0);
         chkz(12, z, 32'sd0);
 
         // ---- all-max-positive: z = 8 * 127 = 1016 ----
         drive(1'b1, 2'd1, 127, 127, 127, 127, 127, 127, 127, 127);
+        settle;
         chkz(13, z, 32'sd1016);
 
         // ---- all-max-negative: z = 8 * (-128) = -1024 ----
         drive(1'b1, 2'd2, -128, -128, -128, -128, -128, -128, -128, -128);
+        settle;
         chkz(14, z, -32'sd1024);
 
         // ---- mixed signs: 10-20+30-40+50-60+70-80 = -40 ----
         drive(1'b1, 2'd3, 10, -20, 30, -40, 50, -60, 70, -80);
+        settle;
         chk(15, ml_valid, 1'b1);
         chk(16, ml_slot, 2'd3);   // norm_slot passes through unchanged
         chkz(17, z, -32'sd40);
 
         // ---- norm_valid=0 produces no ml_valid pulse ----
         drive(1'b0, 2'd0, 0, 0, 0, 0, 0, 0, 0, 0);
+        settle;
         chk(18, ml_valid, 1'b0);
 
-        // ---- back-to-back norm_valid pulses: both pipelined, none dropped ----
+        // ---- back-to-back norm_valid pulses: both pipelined, none dropped.
+        // D53: with 2-cycle latency, driving two events on consecutive
+        // cycles (no settle between them, to keep testing true input
+        // adjacency) means the check right after the second drive() reflects
+        // the FIRST event's result (2 cycles after event 1 == 1 cycle after
+        // event 2); the second event's own result needs one more settle. ----
         do_reset;
-        drive(1'b1, 2'd0, 5, 5, 5, 5, 5, 5, 5, 5);   // z = 40
-        chkz(20, z, 32'sd40);
-        drive(1'b1, 2'd1, 3, 3, 3, 3, 3, 3, 3, 3);   // z = 24
-        chk(21, ml_valid, 1'b1);
-        chk(22, ml_slot, 2'd1);
-        chkz(23, z, 32'sd24);
+        drive(1'b1, 2'd0, 5, 5, 5, 5, 5, 5, 5, 5);   // event 1: z = 40
+        drive(1'b1, 2'd1, 3, 3, 3, 3, 3, 3, 3, 3);   // event 2: z = 24 (back-to-back, no settle)
+        chk(19, ml_valid, 1'b1);
+        chk(20, ml_slot, 2'd0);       // event 1's slot
+        chkz(21, z, 32'sd40);         // event 1's own result
+        settle;
+        chk(22, ml_valid, 1'b1);
+        chk(23, ml_slot, 2'd1);       // event 2's slot
+        chkz(24, z, 32'sd24);         // event 2's own result
 
         if (fail) begin
             $display("FAIL");

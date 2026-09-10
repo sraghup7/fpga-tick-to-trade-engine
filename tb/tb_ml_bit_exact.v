@@ -60,6 +60,21 @@ module tb_ml_bit_exact;
         end
     endtask
 
+    // D53: ml_classifier_wrap.v now registers z 2 cycles after norm_valid
+    // (was 1), so back-to-back drive() calls (one per vector, streamed with
+    // no gap to also exercise true pipelined back-to-back behavior) present
+    // vector i's inputs but leave z showing vector (i-1)'s result by the time
+    // drive() returns -- one settle cycle (norm_valid=0) drains the last
+    // vector's own result after the loop.
+    task settle;
+        begin
+            @(negedge clk);
+            norm_valid = 1'b0;
+            @(posedge clk);
+            #1;
+        end
+    endtask
+
     initial begin
         @(negedge clk);
         rst_n = 1'b0; norm_valid = 1'b0;
@@ -77,13 +92,27 @@ module tb_ml_bit_exact;
                 x_mem[i*8+0], x_mem[i*8+1], x_mem[i*8+2], x_mem[i*8+3],
                 x_mem[i*8+4], x_mem[i*8+5], x_mem[i*8+6], x_mem[i*8+7]
             );
-            if (z !== $signed(z_expected[i])) begin
-                mismatches = mismatches + 1;
-                if (mismatches <= 10) begin
-                    $display("FAIL: vector %0d: z=%0d, expected %0d", i, z, $signed(z_expected[i]));
+            // D53: z reflects vector (i-1) here (2-cycle latency, streamed
+            // back-to-back) -- nothing to check yet on the very first vector.
+            if (i > 0) begin
+                if (z !== $signed(z_expected[i-1])) begin
+                    mismatches = mismatches + 1;
+                    if (mismatches <= 10) begin
+                        $display("FAIL: vector %0d: z=%0d, expected %0d", i-1, z, $signed(z_expected[i-1]));
+                    end
+                    fail = 1'b1;
                 end
-                fail = 1'b1;
             end
+        end
+        // Drain: one settle cycle brings up the LAST vector's own result.
+        settle;
+        if (z !== $signed(z_expected[`ML_BIT_EXACT_N-1])) begin
+            mismatches = mismatches + 1;
+            if (mismatches <= 10) begin
+                $display("FAIL: vector %0d: z=%0d, expected %0d",
+                         `ML_BIT_EXACT_N-1, z, $signed(z_expected[`ML_BIT_EXACT_N-1]));
+            end
+            fail = 1'b1;
         end
 
         if (fail) begin

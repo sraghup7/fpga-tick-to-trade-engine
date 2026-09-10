@@ -124,12 +124,14 @@ module tb_tob_top;
     // trace back to the same triggering message's book_upd_valid (this
     // snapshot pipeline vs feature_extractor -> feature_normalizer ->
     // ml_classifier_wrap's real latency). A future latency change anywhere in
-    // the ML chain that drifts ml_valid relative to ml_policy's
-    // SNAPSHOT_DEPTH default (4) is caught by simulation, not a later audit.
-    // The same frame-cadence note as the D28 guard applies -- two same-slot
-    // book updates can never land inside the ~5-cycle ML window when frames
-    // arrive hundreds of cycles apart, so the unit-level poison regression
-    // lives in tb_ml_policy; this is the integration-level structural check.
+    // the ML chain that drifts ml_valid relative to ml_policy's wired
+    // SNAPSHOT_DEPTH (tob_top.v's ALIGN_DEPTH, now 5 -- was 4 before D53's
+    // extra ml_classifier_wrap.v pipeline stage) is caught by simulation, not
+    // a later audit. The same frame-cadence note as the D28 guard applies --
+    // two same-slot book updates can never land inside the ~6-cycle ML window
+    // when frames arrive hundreds of cycles apart, so the unit-level poison
+    // regression lives in tb_ml_policy; this is the integration-level
+    // structural check.
     always @(posedge dut.gmii_rx_clk) begin
         if (dut.engine_rst_n &&
             (dut.u_policy.fs_snap_out_valid !== dut.ml_valid)) begin

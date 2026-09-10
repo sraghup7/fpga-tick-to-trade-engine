@@ -69,21 +69,32 @@ its trigger input (established by `feature_extractor.v`/
 | :-- | --: |
 | `feature_extractor.v` (`feat_valid`) | +1 |
 | `feature_normalizer.v` (`norm_valid`) | +2 |
-| `ml_classifier_wrap.v` (`ml_valid`) | +3 |
-| `ml_policy.v` (registered `adverse_risk` reflects this event) | +4 |
+| `ml_classifier_wrap.v` (`ml_valid`) | +4 |
+| `ml_policy.v` (registered `adverse_risk` reflects this event) | +5 |
 | `signal_engine.v` (`sig_valid`) | +1 |
 
-`ALIGN_DEPTH = (ML branch, 4) − (signal branch, 1) = 3` — a fixed-depth
-delay line (§2) delays `signal_engine.v`'s order-intent bus by exactly 3
-cycles so it reaches `risk_engine.v` on the same cycle `adverse_risk`'s
-registered value reflects the *same* triggering event. This is shallower
-than the master spec's own estimate of "4–5 cycles" (§7.1) because that
-estimate assumed the real hls4ml IP's 2–3 cycle classifier latency; the
-hand-written 8-MAC classifier here is small enough to close timing in one
-combinational cycle, registered once. **`ALIGN_DEPTH` is a single
-`localparam` in `tob_top.v`** — when the real hls4ml IP eventually
-replaces `ml_classifier_wrap.v`'s internals, only that one constant may
-need to change, nothing else.
+`ml_classifier_wrap.v`'s entry moved from +3 to +4 (docs/design_decisions.md
+D53): it closes a synthesis timing violation by splitting into 2 registered
+pipeline stages (stage 1 registers the raw int8x8 products, stage 2
+computes the balanced adder tree + bias), so `ml_valid` now lands 2 cycles
+after `norm_valid` instead of 1. `ml_policy.v`'s entry shifts with it.
+
+`ALIGN_DEPTH = (ML branch, 5) − (signal branch, 1) = 4` in this table's own
+local counting — a fixed-depth delay line (§2) delays `signal_engine.v`'s
+order-intent bus by exactly that many cycles so it reaches `risk_engine.v`
+on the same cycle `adverse_risk`'s registered value reflects the *same*
+triggering event. **Note:** this section's baseline stage counts
+(`feature_extractor.v` +1, `feature_normalizer.v` +2) predate several later
+timing patches (D26/D27/D40) that changed those two stages' own latencies
+in `rtl/tob_top.v` without this contract doc being reconciled afterward —
+`rtl/tob_top.v`'s `localparam ALIGN_DEPTH` (currently 5, per D53) and
+`docs/design_decisions.md` are the authoritative values for the actual
+built RTL; this table's absolute numbers are historical/illustrative and
+only its *relative* shift from this task (+1 cycle on the ML branch) should
+be trusted at face value. **`ALIGN_DEPTH` is a single `localparam` in
+`tob_top.v`** — when the real hls4ml IP eventually replaces
+`ml_classifier_wrap.v`'s internals, only that one constant may need to
+change, nothing else.
 
 Why this is safe under back-to-back messages (NFR-5, one message/cycle):
 each pipeline stage advances exactly one event per cycle in strict

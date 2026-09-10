@@ -15,9 +15,10 @@
 //     rtl/common/delay_line.v tb/tb_ml_chain.v
 //   vvp tb_ml_chain.vvp
 //
-// Pipeline timing (D26/D27 v2 timing patch): book_upd_valid at cycle 0,
+// Pipeline timing (D26/D27 v2 timing patch, D53): book_upd_valid at cycle 0,
 // feat_valid +3 (feature_extractor.v's 3-stage pipeline), norm_valid +4,
-// ml_valid (and z) +5, adverse_risk/pulses registered at +6.
+// ml_valid (and z) +6 (was +5 -- D53 split ml_classifier_wrap.v into 2
+// pipeline stages), adverse_risk/pulses registered at +7 (was +6).
 // feature_normalizer's cfg_offset_i/cfg_shift_i are all 0 (identity
 // normalization), so x_i = raw feature clamped to int8 -- every raw feature
 // below is chosen small enough (< 128) that no clamp fires, making z a plain
@@ -143,7 +144,20 @@ module tb_ml_chain;
         .ml_valid(ml_valid), .ml_slot(ml_slot), .z(z)
     );
 
-    ml_policy #(.NUM_SYMBOLS(4)) u_policy (
+    ml_policy #(
+        .NUM_SYMBOLS    (4),
+        .SNAPSHOT_DEPTH (5)   // D53: explicitly pinned to this chain's real
+                              // book_upd_valid -> ml_valid latency (was 4,
+                              // implicitly matching ml_policy.v's own
+                              // default; now explicit since
+                              // ml_classifier_wrap.v's extra pipeline stage
+                              // moved the real latency to 5 but this
+                              // module's own default stays 4 -- same
+                              // "explicit wiring, don't rely on a
+                              // coincidental default" reasoning as
+                              // tob_top.v's ALIGN_DEPTH -> SNAPSHOT_DEPTH
+                              // wiring, Task 3)
+    ) u_policy (
         .clk(clk), .rst_n(rst_n),
         // D28-class fix (ml_policy_align_fix.md S3): key u_policy's internal
         // fail-safe snapshot to the triggering message's own book update --
@@ -168,8 +182,9 @@ module tb_ml_chain;
     // book_upd_valid (this snapshot pipeline vs feature_extractor ->
     // feature_normalizer -> ml_classifier_wrap's real latency). A future
     // latency change anywhere in the ML chain that drifts ml_valid relative to
-    // ml_policy's SNAPSHOT_DEPTH default (4) is caught by simulation, not a
-    // later audit.
+    // u_policy's explicitly-pinned SNAPSHOT_DEPTH (5, above) is caught by
+    // simulation, not a later audit -- this is exactly what caught D53's own
+    // +1 cycle shift when this tb was updated for it.
     always @(posedge clk) begin
         #1;
         if (rst_n && (u_policy.fs_snap_out_valid !== ml_valid)) begin
@@ -223,10 +238,11 @@ module tb_ml_chain;
                             // the fired event was on
     reg        c_ev, c_forced, c_adv_pulse, c_ben_pulse;
 
-    // Present one message and advance the whole ML pipeline (6 clock cycles
-    // past the message's commit edge, D26/D27 v2 timing patch) so
+    // Present one message and advance the whole ML pipeline (7 clock cycles
+    // past the message's commit edge, D26/D27 v2 timing patch + D53) so
     // adverse_risk/pulses reflect it. z/ml_slot are sampled on ml_valid's
-    // own cycle (+5); the verdicts are sampled one cycle later (+6).
+    // own cycle (+6, was +5 before D53's extra classifier stage); the
+    // verdicts are sampled one cycle later (+7, was +6).
     task fire;
         input [7:0]  mt;
         input [7:0]  ms;
@@ -244,8 +260,10 @@ module tb_ml_chain;
             @(posedge clk); #1;                // two extra cycles: feat_valid
             @(posedge clk); #1;                // now pulses at +3 (D26/D27 v2)
             @(posedge clk); #1;                // P1: norm_valid latches
+            @(posedge clk); #1;                // P1.5: ml_classifier_wrap.v stage 1
+                                                // (products) latch (D53) -- new cycle
             @(posedge clk); #1;                // P2: ml_valid/z latch
-            @(negedge clk);                    // cycle 5: ml_valid/z visible
+            @(negedge clk);                    // cycle 6: ml_valid/z visible
             c_ml_valid = ml_valid; c_slot = ml_slot; c_z = z;
             @(posedge clk); #1;                // P3: adverse/pulses latch
             c_adverse  = adverse_risk;
@@ -329,6 +347,7 @@ module tb_ml_chain;
         @(negedge clk);
         filt_valid = 1'b0; err_seq_dup = 1'b0;
         @(posedge clk); #1;              // M2 book_upd_valid: slot 0 now healthy
+        @(posedge clk); #1;              // M1 ml stage 1 (products) latch (D53)
         @(posedge clk); #1;              // M1 ml_valid high
         @(negedge clk);                  // sample M1's ml_valid/z on its own cycle
         c_ml_valid = ml_valid; c_slot = ml_slot; c_z = z;

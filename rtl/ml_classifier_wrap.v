@@ -32,10 +32,15 @@
 // width auditable, same spirit as risk_engine.v's D16/FR-45 signed-width
 // comments and feature_normalizer.v's >>> footgun note.
 //
-// Timing: z/ml_valid/ml_slot register exactly one cycle after norm_valid
-// (S1.3: feat_valid +1, norm_valid +2, ml_valid +3), norm_slot passes through
-// unchanged. Back-to-back norm_valid pulses are independent -- no cross-event
-// state.
+// Timing: z/ml_valid/ml_slot register exactly two cycles after norm_valid
+// (S1.3: feat_valid +1, norm_valid +2, ml_valid +4; docs/design_decisions.md
+// D53) -- split into 2 pipeline stages to close a timing violation whose
+// bottleneck ran partly through each product term's own multiply carry
+// chain (Task 4 synthesis evidence): stage 1 registers the raw int8x8
+// products, stage 2 computes the balanced adder tree + bias from those
+// registered products and registers the final result. norm_slot passes
+// through both stages unchanged. Back-to-back norm_valid pulses are
+// independent -- no cross-event state.
 //
 // Verilog-2001 only.
 
@@ -98,6 +103,16 @@ module ml_classifier_wrap #(
     wire signed [ACC_W-1:0] bias_trunc = bias[ACC_W-1:0];
 
     // Exact int8 x int8 -> int16 products (S5.4) -- unchanged.
+    // Pipelined into 2 stages (docs/design_decisions.md D53): stage 1
+    // registers the raw products (each product's own multiply carry chain
+    // settles within cycle 1's budget -- Vivado implements each int8x8
+    // constant multiply as its own CARRY4 chain, not flat LUTs, per Task 4's
+    // synthesis evidence), stage 2 computes the balanced adder tree + bias
+    // from the registered products and registers the final result.
+    reg signed [15:0] p0_r, p1_r, p2_r, p3_r, p4_r, p5_r, p6_r, p7_r;
+    reg               stage1_valid;
+    reg [1:0]         stage1_slot;
+
     wire signed [15:0] p0 = $signed(x0) * $signed(w_mem[0]);
     wire signed [15:0] p1 = $signed(x1) * $signed(w_mem[1]);
     wire signed [15:0] p2 = $signed(x2) * $signed(w_mem[2]);
@@ -110,11 +125,13 @@ module ml_classifier_wrap #(
     // Balanced-tree, narrowed-width sum (docs/design_decisions.md D53) --
     // replaces the previous left-to-right 32-bit chain. Reassociation is
     // exact in two's complement as long as no intermediate overflows its
-    // declared width, which the ACC_W bound above guarantees.
-    wire signed [ACC_W-1:0] s0 = $signed(p0) + $signed(p1);
-    wire signed [ACC_W-1:0] s1 = $signed(p2) + $signed(p3);
-    wire signed [ACC_W-1:0] s2 = $signed(p4) + $signed(p5);
-    wire signed [ACC_W-1:0] s3 = $signed(p6) + $signed(p7);
+    // declared width, which the ACC_W bound above guarantees. Now computed
+    // from the registered products (p*_r), one cycle after the products
+    // themselves settle.
+    wire signed [ACC_W-1:0] s0 = $signed(p0_r) + $signed(p1_r);
+    wire signed [ACC_W-1:0] s1 = $signed(p2_r) + $signed(p3_r);
+    wire signed [ACC_W-1:0] s2 = $signed(p4_r) + $signed(p5_r);
+    wire signed [ACC_W-1:0] s3 = $signed(p6_r) + $signed(p7_r);
     wire signed [ACC_W-1:0] t0 = s0 + s1;
     wire signed [ACC_W-1:0] t1 = s2 + s3;
     wire signed [ACC_W-1:0] acc = (t0 + t1) + bias_trunc;
@@ -122,12 +139,21 @@ module ml_classifier_wrap #(
 
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
+            stage1_valid <= 1'b0;
+            stage1_slot  <= 2'd0;
+            p0_r <= 16'sd0; p1_r <= 16'sd0; p2_r <= 16'sd0; p3_r <= 16'sd0;
+            p4_r <= 16'sd0; p5_r <= 16'sd0; p6_r <= 16'sd0; p7_r <= 16'sd0;
             ml_valid <= 1'b0;
             ml_slot  <= 2'd0;
             z        <= 32'sd0;
         end else begin
-            ml_valid <= norm_valid;
-            ml_slot  <= norm_slot;
+            stage1_valid <= norm_valid;
+            stage1_slot  <= norm_slot;
+            p0_r <= p0; p1_r <= p1; p2_r <= p2; p3_r <= p3;
+            p4_r <= p4; p5_r <= p5; p6_r <= p6; p7_r <= p7;
+
+            ml_valid <= stage1_valid;
+            ml_slot  <= stage1_slot;
             z        <= z_c;
         end
     end

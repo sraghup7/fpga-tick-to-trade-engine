@@ -11,8 +11,8 @@
 //   iverilog -g2001 -Wall -o tb_ml_policy.vvp rtl/ml_policy.v \
 //       rtl/common/delay_line.v tb/tb_ml_policy.v
 //   vvp tb_ml_policy.vvp
-//   # and for the depth-independence pass:
-//   iverilog -g2001 -DTB_SNAPSHOT_DEPTH=4 -o tb_ml_policy4.vvp \
+//   # and for the depth-independence pass (real depth, D53: was 4, now 5):
+//   iverilog -g2001 -DTB_SNAPSHOT_DEPTH=5 -o tb_ml_policy5.vvp \
 //       rtl/ml_policy.v rtl/common/delay_line.v tb/tb_ml_policy.v
 //
 // Why the DUT is driven through its own snapshot pipeline: since the fix,
@@ -29,7 +29,8 @@
 //
 // SNAPSHOT_DEPTH is `TB_SNAPSHOT_DEPTH (default 3), deliberately independent
 // of -- and numerically different from -- tob_top.v's ALIGN_DEPTH (currently
-// 4): the whole point of the fix is that these two parameters are NOT
+// 5, per D53: was 4 before ml_classifier_wrap.v gained a second pipeline
+// stage): the whole point of the fix is that these two parameters are NOT
 // coupled, and a tb that instantiated this module at a depth equal to
 // ALIGN_DEPTH could let a "SNAPSHOT_DEPTH reuses ALIGN_DEPTH" wiring bug pass
 // by coincidence. Run with -DTB_SNAPSHOT_DEPTH=<N> to confirm any depth.
@@ -276,7 +277,7 @@ module tb_ml_policy;
 
     initial begin
         if (SNAPSHOT_DEPTH < 3) begin
-            $display("FAIL: tb_ml_policy requires TB_SNAPSHOT_DEPTH >= 3 (got %0d); real depth is 4", SNAPSHOT_DEPTH);
+            $display("FAIL: tb_ml_policy requires TB_SNAPSHOT_DEPTH >= 3 (got %0d); real depth is 5 (D53)", SNAPSHOT_DEPTH);
             $finish;
         end
         do_reset;
