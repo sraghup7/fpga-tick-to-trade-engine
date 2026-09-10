@@ -49,6 +49,15 @@ def parse_timing(text):
     # Achieved Fmax = 1 / (constrained period - worst setup slack), not the
     # constrained clock's own nominal frequency (which is just NFR-1's target).
     fmax_mhz = (1000.0 / (period_ns - float(wns))) if period_ns else None
+    # Vivado prints this sentence itself, right after the summary table --
+    # use it directly rather than re-deriving pass/fail from the failing-
+    # endpoint counts (which a future report format change could break
+    # silently). Found missing 2026-09-09: this whole function had only ever
+    # been exercised against a MET report before (D29 -- every prior build
+    # failed the WNS gate before report_timing_summary even ran), so a
+    # missing "met" status went unnoticed until the first real VIOLATED run.
+    met_m = re.search(r"Timing constraints are (not met|met)\.", text)
+    met = (met_m.group(1) == "met") if met_m else None
     return {
         "wns": float(wns), "tns": float(tns),
         "tns_fail": int(tns_fail), "tns_total": int(tns_total),
@@ -56,15 +65,22 @@ def parse_timing(text):
         "ths_fail": int(ths_fail), "ths_total": int(ths_total),
         "period_ns": period_ns, "fmax_mhz": fmax_mhz,
         "clock_name": clk.group(1) if clk else None,
+        "met": met,
     }
 
 
 def parse_worst_path(text, label):
     """First 'Max Delay Paths' / 'Min Delay Paths' block's Source/Destination
     and one-line delay summary, for the top-level rx_clk->rx_clk group only
-    (the first occurrence in the file)."""
+    (the first occurrence in the file). Matches BOTH "Slack (MET)" and
+    "Slack (VIOLATED)" -- a MET-only regex silently falls through to the
+    next matching block anywhere in the file (e.g. an unrelated, always-
+    passing sys_clk path) whenever the real rx_clk path is violated, which
+    is exactly the report.py bug found 2026-09-09 on the first real failing
+    build (D29: no prior build ever reached report_timing_summary while
+    failing, so this path was never exercised)."""
     block = re.search(
-        label + r" Paths\n-+\nSlack \(MET\)\s*:\s*([\d.-]+)ns.*?\n"
+        label + r" Paths\n-+\nSlack \((MET|VIOLATED)\)\s*:\s*([\d.-]+)ns.*?\n"
         r"\s*Source:\s*(\S+)\n.*?\n"
         r"\s*Destination:\s*(\S+)\n",
         text, re.DOTALL,
@@ -72,9 +88,10 @@ def parse_worst_path(text, label):
     if not block:
         return None
     return {
-        "slack_ns": float(block.group(1)),
-        "source": block.group(2),
-        "destination": block.group(3),
+        "status": block.group(1),
+        "slack_ns": float(block.group(2)),
+        "source": block.group(3),
+        "destination": block.group(4),
     }
 
 
@@ -123,23 +140,42 @@ def write_timing_md(timing_text):
     lines.append(f"| Hold failing endpoints | {t['ths_fail']} / {t['ths_total']} |")
     lines.append(f"| Achieved Fmax ({t['clock_name']}) | {t['fmax_mhz']:.3f} MHz (period {t['period_ns']:.3f} ns) |")
     lines.append("")
-    lines.append("**All user-specified timing constraints are met (0 failing endpoints, both setup and hold).**")
+    if t["met"] is True:
+        lines.append("**All user-specified timing constraints are met (0 failing endpoints, both setup and hold).**")
+    elif t["met"] is False:
+        lines.append(f"**Timing constraints are NOT met** — {t['tns_fail']} setup / {t['ths_fail']} hold "
+                      f"endpoint(s) failing (Vivado's own `report_timing_summary` verdict). "
+                      f"Do not treat this build's bitstream as ready for hardware.")
+    else:
+        lines.append("**WARN: could not determine met/not-met status from this report.**")
     lines.append("")
     if worst_setup:
-        lines.append(f"Worst setup path: slack **{worst_setup['slack_ns']:.3f} ns** — "
-                      f"`{worst_setup['source']}` → `{worst_setup['destination']}` "
-                      f"(order_builder's TX payload register into the latency histogram's "
-                      f"distributed-RAM write port; see `docs/design_decisions.md` D26-D40 "
-                      f"for the bottleneck history that got timing here).")
+        label = "path" if worst_setup["status"] == "MET" else "**VIOLATED** path"
+        lines.append(f"Worst setup {label}: slack **{worst_setup['slack_ns']:.3f} ns** — "
+                      f"`{worst_setup['source']}` → `{worst_setup['destination']}`"
+                      + (" (order_builder's TX payload register into the latency histogram's "
+                         "distributed-RAM write port; see `docs/design_decisions.md` D26-D40 "
+                         "for the bottleneck history that got timing here)."
+                         if worst_setup["status"] == "MET" else "."))
         lines.append("")
     if worst_hold:
-        lines.append(f"Worst hold path: slack **{worst_hold['slack_ns']:.3f} ns** — "
+        label = "path" if worst_hold["status"] == "MET" else "**VIOLATED** path"
+        lines.append(f"Worst hold {label}: slack **{worst_hold['slack_ns']:.3f} ns** — "
                       f"`{worst_hold['source']}` → `{worst_hold['destination']}`.")
         lines.append("")
-    lines.append("**Caveat (see master spec S0 / D40, and the Opus review that prompted this")
-    lines.append("script): 0.141 ns of setup margin on an 8 ns period is 1.8% — real but thin.")
+    if t["met"] is True and t["period_ns"]:
+        margin_pct = 100.0 * t["wns"] / t["period_ns"]
+        lines.append("**Caveat (see master spec S0 / D40, and the Opus review that prompted this")
+        lines.append(f"script): {t['wns']:.3f} ns of setup margin on a {t['period_ns']:.3f} ns period is "
+                      f"{margin_pct:.1f}% — real but thin.")
+    elif t["met"] is False:
+        lines.append("**Caveat (see master spec S0 / D40, and the Opus review that prompted this")
+        lines.append(f"script): the worst setup path is violated by {abs(t['wns']):.3f} ns on a "
+                      f"{t['period_ns']:.3f} ns period — not a margin, a real deficit that must be "
+                      f"closed (e.g. by pipelining the failing path) before this build's bitstream can")
+        lines.append("be trusted for hardware.")
     lines.append("`constraints/tob_timing.xdc` sets no `set_input_delay`/`set_output_delay` on")
-    lines.append("RGMII, so the 31,058 timed endpoints above are internal paths only; the")
+    lines.append(f"RGMII, so the {t['tns_total']} timed endpoints above are internal paths only; the")
     lines.append("source-synchronous PHY interface itself is unconstrained and unmeasured here.**")
     lines.append("")
     (OUT_DIR / "timing.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
@@ -166,12 +202,15 @@ def write_utilization_md(util_text):
     lines.append(fmt_row("Block RAM Tile", u["bram"]))
     lines.append(fmt_row("DSPs", u["dsp"]))
     lines.append("")
-    lines.append("**DSP usage is 0 for the whole design, classifier included** — this is a")
-    lines.append("placeholder-classifier artifact, not a demonstrated DSP budget: `model/`'s")
-    lines.append("weights are the documented S4 placeholder (`w_i=1`, bias=0, see CLAUDE.md /")
-    lines.append("`docs/design_decisions.md`), so Vivado maps the int8x8 products to LUTs and")
-    lines.append("trivially reduces the multiply-by-one classifier away entirely. The `<=8 DSP`")
-    lines.append("classifier budget (S7.3) is met vacuously until a real trained model lands (S4).")
+    lines.append("**DSP usage is 0 for the whole design, classifier included.** Do not assume")
+    lines.append("this means untrained placeholder weights (`w_i=1`) -- check")
+    lines.append("`docs/design_decisions.md`'s latest D-entry for the model's actual status.")
+    lines.append("Vivado maps the classifier's int8x8 constant multiplies to LUT fabric rather")
+    lines.append("than DSP48 slices at this optimization setting regardless of whether the")
+    lines.append("weights are the placeholder or a real trained model (small constant multiplies")
+    lines.append("are cheap enough in LUTs that Vivado doesn't need a DSP for them here). The")
+    lines.append("`<=8 DSP` classifier budget (S7.3) is met either way, but this line alone")
+    lines.append("cannot tell you which case you're looking at.")
     lines.append("")
     lines.append("**`csr_block.v` is the single largest hand-written contributor to LUT usage**")
     lines.append("— 2,335 LUTs / 2,253 FFs, 11.2% of the part's entire LUT fabric, measured via")
