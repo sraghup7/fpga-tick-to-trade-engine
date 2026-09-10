@@ -39,7 +39,6 @@ pytestmark = pytest.mark.skipif(
 def test_sim_ml_golden_agrees_with_model_ml_golden():
     with open(CONFIG_PATH) as f:
         cfg = json.load(f)
-    import csv
     rows = []
     with open(VECTORS_PATH, newline="") as f:
         for row in csv.DictReader(f):

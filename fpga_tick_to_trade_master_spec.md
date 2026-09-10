@@ -728,7 +728,7 @@ A model derived by reading the RTL can only confirm the RTL does what the RTL do
 | `T32_gate_ml_block` | `0x09` | `adverse_risk=1` blocks; counter increments |
 | `T33_gate_ml_reduce` | `0x09`, `ML_CTRL` | `cfg_ml_action=1` reduces size correctly |
 | `T34_ml_failsafe` | FR-26,31 | Invalid/crossed/gap forces `adverse_risk=1` |
-| `T35_ml_bit_exact` | FR-34 | hls4ml IP `z` == `ml_golden.py` for all golden vectors |
+| `T35_ml_bit_exact` | FR-34 | hand-written fallback (`ml_classifier_wrap.v`) `z` == `ml_golden.py` for all golden vectors (D52; re-run against the real hls4ml IP once it exists) |
 | `T36_align` | FR-50, NFR-14 | ML verdict and order intent arrive same cycle; no race |
 
 ### 11.5 Coverage goals (asserted by testbench at end of soak)
@@ -782,7 +782,7 @@ LUT, FF, BRAM, DSP per module and total (post-implementation), as a percentage o
 | Block RAM Tile | 2.5 | 50 | 5.00% |
 | DSPs | 0 | 90 | 0.00% |
 
-DSP usage is 0 for the whole design including the classifier — this is a placeholder-classifier artifact (`w_i=1`, bias=0), not a demonstrated DSP budget; expect nonzero DSP usage once S4's real trained model lands. `csr_block.v` is the single largest hand-written LUT contributor at 2,335 LUTs / 11.2% of the part (D41, per-module breakdown not yet re-measured on this exact netlist). Full per-module breakdown remains a follow-up (D41's open question); this table is whole-design only.
+DSP usage is 0 for the whole design including the classifier — this is a placeholder-classifier artifact (`w_i=1`, bias=0), not a demonstrated DSP budget; expect nonzero DSP usage once S4's real trained model lands. `csr_block.v` is the single largest hand-written LUT contributor at 2,335 LUTs / 11.2% of the part (D41, per-module breakdown not yet re-measured on this exact netlist). Full per-module breakdown remains a follow-up (D41's open question); this table is whole-design only. **S4 has now landed (D52) but this utilization report has not yet been regenerated against the trained weights — re-run `make synth`/`scripts/report.py` before relying on this DSP/LUT count for hardware bring-up; real (non-identity) weights will very likely introduce nonzero DSP usage.**
 
 ### 12.3 Timing
 

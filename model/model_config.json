@@ -62,6 +62,7 @@
   "bias": -1302,
   "t_high": -454,
   "t_low": -458,
+  "threshold_source": "percentile_fallback_95",
   "versions": {
     "python": "3.11.15",
     "numpy": "2.4.6",

@@ -32,6 +32,7 @@ def test_weights_and_bias_export_as_hex(tmp_path=None):
             bias_i32=bias_i32,
             t_high=10,
             t_low=5,
+            threshold_source="precision_at_k",
             x_val_i8=np.zeros((1, 8), dtype=np.int8),
             z_val=np.array([0], dtype=np.int32),
             y_val=np.array([0], dtype=np.int8),

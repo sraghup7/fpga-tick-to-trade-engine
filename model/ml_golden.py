@@ -3,7 +3,11 @@ and classification (ml_engineer_brief.md SS4, SS5, SS7).
 
 This file *is* the specification of the arithmetic: whatever it computes, the
 RTL (feature_extractor.v, feature_normalizer.v, ml_classifier_wrap.v,
-ml_policy.v) must reproduce bit-for-bit. Two rules make that possible:
+ml_policy.v) must reproduce bit-for-bit. Feature extraction (SS4) delegates
+to sim/feature_golden.py (the RTL's own bit-exact reference, see below)
+rather than reimplementing it here; the label/normalization/classification
+logic below (SS5, SS7) remains this file's own specification-derived
+implementation. Two rules make that possible:
 
   1. Every shift is an arithmetic right shift that floors toward -infinity
      (np.right_shift on a signed numpy int array), never Python's `//` or
@@ -18,6 +22,7 @@ normalization, and the score itself are pure integer arithmetic.
 from __future__ import annotations
 
 import importlib.util
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -33,8 +38,6 @@ NUM_FEATURES = config.NUM_FEATURES
 # with sim/ml_golden.py's own module name, and so model/ never needs to
 # become a package or add sim/ to sys.path globally.
 # ---------------------------------------------------------------------------
-import sys
-
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 _fg_spec = importlib.util.spec_from_file_location(
     "_rtl_feature_golden", _REPO_ROOT / "sim" / "feature_golden.py"

@@ -24,10 +24,13 @@ def test_pick_thresholds_does_not_degenerate_to_minimum():
     y_val = (rng.random(n) < 0.7).astype(np.int8)
     z_val = rng.integers(-50, 50, size=n).astype(np.int32)
 
-    t_high, t_low = train.pick_thresholds(z_val, y_val)
+    t_high, t_low, source = train.pick_thresholds(z_val, y_val)
 
     assert t_high > int(np.min(z_val)), (
         f"t_high={t_high} degenerated to (near) the minimum z={z_val.min()}"
+    )
+    assert source == "percentile_fallback_95", (
+        f"expected the degenerate case to take the percentile fallback branch, got {source!r}"
     )
 
 

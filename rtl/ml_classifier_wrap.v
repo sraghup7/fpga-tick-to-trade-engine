@@ -4,10 +4,12 @@
 //
 // Fallback linear classifier (master spec S3.1 [P], S5.4/S5.6, FR-27;
 // contract docs/contracts/ml_integration.md S3). Hand-written, NOT
-// hls4ml-generated: S4 (model/, hls4ml/) has not run, so per master spec
-// S15 this module stands in for the hls4ml IP with a zero-change port list --
-// when S4 produces the real trained weights, only model/weights.mem and
-// model/bias.mem change; this file and all its wiring are untouched.
+// hls4ml-generated: hls4ml/ is still empty, so per master spec S15 this
+// module stands in for the hls4ml IP with a zero-change port list -- S4's
+// training pipeline HAS now run (docs/design_decisions.md D52) and
+// model/weights.mem/model/bias.mem hold real trained, quantized weights,
+// exactly the "only these two files change" swap this module was designed
+// for from the start -- this file and all its wiring are unchanged.
 //
 // The model is a single Dense(8->1) linear layer with no activation:
 //
@@ -17,11 +19,13 @@
 // weights (int8), exact signed 16-bit products, signed 32-bit accumulator.
 // Weights and bias are elaboration-time-loaded from .mem files via
 // $readmemh -- the same "baked at synthesis" hardware contract the real
-// hls4ml IP will have (S9's note that weights are not CSR-writable). The
-// current weights.mem/bias.mem are a DOCUMENTED PLACEHOLDER (w_i = 1 for all
-// i, bias = 0, so z = SUM x_i), chosen only so every test vector is trivially
-// hand-computable. They are not trained and must not be read as predictive of
-// real adverse selection.
+// hls4ml IP will have (S9's note that weights are not CSR-writable).
+// model/weights.mem/bias.mem are real trained values (D52) -- still not
+// evidence of real adverse-selection prediction (a synthetic proxy label,
+// per ml_engineer_brief.md SS5); see docs/design_decisions.md D52 for the
+// full training/verification record, including the RTL bit-exactness
+// harness (tb/tb_ml_bit_exact.v) that checks every one of 4,860 real
+// golden vectors against this exact module.
 //
 // The eight 16-bit product intermediates are held explicitly (not folded into
 // one wide expression) -- matches S5.4's table literally and keeps every

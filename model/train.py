@@ -108,7 +108,7 @@ def threshold_rule_baseline(raw_features: np.ndarray) -> np.ndarray:
     ).astype(np.int8)
 
 
-def pick_thresholds(z_val: np.ndarray, y_val: np.ndarray) -> tuple[int, int]:
+def pick_thresholds(z_val: np.ndarray, y_val: np.ndarray) -> tuple[int, int, str]:
     """T_high: the highest z-score cutoff (i.e. most conservative) that still
     achieves at least TARGET_PRECISION precision on the validation set, found
     by sweeping thresholds in descending-score order and taking cumulative
@@ -136,6 +136,7 @@ def pick_thresholds(z_val: np.ndarray, y_val: np.ndarray) -> tuple[int, int]:
     base_rate = float(y_val.mean())
     if base_rate >= config.TARGET_PRECISION:
         t_high = int(np.percentile(z_val, 95))
+        source = "percentile_fallback_95"
     else:
         cum_tp = np.cumsum(y_sorted)
         cum_n = np.arange(1, len(y_sorted) + 1)
@@ -143,10 +144,12 @@ def pick_thresholds(z_val: np.ndarray, y_val: np.ndarray) -> tuple[int, int]:
         hits = np.where(precision_at_k >= config.TARGET_PRECISION)[0]
         if len(hits) > 0:
             t_high = int(z_val[order][hits[-1]])
+            source = "precision_at_k"
         else:
             t_high = int(np.percentile(z_val, 95))
+            source = "percentile_fallback_95"
     t_low = t_high - config.HYSTERESIS_GAP
-    return t_high, t_low
+    return t_high, t_low, source
 
 
 def export(
@@ -156,6 +159,7 @@ def export(
     bias_i32: int,
     t_high: int,
     t_low: int,
+    threshold_source: str,
     x_val_i8: np.ndarray,
     z_val: np.ndarray,
     y_val: np.ndarray,
@@ -198,6 +202,7 @@ def export(
         "bias": int(bias_i32),
         "t_high": int(t_high),
         "t_low": int(t_low),
+        "threshold_source": threshold_source,
         "versions": {
             "python": sys.version.split()[0],
             "numpy": np.__version__,
@@ -281,7 +286,7 @@ def main() -> None:
     )
 
     raw_feats, y, symbol_ids = raw_feats[valid], y[valid], symbol_ids[valid]
-    print(f"labeled rows (signal + in-horizon): {len(y)}  positive rate: {y.mean():.3f}")
+    print(f"labeled rows (in-horizon): {len(y)}  positive rate: {y.mean():.3f}")
 
     train_idx, val_idx = chronological_split(symbol_ids, config.TRAIN_FRACTION)
     print(f"train rows: {len(train_idx)}  val rows: {len(val_idx)}")
@@ -334,8 +339,8 @@ def main() -> None:
     x_val_i8 = ml_golden.normalize(raw_feats[val_idx], offsets, shifts)
     z_val = ml_golden.classify(x_val_i8, weights_i8, int(bias_i32))
 
-    t_high, t_low = pick_thresholds(z_val, y[val_idx])
-    print(f"thresholds: T_high={t_high} T_low={t_low}")
+    t_high, t_low, threshold_source = pick_thresholds(z_val, y[val_idx])
+    print(f"thresholds: T_high={t_high} T_low={t_low} source={threshold_source}")
 
     y_pred = (z_val >= t_high).astype(np.int8)
     adverse_risk = ml_golden.hysteresis_policy(z_val, symbol_ids[val_idx], t_high, t_low)
@@ -358,7 +363,7 @@ def main() -> None:
         "real market microstructure, only a controlled test of the pipeline."
     )
 
-    export(offsets, shifts, weights_i8, bias_i32, t_high, t_low, x_val_i8, z_val, y[val_idx])
+    export(offsets, shifts, weights_i8, bias_i32, t_high, t_low, threshold_source, x_val_i8, z_val, y[val_idx])
 
 
 if __name__ == "__main__":
