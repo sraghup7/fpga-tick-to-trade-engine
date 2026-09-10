@@ -589,7 +589,13 @@ module tob_top #(
         .z          (ml_z)
     );
 
-    ml_policy u_policy (
+    ml_policy #(
+        .SNAPSHOT_DEPTH (ALIGN_DEPTH)   // must match -- same reasoning as
+                                        // risk_engine's own explicit
+                                        // .ALIGN_DEPTH wiring above; this
+                                        // was previously an unwired
+                                        // coincidental match (D53)
+    ) u_policy (
         .clk                  (gmii_rx_clk),
         .rst_n                (engine_rst_n),
         // D28-class fix (ml_policy_align_fix.md S3): key ml_policy's internal
