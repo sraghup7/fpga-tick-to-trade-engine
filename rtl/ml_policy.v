@@ -67,14 +67,24 @@
 // -- it is seq_monitor.v's feed-wide sticky level, meant to reflect current
 // feed health at the decision's own cycle, not any specific message's state.
 //
-// SNAPSHOT_DEPTH (4 today) is the cycles from a message's book_upd_valid to
+// SNAPSHOT_DEPTH (5 today) is the cycles from a message's book_upd_valid to
 // its ml_valid minus the one cycle already spent capturing the snapshot at
 // T+1 -- i.e. feature_extractor's 3 + feature_normalizer's 1 +
-// ml_classifier_wrap's 1. It is DELIBERATELY NOT tied to tob_top.v's
-// ALIGN_DEPTH: that parameter derives from a different relationship (this
-// branch's total latency minus signal_engine.v's own latency) and only
-// numerically coincides with this value today. The tb instantiates this
-// module with a non-default depth to prove the two are not coupled.
+// ml_classifier_wrap's 2 (D53 -- ml_classifier_wrap became 2 cycles when it
+// was pipelined to close a timing violation). rtl/tob_top.v now wires this
+// parameter explicitly from its own ALIGN_DEPTH (D53) rather than relying on
+// a coincidentally-matching default, because the two ARE required to agree:
+// ALIGN_DEPTH = (this branch's total latency) - signal_engine.v's own
+// latency, and SNAPSHOT_DEPTH as derived above are algebraically identical
+// as long as signal_engine.v's latency (2 cycles) and this module's own
+// capture-to-decision offset (1 cycle) both hold -- if either changes, the
+// two would need to be re-derived together, not just kept equal by
+// coincidence. tb_ml_chain.v's and tb_tob_top.v's `fs_snap_out_valid !==
+// ml_valid` assertions are the guard that would catch a violation of that
+// condition. The tb still instantiates this module directly with a
+// non-default depth in some cases (SNAPSHOT_DEPTH is a genuine parameter of
+// this module, not hardwired to tob_top.v's value) -- that is a testbench
+// convenience, not evidence the two are decoupled in the actual design.
 //
 // Verilog-2001 only.
 
@@ -83,12 +93,15 @@ module ml_policy #(
     // Cycles from this message's own book_upd_valid to when ml_valid fires
     // for it, MINUS the one cycle already spent capturing the snapshot at
     // T+1 -- see docs/contracts/ml_policy_align_fix.md S1 for the full
-    // derivation (currently 4: feature_extractor's 3 + feature_normalizer's
-    // 1 + ml_classifier_wrap's 1, minus the T+1 capture offset).
-    // DELIBERATELY NOT tied to tob_top.v's ALIGN_DEPTH -- that parameter
-    // derives from a different relationship (this branch's total latency
-    // minus signal_engine.v's own latency) and only coincides with this
-    // value today; see S1.
+    // derivation (currently 5: feature_extractor's 3 + feature_normalizer's
+    // 1 + ml_classifier_wrap's 2, minus the T+1 capture offset; D53 --
+    // ml_classifier_wrap became 2 cycles when pipelined to close a timing
+    // violation).
+    // rtl/tob_top.v now wires this parameter explicitly from its own
+    // ALIGN_DEPTH (D53) -- the two must agree as long as signal_engine.v's
+    // latency and this module's own capture-to-decision offset both hold;
+    // see the module-level comment above for the full derivation and the
+    // guard (tb_ml_chain.v/tb_tob_top.v's drift assertions).
     parameter integer SNAPSHOT_DEPTH = 4
 ) (
     input  wire        clk,

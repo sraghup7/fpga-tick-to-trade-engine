@@ -56,7 +56,7 @@ module ml_classifier_wrap #(
     input  wire [1:0]   norm_slot,
     input  wire signed [7:0] x0, x1, x2, x3, x4, x5, x6, x7,
 
-    // to ml_policy.v -- registered one cycle after norm_valid
+    // to ml_policy.v -- registered two cycles after norm_valid (D53)
     output reg          ml_valid,
     output reg  [1:0]   ml_slot,
     output reg  signed [31:0] z

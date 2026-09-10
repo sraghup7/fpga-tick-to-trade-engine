@@ -197,7 +197,7 @@ module ml_classifier_wrap #(
     input  wire [1:0]   norm_slot,
     input  wire signed [7:0] x0, x1, x2, x3, x4, x5, x6, x7,
 
-    // to ml_policy.v -- registered one cycle after norm_valid
+    // to ml_policy.v -- registered two cycles after norm_valid (D53)
     output reg          ml_valid,
     output reg  [1:0]   ml_slot,
     output reg  signed [31:0] z
@@ -306,9 +306,10 @@ Using the exact placeholder weights above (`w_i=1` for all `i`, `b=0`, so
 - **All-max-negative:** `x0..x7 = -128` → `z = 8 × (−128) = −1024`.
 - **Mixed signs, hand-computed:** e.g. `x = {10, -20, 30, -40, 50, -60,
   70, -80}` → `z = 10−20+30−40+50−60+70−80 = −40`.
-- **Timing:** `ml_valid`/`ml_slot`/`z` register exactly one cycle after
-  `norm_valid`; `norm_slot` passes through unchanged; a `norm_valid=0`
-  cycle produces no `ml_valid` pulse.
+- **Timing:** `ml_valid`/`ml_slot`/`z` register exactly two cycles after
+  `norm_valid` (D53 — split into 2 pipeline stages to close a timing
+  violation); `norm_slot` passes through both stages unchanged; a
+  `norm_valid=0` cycle produces no `ml_valid` pulse.
 - **Back-to-back `norm_valid` pulses** (two different feature vectors on
   consecutive cycles): confirm both are correctly pipelined, no vector
   overwritten or dropped.
