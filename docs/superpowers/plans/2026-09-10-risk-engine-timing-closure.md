@@ -701,21 +701,264 @@ mechanical copy-paste:**
    "keep\|dont_touch" rtl/`) so synthesis doesn't merge the now-identical
    local buffers back into a single register, defeating the whole point.
 
-Given the correctness sensitivity here and that this task is conditional
-(may not even run), a full code-complete Step-by-step is deliberately NOT
-written out in this plan — if Task 3 determines this task is needed, write
-its detailed brief at dispatch time, informed by:
-- The exact current fanout/placement data from Task 3's fresh
-  `timing_summary.rpt`/`report_high_fanout_nets` (which module instances'
-  reset inputs are actually the ones driving the worst remaining paths —
-  don't assume it's still exactly `csr_block.v`'s counters; re-derive from
-  the fresh data).
-- The uniform-depth and `keep`-attribute constraints above, non-negotiable.
-- Re-verification via `RUN_SIM_FAST=1 bash scripts/run_sim.sh` (full soak,
-  not fast mode, given this touches every module's reset — this is exactly
-  the kind of change that could introduce a subtle timing-of-reset-release
-  bug the fast suite's smaller stimulus might not catch) and a fresh `make
-  synth`.
+**Task 3's actual finding (this section written after Task 3 ran, per the
+plan's own deferral):** `phys_opt_design` made **zero modifications** — its
+own log states `"No setup violation found. The netlist was not modified"`,
+because `place_design` had already reached a barely-non-negative WNS
+(0.239ns estimated) before `phys_opt_design` even ran, and Vivado's
+`phys_opt_design` structurally skips all setup optimization once WNS is
+already ≥ 0. This means the mechanism Task 2 was counting on can **never**
+harden an already-passing-by-margin path — it is conditionally gated on the
+opposite of what we need. The worst destination this run was
+`u_feat/win_abs_reg[87]/CLR` (feature_extractor, not `csr_block.v` as
+originally seen) at a 0.528ns margin on a still-`fo=10876` net (was
+`fo=10881` — essentially unchanged) — confirming the net itself was never
+touched. The fix below is therefore a deterministic RTL change, not a
+build-flow constraint that depends on Vivado's heuristics.
+
+**The exact fix:** one local reset buffer per module instance currently
+wired to `engine_rst_n` in `rtl/tob_top.v` — confirmed by grep to be
+exactly 19 consumers (18 module instantiations plus one bare register,
+`cur_cycle`, that uses `engine_rst_n` directly in its own `always` block):
+`u_mac`, `u_eth_if`, `u_fc`, `u_md`, `u_sym`, `u_seq`, `u_tob`, `u_sig`,
+`u_feat`, `u_norm`, `u_ml`, `u_policy`, `u_align`, `u_kill_sync`,
+`cur_cycle`, `u_risk`, `u_ob`, `u_csr`, `u_hist`.
+
+Each buffer is **independently async-reset by `engine_rst_n` directly** —
+NOT a synchronous pipeline register. This is the critical design choice:
+a plain `always @(posedge clk) buf <= engine_rst_n;` would add a real
+1-cycle delay to reset release (and, worse, a 1-cycle delay to reset
+*assertion* propagating too, since a purely synchronous register can't
+react to an async event between clock edges). Instead, every buffer below
+uses the SAME `always @(posedge gmii_rx_clk or negedge engine_rst_n)`
+async-sensitivity pattern as `engine_rst_n` itself already has — meaning
+every buffer releases on the exact same clock edge as `engine_rst_n`'s own
+release, with zero added cycle latency anywhere. This is a pure fanout/
+placement fix: `engine_rst_n` now only drives 19 flip-flops directly
+(trivial fanout, easy to route anywhere), and each of those 19 flip-flops'
+own output then drives only ONE module's internal registers — letting
+Vivado's placer put each buffer physically next to its own consumer
+instead of needing one single point to reach ~10,881 scattered
+destinations across the whole die.
+
+- [ ] **Step 1: Add the 19 local reset buffers to `rtl/tob_top.v`**
+
+Find (the existing reset synchronizer, unchanged):
+
+```verilog
+    // ---- engine reset, synchronized into the gmii_rx_clk domain ----
+    wire engine_rst_n;
+    sync_2ff #(.RESET_VALUE(1'b0)) u_rst_sync (
+        .clk      (gmii_rx_clk),
+        .rst_n    (phy_reset_n_r),   // async reset held while the PHY reset is low
+        .async_in (phy_reset_n_r),
+        .sync_out (engine_rst_n)
+    );
+```
+
+Immediately after it, add:
+
+```verilog
+    // ---- D54 (Task 4): local reset-fanout buffers, one per module
+    // instance. Each is independently async-reset by engine_rst_n
+    // directly (same posedge-clk-or-negedge-rst_n pattern engine_rst_n
+    // itself uses) -- NOT a synchronous pipeline stage, so every buffer
+    // releases on the exact same clock edge engine_rst_n itself releases
+    // on. Zero cycle-timing change anywhere; this only reduces engine_rst_n's
+    // own fanout to 19 (trivial to route) and gives each of these 19
+    // buffers' own, much smaller, LOCAL fanout to its own module -- letting
+    // placement put each buffer physically next to its own consumer
+    // instead of one point reaching ~10,881 scattered destinations
+    // (docs/design_decisions.md D54). (* keep = "true" *) stops synthesis
+    // from merging these 19 logically-identical registers back into one.
+    (* keep = "true" *) reg rst_n_mac;
+    (* keep = "true" *) reg rst_n_eth_if;
+    (* keep = "true" *) reg rst_n_fc;
+    (* keep = "true" *) reg rst_n_md;
+    (* keep = "true" *) reg rst_n_sym;
+    (* keep = "true" *) reg rst_n_seq;
+    (* keep = "true" *) reg rst_n_tob;
+    (* keep = "true" *) reg rst_n_sig;
+    (* keep = "true" *) reg rst_n_feat;
+    (* keep = "true" *) reg rst_n_norm;
+    (* keep = "true" *) reg rst_n_ml;
+    (* keep = "true" *) reg rst_n_policy;
+    (* keep = "true" *) reg rst_n_align;
+    (* keep = "true" *) reg rst_n_kill_sync;
+    (* keep = "true" *) reg rst_n_cur_cycle;
+    (* keep = "true" *) reg rst_n_risk;
+    (* keep = "true" *) reg rst_n_ob;
+    (* keep = "true" *) reg rst_n_csr;
+    (* keep = "true" *) reg rst_n_hist;
+
+    always @(posedge gmii_rx_clk or negedge engine_rst_n) begin
+        if (!engine_rst_n) begin
+            rst_n_mac       <= 1'b0;
+            rst_n_eth_if    <= 1'b0;
+            rst_n_fc        <= 1'b0;
+            rst_n_md        <= 1'b0;
+            rst_n_sym       <= 1'b0;
+            rst_n_seq       <= 1'b0;
+            rst_n_tob       <= 1'b0;
+            rst_n_sig       <= 1'b0;
+            rst_n_feat      <= 1'b0;
+            rst_n_norm      <= 1'b0;
+            rst_n_ml        <= 1'b0;
+            rst_n_policy    <= 1'b0;
+            rst_n_align     <= 1'b0;
+            rst_n_kill_sync <= 1'b0;
+            rst_n_cur_cycle <= 1'b0;
+            rst_n_risk      <= 1'b0;
+            rst_n_ob        <= 1'b0;
+            rst_n_csr       <= 1'b0;
+            rst_n_hist      <= 1'b0;
+        end else begin
+            rst_n_mac       <= 1'b1;
+            rst_n_eth_if    <= 1'b1;
+            rst_n_fc        <= 1'b1;
+            rst_n_md        <= 1'b1;
+            rst_n_sym       <= 1'b1;
+            rst_n_seq       <= 1'b1;
+            rst_n_tob       <= 1'b1;
+            rst_n_sig       <= 1'b1;
+            rst_n_feat      <= 1'b1;
+            rst_n_norm      <= 1'b1;
+            rst_n_ml        <= 1'b1;
+            rst_n_policy    <= 1'b1;
+            rst_n_align     <= 1'b1;
+            rst_n_kill_sync <= 1'b1;
+            rst_n_cur_cycle <= 1'b1;
+            rst_n_risk      <= 1'b1;
+            rst_n_ob        <= 1'b1;
+            rst_n_csr       <= 1'b1;
+            rst_n_hist      <= 1'b1;
+        end
+    end
+```
+
+- [ ] **Step 2: Rewire each of the 19 consumers to its own buffer**
+
+Each of these is a one-line change (context lines shown so the correct
+occurrence is unambiguous — several instantiations use identical
+`.rst_n (engine_rst_n),` text, so match by the surrounding instance name):
+
+| Instance | Find (within that instantiation's port list) | Replace with |
+|---|---|---|
+| `u_mac` | `.rst_n                    (engine_rst_n),` | `.rst_n                    (rst_n_mac),` |
+| `u_eth_if` | `.rst_n                   (engine_rst_n),` | `.rst_n                   (rst_n_eth_if),` |
+| `u_fc` | `.rst_n         (engine_rst_n),` | `.rst_n         (rst_n_fc),` |
+| `u_md` | `.rst_n         (engine_rst_n),` | `.rst_n         (rst_n_md),` |
+| `u_sym` | `.rst_n         (engine_rst_n),` | `.rst_n         (rst_n_sym),` |
+| `u_seq` | `.rst_n            (engine_rst_n),` | `.rst_n            (rst_n_seq),` |
+| `u_tob` | `.rst_n               (engine_rst_n),` | `.rst_n               (rst_n_tob),` |
+| `u_sig` | `.rst_n               (engine_rst_n),` | `.rst_n               (rst_n_sig),` |
+| `u_feat` | `.rst_n                  (engine_rst_n),` | `.rst_n                  (rst_n_feat),` |
+| `u_norm` | `.rst_n              (engine_rst_n),` | `.rst_n              (rst_n_norm),` |
+| `u_ml` | `.rst_n      (engine_rst_n),` | `.rst_n      (rst_n_ml),` |
+| `u_policy` | `.rst_n                (engine_rst_n),` | `.rst_n                (rst_n_policy),` |
+| `u_align` | `.rst_n     (engine_rst_n),` | `.rst_n     (rst_n_align),` |
+| `u_kill_sync` | `.rst_n    (engine_rst_n),` | `.rst_n    (rst_n_kill_sync),` |
+| `cur_cycle` (bare `always` block, not an instantiation) | `always @(posedge gmii_rx_clk or negedge engine_rst_n) begin`<br>`        if (!engine_rst_n) cur_cycle <= 32'd0;` | `always @(posedge gmii_rx_clk or negedge rst_n_cur_cycle) begin`<br>`        if (!rst_n_cur_cycle) cur_cycle <= 32'd0;` |
+| `u_risk` | `.rst_n                    (engine_rst_n),` | `.rst_n                    (rst_n_risk),` |
+| `u_ob` | `.rst_n                (engine_rst_n),` | `.rst_n                (rst_n_ob),` |
+| `u_csr` | `.rst_n                  (engine_rst_n),` | `.rst_n                  (rst_n_csr),` |
+| `u_hist` | `.rst_n             (engine_rst_n),` | `.rst_n             (rst_n_hist),` |
+
+Verify each replacement immediately after making it by checking the
+preceding few lines actually name the module instance the table says (the
+exact whitespace in each `.rst_n` line varies by instantiation — use the
+surrounding `module_name u_instance (` line just above each one, visible in
+`rtl/tob_top.v`, to disambiguate rather than a blind global find/replace of
+`engine_rst_n` — a global replace would also incorrectly touch
+`u_rst_sync`'s own declaration and `sync_out (engine_rst_n)` itself,
+neither of which should change).
+
+After this step, `engine_rst_n` itself should be referenced in exactly 2
+places in `rtl/tob_top.v`: its own declaration/instantiation (`wire
+engine_rst_n; sync_2ff ... .sync_out (engine_rst_n)`) and the new buffer
+`always` block's own sensitivity list / `if (!engine_rst_n)` condition —
+confirm with `grep -c "engine_rst_n" rtl/tob_top.v` (expect exactly the
+buffer block's own references plus the original declaration, not 19+
+scattered module-port references anymore).
+
+- [ ] **Step 3: Compile-check**
+
+```bash
+iverilog -g2001 -Wall -o /tmp/lint.vvp rtl/*.v rtl/common/*.v tb/sim_models/tob_top_sim_leaves.v
+```
+
+Expected: zero warnings, zero errors, zero inferred latches (the `(* keep
+= "true" *)` attribute is synthesis-only syntax that Icarus should parse
+and ignore harmlessly — if it doesn't, check Icarus's attribute-comment
+syntax support and adjust if genuinely needed, but don't remove the
+attribute just to silence a warning).
+
+- [ ] **Step 4: Run tests**
+
+```bash
+RUN_SIM_FAST=1 bash scripts/run_sim.sh
+```
+
+Expected: `ALL TESTS PASSED`, identical mismatch/warning counts to the
+pre-Task-4 baseline (this change is designed to be cycle-exact everywhere
+— any behavior difference at all means something about the buffer
+replication isn't as timing-transparent as designed, and needs
+investigation before proceeding, not a golden-model update).
+
+Then run the FULL (non-fast) soak, since this touches every module's reset
+and the fast suite's smaller stimulus might not exercise every reset-timing
+edge case:
+
+```bash
+bash scripts/run_sim.sh
+```
+
+Expected: `ALL TESTS PASSED` including the 1,000,000-message parser soak.
+
+- [ ] **Step 5: Re-synthesize and confirm the specific path closes durably**
+
+```bash
+make synth
+```
+
+```bash
+grep -n "Slack (VIOLATED)\|Slack (MET)" -A 8 results/build/timing_summary.rpt | grep -B 8 "u_rst_sync\|rst_n_mac\|rst_n_csr\|rst_n_feat"
+```
+
+Confirm: (a) no `u_rst_sync`-sourced path is VIOLATED, (b) the specific
+`u_feat/win_abs_reg[87]/CLR`-style recovery path (or whatever is now the
+worst reset-recovery path — the exact destination may shift) shows a
+comfortable margin, and (c) — the actual proof this task worked — the
+fanout of whichever net is now worst is nowhere near 10,876/10,881 anymore
+(check the netlist resource names in the path detail; each buffer's own
+local fanout should be a small fraction of the original, roughly `total
+async-reset registers / 19`).
+
+- [ ] **Step 6: Commit**
+
+```bash
+git add rtl/tob_top.v
+git commit -m "fix: replicate engine_rst_n into 19 per-module local reset buffers to close async-reset-fanout recovery violation durably (D54)
+
+phys_opt_design (added in this plan's own Task 2) turned out to
+structurally never fire on this path: it only optimizes paths still
+VIOLATED at the point it runs, and place_design had already reached a
+barely-non-negative WNS (0.239ns) before phys_opt_design started, so it
+skipped all setup optimization and made zero netlist modifications --
+confirmed directly in vivado.log ('No setup violation found. The netlist
+was not modified.'). The prior 0.528ns pass was placement luck, not a
+durable fix (the target net's fanout was still fo=10876, essentially
+unchanged from fo=10881 pre-fix).
+
+Each of the 19 module instances (and cur_cycle's own always block)
+previously wired directly to engine_rst_n now gets its own local reset
+buffer, independently async-reset by engine_rst_n on the same clock edge
+(not a synchronous pipeline stage -- zero cycle-timing change anywhere).
+(* keep = 'true' *) prevents synthesis from merging the 19 logically-
+identical buffers back into one.
+
+Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>"
+```
 
 ---
 
