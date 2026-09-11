@@ -310,6 +310,63 @@ module tb_risk_engine;
         end
     end
 
+    // ---- D54 equivalence check: reference (OLD, pre-D54) expressions
+    //      computed in a shadow state, compared against the DUT's (NEW,
+    //      restructured) token_bucket every cycle for this file's entire
+    //      test run -- independent of Steps 1-2's hand-proof, this
+    //      exercises every directed test in this file (including the two
+    //      new boundary blocks added below) and checks bit-for-bit
+    //      agreement, not just the hand-checked cases. Runs continuously
+    //      rather than as a separately time-boxed loop so it can never be
+    //      truncated by this file's own final $finish. This is a literal,
+    //      direct transcription of the ORIGINAL pre-D54 expressions -- an
+    //      independent re-derivation, not a shortcut that agrees with
+    //      Steps 1-2's math by construction. ----
+    reg [31:0] ref_refill_ctr = 32'd0;
+    reg [31:0] ref_token_bucket = 32'd0;
+    reg        ref_boot_done = 1'b0;
+    integer    d54_mismatches = 0;
+    reg        d54_active = 1'b0;   // gates tracking until first post-reset edge
+
+    // Combinational shadow of the ORIGINAL (pre-D54) expressions, using
+    // the reference state above instead of the DUT's registers.
+    reg        ref_refill_tick;
+    reg [31:0] ref_refill_ctr_next;
+    reg [31:0] ref_token_bucket_eff;
+    reg [31:0] ref_token_after_refill;
+    always @(*) begin
+        ref_refill_tick      = (ref_refill_ctr + 32'd1) >= cfg_token_refill_cycles;
+        ref_refill_ctr_next  = ref_refill_tick
+            ? (ref_refill_ctr + 32'd1 - cfg_token_refill_cycles)
+            : (ref_refill_ctr + 32'd1);
+        ref_token_bucket_eff = ref_boot_done ? ref_token_bucket : cfg_token_max;
+        ref_token_after_refill = (ref_refill_tick && (ref_token_bucket_eff < cfg_token_max))
+            ? (ref_token_bucket_eff + 32'd1)
+            : ref_token_bucket_eff;
+    end
+
+    always @(posedge clk) begin
+        if (!rst_n) begin
+            ref_refill_ctr   <= 32'd0;
+            ref_token_bucket <= 32'd0;
+            ref_boot_done    <= 1'b0;
+            d54_active       <= 1'b0;
+        end else begin
+            if (d54_active && (ref_token_bucket !== dut.token_bucket)) begin
+                $display("FAIL: D54 equivalence mismatch: ref=%0d dut=%0d (cfg_token_max=%0d cfg_token_refill_cycles=%0d accepted_c=%b)",
+                          ref_token_bucket, dut.token_bucket,
+                          cfg_token_max, cfg_token_refill_cycles, dut.accepted_c);
+                d54_mismatches = d54_mismatches + 1;
+                fail = 1'b1;
+            end
+            ref_refill_ctr <= ref_refill_ctr_next;
+            if (dut.accepted_c) ref_token_bucket <= (ref_token_after_refill == 32'd0)
+                                                     ? 32'd0 : ref_token_after_refill - 32'd1;
+            else                ref_token_bucket <= ref_token_after_refill;
+            ref_boot_done <= 1'b1;
+            d54_active <= 1'b1;
+        end
+    end
 
 
     // ---- per-slot book model (bid/ask price + crossed; risk reads no qty) ----
@@ -699,6 +756,33 @@ module tb_risk_engine;
         idle_cycles(200);
         intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b0);
         ck(43, 1'b1, 2'd0, SIDE_BID, 32'd1010, 32'd100, 8'd0, 9'b000000000);   // refilled, free-running
+
+        // ================= D54 boundary: cfg_token_max == 0 =================
+        // Bucket can never hold a token (inc's "< cfg_token_max" side is
+        // vacuously false), so every accepted intent should throttle. No new
+        // assertions here -- purely to exercise this boundary value under the
+        // continuous D54 equivalence check above (this combination isn't hit
+        // by any existing directed test in this file).
+        cfg_token_max = 32'd0;
+        cfg_token_refill_cycles = 32'd12500;
+        cfg_max_age = 32'd1250000;
+        do_reset;
+        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b0);
+        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b0);
+        idle_cycles(150);
+        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b0);
+
+        // ================= D54 boundary: cfg_token_refill_cycles == 1 =========
+        // refill_tick fires every cycle (fastest possible refill); no new
+        // assertions here -- purely to exercise this boundary value under the
+        // continuous D54 equivalence check above.
+        cfg_token_max = 32'd8;
+        cfg_token_refill_cycles = 32'd1;
+        do_reset;
+        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b0);
+        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b0);
+        idle_cycles(20);
+        intent(2'd0, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1010, 32'd100, 1'b0, 1'b0);
 
         // ================= F: gate 0x01 kill (T20) =================
         cfg_token_max = 32'd8;
@@ -1114,6 +1198,7 @@ module tb_risk_engine;
         intent(2'd3, 1'b1, 1'b1, 32'd1000, 32'd1010, 1'b0, SIDE_BID, 32'd1005, 32'd100, 1'b0, 1'b0);
         ck(400, 1'b0, 2'd3, SIDE_BID, 32'd1005, 32'd100, 8'd8, 9'b010000000);
 
+        $display("D54 equivalence check: %0d mismatches over the full test run", d54_mismatches);
         if (fail) begin
             $display("FAIL");
             $finish;

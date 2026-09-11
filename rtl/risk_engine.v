@@ -218,7 +218,22 @@ module risk_engine #(
     reg [31:0] pend_msg_cycle;
 
     // ---- free-running token bucket (S2.3) ----
-    reg [31:0] refill_ctr;
+    // D54: refill_ctr_p1 stores (the old refill_ctr's value) + 1 as a
+    // maintained invariant, instead of storing refill_ctr and adding 1 to
+    // it every time refill_tick needs to be checked. This keeps the "+1"
+    // off risk_engine's own critical path (u_risk/refill_ctr_reg[1]/C ->
+    // u_risk/token_bucket_reg[31]/D, -0.752ns pre-fix) -- refill_tick
+    // becomes a direct 32-bit compare against a register, with no
+    // incrementer in front of it. The "+1" still happens, just on
+    // refill_ctr_p1's OWN next-state path (a separate register-to-register
+    // path, not the one that was violated) instead of on the forward path
+    // into token_bucket. Provably equivalent: refill_ctr_p1 == (what
+    // refill_ctr would have held) + 1, maintained from reset (refill_ctr
+    // started at 0, so refill_ctr_p1 starts at 1) through every update.
+    // Nothing outside this module ever reads refill_ctr by name (grepped
+    // tb/, sim/, docs/ before renaming) -- token_bucket keeps its name
+    // unchanged, since tb/tb_risk_engine.v:224 hierarchically probes it.
+    reg [31:0] refill_ctr_p1;
     reg [31:0] token_bucket;
     // D38: token_bucket's async reset target (cfg_token_max) is a live CSR
     // value, not a compile-time constant. Xilinx 7-series flip-flop
@@ -305,16 +320,27 @@ module risk_engine #(
     // ================= combinational logic =================
 
     // free-running refill (see sequential block below for state update)
-    wire refill_tick = (refill_ctr + 32'd1) >= cfg_token_refill_cycles;
-    wire [31:0] refill_ctr_next = refill_tick
-        ? (refill_ctr + 32'd1 - cfg_token_refill_cycles)
-        : (refill_ctr + 32'd1);
+    // D54: direct compare, no incrementer -- refill_ctr_p1 already holds
+    // (old refill_ctr)+1.
+    wire refill_tick = (refill_ctr_p1 >= cfg_token_refill_cycles);
+    // D54: refill_ctr_p1_next maintains the "+1" invariant: it must equal
+    // (what the old refill_ctr_next would have been) + 1. Derivation:
+    //   old refill_ctr_next = refill_tick ? (refill_ctr+1-cfg) : (refill_ctr+1)
+    //                        = refill_tick ? (refill_ctr_p1-cfg) : refill_ctr_p1
+    //   new refill_ctr_p1_next = old refill_ctr_next + 1
+    //                          = refill_tick ? (refill_ctr_p1-cfg+1) : (refill_ctr_p1+1)
+    // This add/subtract now lives entirely on refill_ctr_p1's own
+    // register-to-register path, decoupled from token_bucket's path below.
+    wire [31:0] refill_ctr_p1_next = refill_tick
+        ? (refill_ctr_p1 - cfg_token_refill_cycles + 32'd1)
+        : (refill_ctr_p1 + 32'd1);
     // D38: substitute cfg_token_max for token_bucket until the reset-time
     // synchronous load actually lands (see boot_done's declaration above).
     wire [31:0] token_bucket_eff = boot_done ? token_bucket : cfg_token_max;
-    wire [31:0] token_after_refill = (refill_tick && (token_bucket_eff < cfg_token_max))
-        ? (token_bucket_eff + 32'd1)
-        : token_bucket_eff;
+    // D54: inc replaces "refill_tick && (token_bucket_eff < cfg_token_max)"
+    // -- same expression, named so the merged token_bucket_next below reads
+    // clearly.
+    wire inc = refill_tick && (token_bucket_eff < cfg_token_max);
 
     // ---- the nine gates, all combinational on the sig_valid cycle ----
     // D28: gates 0x04/0x05/0x07 read the snapshot taken on the RAW sig_valid
@@ -348,7 +374,18 @@ module risk_engine #(
     wire gate_stale_fired_c    = (a_pend_msg - a_pend_prev) > cfg_max_age; // D17+D28
     wire gate_seqgap_fired_c   = seq_gap;
     wire gate_crossed_fired_c  = a_crossed;                               // D28
-    wire gate_throttle_fired_c = (token_after_refill == 32'd0);
+    // D54: token_after_refill == 0 iff (!inc && token_bucket_eff == 0) --
+    // proof: when inc is true, token_bucket_eff < cfg_token_max is
+    // required, so token_bucket_eff+1 <= cfg_token_max <= 32'hFFFFFFFF,
+    // meaning it can only be 0 by wrapping, which would require
+    // token_bucket_eff == 32'hFFFFFFFF -- impossible given
+    // token_bucket_eff < cfg_token_max already holds. So inc==1 implies
+    // token_after_refill != 0 always; when inc==0, token_after_refill ==
+    // token_bucket_eff unchanged, so it's 0 exactly when
+    // token_bucket_eff is. This lets gate_throttle_fired_c be computed
+    // directly with no dependency on a materialized token_after_refill
+    // signal.
+    wire gate_throttle_fired_c = (!inc && (token_bucket_eff == 32'd0));
     // D47 (ml_policy_per_symbol.md S2): gate 0x09 reads THIS message's own
     // slot's adverse bit (sig_slot = the aligned intent's slot, the same
     // index gate 0x03/0x07 already use), never some other slot's.
@@ -446,34 +483,41 @@ module risk_engine #(
         end
     end
 
+    // D54: token_bucket_next replaces the old "compute token_after_refill,
+    // then conditionally subtract 1 from it" chain (two SERIAL 32-bit
+    // carry chains) with a single mux over 4 independently-computable
+    // candidates (each needs at most ONE 32-bit add or subtract, not two
+    // chained). Case-by-case equivalence to the original expressions:
+    //   (inc=1, accepted_c=1): old = (eff+1), then clamp-check sees
+    //     eff+1 != 0 (proven above), so subtracts 1 back: eff+1-1 = eff.
+    //   (inc=1, accepted_c=0): old = eff+1, no subtract.
+    //   (inc=0, accepted_c=1): old = eff unchanged, then clamp-check:
+    //     eff==0 ? 0 : eff-1.
+    //   (inc=0, accepted_c=0): old = eff unchanged, no subtract.
+    // Every branch below matches one of these four cases exactly.
+    wire [31:0] token_bucket_next =
+        inc ? (accepted_c ? token_bucket_eff : (token_bucket_eff + 32'd1))
+            : (accepted_c ? ((token_bucket_eff == 32'd0) ? 32'd0 : (token_bucket_eff - 32'd1))
+                          : token_bucket_eff);
+
     always @(posedge clk or negedge rst_n) begin
         if (!rst_n) begin
-            refill_ctr   <= 32'd0;
-            token_bucket <= 32'd0;   // D38: constant reset value -- boot_done
-                                      // substitutes cfg_token_max until loaded
-            boot_done    <= 1'b0;
+            refill_ctr_p1 <= 32'd1;   // D54: represents (old refill_ctr=0)+1
+            token_bucket  <= 32'd0;   // D38: constant reset value -- boot_done
+                                       // substitutes cfg_token_max until loaded
+            boot_done     <= 1'b0;
         end else begin
-            refill_ctr <= refill_ctr_next;
-            boot_done  <= 1'b1;
-            // single next-state expression: refill combined with any
-            // same-cycle consumption -- never two separate NBA writes.
-            // D45: clamp at 0 instead of letting the subtraction wrap.
-            // gate_throttle_fired_c (stage 1, above) samples token_bucket
-            // one cycle before THIS decrement commits, so back-to-back
-            // aligned intents on consecutive cycles can each see the same
-            // not-yet-decremented value and all pass the gate -- accepted_c
-            // can therefore still be 1 here when token_after_refill is
-            // already 0. Without the clamp, token_bucket wraps to
-            // 32'hFFFFFFFF, which is not zero, so gate_throttle_fired_c
-            // never fires again for the rest of the run (FR-41's
-            // non-bypassable gate 0x08 silently and permanently disabled).
-            // This guard fixes ONLY that permanent-disable failure mode --
-            // it does not fix the underlying over-admission on a
-            // back-to-back burst (docs/design_decisions.md D45), which is a
-            // separate, larger change deliberately deferred.
-            if (accepted_c) token_bucket <= (token_after_refill == 32'd0)
-                                             ? 32'd0 : token_after_refill - 32'd1;
-            else            token_bucket <= token_after_refill;
+            refill_ctr_p1 <= refill_ctr_p1_next;
+            boot_done     <= 1'b1;
+            // D45: the clamp-at-0 behavior (never wrap to 32'hFFFFFFFF) is
+            // folded into token_bucket_next's (inc=0, accepted_c=1) branch
+            // above -- same guard, same reasoning (gate_throttle_fired_c
+            // samples token_bucket one cycle before this commits, so
+            // back-to-back aligned intents can still both pass the gate;
+            // without the clamp gate 0x08 would silently disable itself
+            // permanently, FR-41). D45's own separately-deferred
+            // over-admission-on-a-burst issue is unchanged by this task.
+            token_bucket <= token_bucket_next;
         end
     end
 

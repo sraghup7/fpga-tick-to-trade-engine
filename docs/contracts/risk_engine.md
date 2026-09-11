@@ -183,31 +183,49 @@ A **continuously free-running** refill counter, independent of message
 arrival — not a lazy "compute elapsed cycles when a message shows up"
 calculation (which is how `sim/golden_model.py` does it, using Python's
 division; see the note below for why RTL should NOT copy that structure
-literally). `refill_ctr` increments every cycle; when it would reach
-`cfg_token_refill_cycles`, `token_bucket` gains one token (saturating at
-`cfg_token_max`) and the counter carries its remainder forward (not reset
-to 0 — preserves exactness across boundaries, matching
-`sim/golden_model.py`'s `_last_refill_cycle += refills * refill_cycles`):
+literally). The counter (`refill_ctr_p1`) stores the count **plus one** as
+a maintained invariant (D54) — this keeps the "+1" off the critical
+register-to-register path into `token_bucket` (a real timing violation
+this exact "+1 then compare" structure caused once real weights elsewhere
+in the design changed placement/routing pressure — see
+`docs/design_decisions.md` D54). Conceptually it's still "increments every
+cycle; when it would reach `cfg_token_refill_cycles`, `token_bucket` gains
+one token (saturating at `cfg_token_max`) and the counter carries its
+remainder forward" — D54 changed how that's expressed in RTL, not what it
+computes:
 
 ```verilog
-wire refill_tick = (refill_ctr + 32'd1) >= cfg_token_refill_cycles;
-wire [31:0] refill_ctr_next = refill_tick
-    ? (refill_ctr + 32'd1 - cfg_token_refill_cycles)
-    : (refill_ctr + 32'd1);
-wire [31:0] token_after_refill = (refill_tick && token_bucket < cfg_token_max)
-    ? token_bucket + 32'd1 : token_bucket;
+wire refill_tick = (refill_ctr_p1 >= cfg_token_refill_cycles);
+wire [31:0] refill_ctr_p1_next = refill_tick
+    ? (refill_ctr_p1 - cfg_token_refill_cycles + 32'd1)
+    : (refill_ctr_p1 + 32'd1);
+wire inc = refill_tick && (token_bucket_eff < cfg_token_max);
+wire [31:0] token_bucket_next =
+    inc ? (accepted_c ? token_bucket_eff : (token_bucket_eff + 32'd1))
+        : (accepted_c ? ((token_bucket_eff == 32'd0) ? 32'd0 : (token_bucket_eff - 32'd1))
+                      : token_bucket_eff);
 ```
 
-`gate_throttle_fired` (§2.5) reads `token_after_refill`, not the
-pre-refill `token_bucket` — matching `sim/golden_model.py`'s ordering,
-which refills *before* checking. `token_bucket`'s single next-state
-expression must combine this refill with any same-cycle consumption from
-an accepted order (§2.6) — **do not write two separate non-blocking
-assignments to `token_bucket` in the same `always` block**; only the
-textually-last one would actually apply, silently dropping the other. On
-reset, `token_bucket <= cfg_token_max` (sampling the config input directly
-at the reset edge — standard, valid Verilog; every other S3/S5 module's
-`cfg_*` ports are stable well before reset deasserts).
+`gate_throttle_fired` (§2.5) fires when `!inc && token_bucket_eff == 32'd0`
+— algebraically identical to the pre-D54 "`token_after_refill == 0`" check
+(D54 proves `inc` being true makes that impossible), just computed without
+ever materializing an intermediate `token_after_refill` signal. `token_bucket`'s
+single next-state expression (`token_bucket_next`, D54) still combines
+refill with any same-cycle consumption from an accepted order (§2.6) in one
+expression — **do not write two separate non-blocking assignments to
+`token_bucket` in the same `always` block**; only the textually-last one
+would actually apply, silently dropping the other. On reset, `token_bucket
+<= 32'd0` (a plain constant clear — NOT `cfg_token_max`, which is a runtime
+CSR value Xilinx FDCE/FDPE primitives cannot async-reset to directly; see
+`docs/design_decisions.md` D38 for why this line previously said
+`cfg_token_max` inaccurately and `token_bucket_eff`/`boot_done` exist to
+substitute the config value in combinationally until the first real cycle).
+
+(The reset-value correction in that last paragraph fixes a pre-existing
+inaccuracy in this doc found while updating this section — the actual RTL
+has reset to a constant `0` since D38, not `cfg_token_max` as this doc
+previously claimed; unrelated to D54's own change but cheap to fix in the
+same edit since this exact paragraph was already being rewritten.)
 
 **Why continuous per-cycle refill instead of literally translating
 `sim/golden_model.py`'s `elapsed // refill_cycles` (a batch division at
