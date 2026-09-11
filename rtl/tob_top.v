@@ -151,6 +151,82 @@ module tob_top #(
         .sync_out (engine_rst_n)
     );
 
+    // ---- D54 (Task 4): local reset-fanout buffers, one per module
+    // instance. Each is independently async-reset by engine_rst_n
+    // directly (same posedge-clk-or-negedge-rst_n pattern engine_rst_n
+    // itself uses) -- NOT a synchronous pipeline stage, so every buffer
+    // releases on the exact same clock edge engine_rst_n itself releases
+    // on. Zero cycle-timing change anywhere; this only reduces engine_rst_n's
+    // own fanout to 19 (trivial to route) and gives each of these 19
+    // buffers' own, much smaller, LOCAL fanout to its own module -- letting
+    // placement put each buffer physically next to its own consumer
+    // instead of one point reaching ~10,881 scattered destinations
+    // (docs/design_decisions.md D54). (* keep = "true" *) stops synthesis
+    // from merging these 19 logically-identical registers back into one.
+    (* keep = "true" *) reg rst_n_mac;
+    (* keep = "true" *) reg rst_n_eth_if;
+    (* keep = "true" *) reg rst_n_fc;
+    (* keep = "true" *) reg rst_n_md;
+    (* keep = "true" *) reg rst_n_sym;
+    (* keep = "true" *) reg rst_n_seq;
+    (* keep = "true" *) reg rst_n_tob;
+    (* keep = "true" *) reg rst_n_sig;
+    (* keep = "true" *) reg rst_n_feat;
+    (* keep = "true" *) reg rst_n_norm;
+    (* keep = "true" *) reg rst_n_ml;
+    (* keep = "true" *) reg rst_n_policy;
+    (* keep = "true" *) reg rst_n_align;
+    (* keep = "true" *) reg rst_n_kill_sync;
+    (* keep = "true" *) reg rst_n_cur_cycle;
+    (* keep = "true" *) reg rst_n_risk;
+    (* keep = "true" *) reg rst_n_ob;
+    (* keep = "true" *) reg rst_n_csr;
+    (* keep = "true" *) reg rst_n_hist;
+
+    always @(posedge gmii_rx_clk or negedge engine_rst_n) begin
+        if (!engine_rst_n) begin
+            rst_n_mac       <= 1'b0;
+            rst_n_eth_if    <= 1'b0;
+            rst_n_fc        <= 1'b0;
+            rst_n_md        <= 1'b0;
+            rst_n_sym       <= 1'b0;
+            rst_n_seq       <= 1'b0;
+            rst_n_tob       <= 1'b0;
+            rst_n_sig       <= 1'b0;
+            rst_n_feat      <= 1'b0;
+            rst_n_norm      <= 1'b0;
+            rst_n_ml        <= 1'b0;
+            rst_n_policy    <= 1'b0;
+            rst_n_align     <= 1'b0;
+            rst_n_kill_sync <= 1'b0;
+            rst_n_cur_cycle <= 1'b0;
+            rst_n_risk      <= 1'b0;
+            rst_n_ob        <= 1'b0;
+            rst_n_csr       <= 1'b0;
+            rst_n_hist      <= 1'b0;
+        end else begin
+            rst_n_mac       <= 1'b1;
+            rst_n_eth_if    <= 1'b1;
+            rst_n_fc        <= 1'b1;
+            rst_n_md        <= 1'b1;
+            rst_n_sym       <= 1'b1;
+            rst_n_seq       <= 1'b1;
+            rst_n_tob       <= 1'b1;
+            rst_n_sig       <= 1'b1;
+            rst_n_feat      <= 1'b1;
+            rst_n_norm      <= 1'b1;
+            rst_n_ml        <= 1'b1;
+            rst_n_policy    <= 1'b1;
+            rst_n_align     <= 1'b1;
+            rst_n_kill_sync <= 1'b1;
+            rst_n_cur_cycle <= 1'b1;
+            rst_n_risk      <= 1'b1;
+            rst_n_ob        <= 1'b1;
+            rst_n_csr       <= 1'b1;
+            rst_n_hist      <= 1'b1;
+        end
+    end
+
     // =====================================================================
     // S2.3 PHY bring-up (mdio_ctrl.v -- sys_clk domain)
     // =====================================================================
@@ -205,7 +281,7 @@ module tob_top #(
     mac_top u_mac (
         .gmii_tx_clk              (gmii_tx_clk),
         .gmii_rx_clk              (gmii_rx_clk),
-        .rst_n                    (engine_rst_n),
+        .rst_n                    (rst_n_mac),
         .source_mac_addr          (BOARD_MAC_ADDR),
         .TTL                      (BOARD_TTL),
         .source_ip_addr           (BOARD_IP_ADDR),
@@ -247,7 +323,7 @@ module tob_top #(
 
     eth_mac_if u_eth_if (
         .clk                     (gmii_rx_clk),
-        .rst_n                   (engine_rst_n),
+        .rst_n                   (rst_n_eth_if),
         .rx_data                 (eth_rx_data),
         .rx_valid                (eth_rx_valid),
         .rx_last                 (eth_rx_last),
@@ -278,7 +354,7 @@ module tob_top #(
     wire [15:0] cfg_udp_port;   // D49 (FR-3): csr_block 0x40 -> frame_classifier
     frame_classifier u_fc (
         .clk           (gmii_rx_clk),
-        .rst_n         (engine_rst_n),
+        .rst_n         (rst_n_fc),
         .rx_data       (eth_rx_data),
         .rx_valid      (eth_rx_valid),
         .frame_start   (eth_frame_start),
@@ -304,7 +380,7 @@ module tob_top #(
 
     md_parser u_md (
         .clk           (gmii_rx_clk),
-        .rst_n         (engine_rst_n),
+        .rst_n         (rst_n_md),
         .in_data       (fc_out_data),
         .in_valid      (fc_out_valid),
         .msg_valid     (md_msg_valid),
@@ -327,7 +403,7 @@ module tob_top #(
 
     symbol_filter u_sym (
         .clk           (gmii_rx_clk),
-        .rst_n         (engine_rst_n),
+        .rst_n         (rst_n_sym),
         .msg_valid     (md_msg_valid),
         .msg_symbol_id (md_msg_symbol_id),
         .cfg_symbol_0  (cfg_symbol_0),
@@ -348,7 +424,7 @@ module tob_top #(
 
     seq_monitor u_seq (
         .clk              (gmii_rx_clk),
-        .rst_n            (engine_rst_n),
+        .rst_n            (rst_n_seq),
         .msg_valid        (md_msg_valid),
         .err_msg_type     (md_err_msg_type),
         .err_flags        (md_err_flags),
@@ -390,7 +466,7 @@ module tob_top #(
 
     tob_engine u_tob (
         .clk                 (gmii_rx_clk),
-        .rst_n               (engine_rst_n),
+        .rst_n               (rst_n_tob),
         .msg_type            (md_msg_type),
         .msg_side            (md_msg_side),
         .msg_price           (md_msg_price),
@@ -435,7 +511,7 @@ module tob_top #(
 
     signal_engine u_sig (
         .clk                 (gmii_rx_clk),
-        .rst_n               (engine_rst_n),
+        .rst_n               (rst_n_sig),
         .book_upd_valid      (book_upd_valid),
         .applied_slot        (applied_slot),
         .next_bid_price      (next_bid_price),
@@ -526,7 +602,7 @@ module tob_top #(
         .WINDOW      (16)
     ) u_feat (
         .clk                    (gmii_rx_clk),
-        .rst_n                  (engine_rst_n),
+        .rst_n                  (rst_n_feat),
         // D36: applied_msg_type/applied_msg_side (registered inside
         // tob_engine.v, aligned with msg_applied/book_upd_valid), NOT
         // md_parser.v's raw md_msg_type/md_msg_side directly -- those now
@@ -555,7 +631,7 @@ module tob_top #(
 
     feature_normalizer u_norm (
         .clk                (gmii_rx_clk),
-        .rst_n              (engine_rst_n),
+        .rst_n              (rst_n_norm),
         .feat_valid         (feat_valid),
         .feat_slot          (feat_slot),
         .feat_f0_spread         (feat_f0_spread),
@@ -585,7 +661,7 @@ module tob_top #(
         .BIAS_FILE    (BIAS_FILE)
     ) u_ml (
         .clk        (gmii_rx_clk),
-        .rst_n      (engine_rst_n),
+        .rst_n      (rst_n_ml),
         .norm_valid (norm_valid),
         .norm_slot  (norm_slot),
         .x0 (norm_x0), .x1 (norm_x1), .x2 (norm_x2), .x3 (norm_x3),
@@ -603,7 +679,7 @@ module tob_top #(
                                         // coincidental match (D53)
     ) u_policy (
         .clk                  (gmii_rx_clk),
-        .rst_n                (engine_rst_n),
+        .rst_n                (rst_n_policy),
         // D28-class fix (ml_policy_align_fix.md S3): key ml_policy's internal
         // per-slot fail-safe snapshot to the triggering message's own
         // book_upd_valid/applied_slot -- already top-level wires (u_feat
@@ -635,7 +711,7 @@ module tob_top #(
         .DEPTH (ALIGN_DEPTH)
     ) u_align (
         .clk       (gmii_rx_clk),
-        .rst_n     (engine_rst_n),
+        .rst_n     (rst_n_align),
         .in_valid  (sig_valid),
         .in_data   ({sig_slot, sig_side, sig_price, sig_qty}),
         .out_valid (sig_valid_aligned),
@@ -655,7 +731,7 @@ module tob_top #(
     wire kill_sw_n_sync;
     sync_2ff #(.RESET_VALUE(1'b1)) u_kill_sync (   // idle-high (not pressed)
         .clk      (gmii_rx_clk),
-        .rst_n    (engine_rst_n),
+        .rst_n    (rst_n_kill_sync),
         .async_in (key_in[0]),
         .sync_out (kill_sw_n_sync)
     );
@@ -678,9 +754,9 @@ module tob_top #(
     wire        kill_latched;
 
     reg [31:0] cur_cycle;
-    always @(posedge gmii_rx_clk or negedge engine_rst_n) begin
-        if (!engine_rst_n) cur_cycle <= 32'd0;
-        else               cur_cycle <= cur_cycle + 32'd1;
+    always @(posedge gmii_rx_clk or negedge rst_n_cur_cycle) begin
+        if (!rst_n_cur_cycle) cur_cycle <= 32'd0;
+        else                  cur_cycle <= cur_cycle + 32'd1;
     end
 
     risk_engine #(
@@ -689,7 +765,7 @@ module tob_top #(
                                      // D28 snapshot misaligns again
     ) u_risk (
         .clk                    (gmii_rx_clk),
-        .rst_n                  (engine_rst_n),
+        .rst_n                  (rst_n_risk),
         .sig_valid              (sig_valid_aligned),
         .sig_slot               (sig_slot_aligned),
         .sig_side               (sig_side_aligned),
@@ -760,7 +836,7 @@ module tob_top #(
                                             // zero change (docs/design_decisions.md D25, D40)
     ) u_ob (
         .clk                  (gmii_rx_clk),
-        .rst_n                (engine_rst_n),
+        .rst_n                (rst_n_ob),
         .msg_seq_num          (md_msg_seq_num),
         .order_valid          (order_valid),
         .order_slot           (order_slot),
@@ -802,7 +878,7 @@ module tob_top #(
 
     csr_block u_csr (
         .clk                    (gmii_rx_clk),
-        .rst_n                  (engine_rst_n),
+        .rst_n                  (rst_n_csr),
         .in_data                (fc_out_data),   // shared tap, D19 point 1
         .in_valid               (fc_out_valid),
         .resp_payload           (csr_resp_payload),
@@ -895,7 +971,7 @@ module tob_top #(
 
     latency_histogram u_hist (
         .clk               (gmii_rx_clk),
-        .rst_n             (engine_rst_n),
+        .rst_n             (rst_n_hist),
         .ob_tx_start       (ob_tx_start),
         .ob_tx_payload     (ob_tx_payload),
         .cfg_counter_clear (counter_clear_pulse),
