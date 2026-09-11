@@ -92,6 +92,14 @@ if {$latch_count > 0} {
 
 opt_design
 place_design
+# D54: phys_opt_design (post-placement optimization) was missing from this
+# flow entirely. Its jobs include automatic replication of high-fanout
+# nets -- exactly the mechanism needed to close the async-reset-fanout
+# recovery-check violation (u_rst_sync's output fans out to 10,881 pins
+# after one inverting LUT; report_high_fanout_nets after this step should
+# show that net's fanout reduced by replication). Zero RTL change; this is
+# a pure build-flow addition.
+phys_opt_design
 route_design
 
 # Reports are written BEFORE the gate checks below (see file header) so a
