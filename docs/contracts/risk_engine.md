@@ -358,7 +358,7 @@ wire gate_band_fired_c     = (abs_band > {1'b0, cfg_price_band});
 wire gate_stale_fired_c    = (pend_msg_cycle - pend_prev_cycle) > cfg_max_age; // S2.4
 wire gate_seqgap_fired_c   = seq_gap;
 wire gate_crossed_fired_c  = crossed[sig_slot];
-wire gate_throttle_fired_c = (token_after_refill == 32'd0);                    // S2.3
+wire gate_throttle_fired_c = (!inc && (token_bucket_eff == 32'd0));             // S2.3, D54
 wire gate_ml_fired_c       = adverse_risk & ~cfg_ml_action;
 ```
 
@@ -453,10 +453,12 @@ is low, all of the above hold `order_valid<=0`/`gate_*_fired<=0`/
 `reject_reason<=8'd0` the following cycle.
 
 **Reset (FR-18-style, applied to this module's own state):** `kill_latched`,
-`position` (all slots), `token_bucket` (to `cfg_token_max`), `refill_ctr`,
-`last_update_cycle` (all slots), `pend_prev_cycle`/`pend_msg_cycle` all
-reset to their stated defaults — no stale value readable from any of them
-immediately after `rst_n` deasserts.
+`position` (all slots), `token_bucket` (to `32'd0` — see §2.3 for why not
+`cfg_token_max`), `refill_ctr_p1` (to `32'd1`, D54's `refill_ctr+1`
+invariant — see §2.3), `last_update_cycle` (all slots),
+`pend_prev_cycle`/`pend_msg_cycle` all reset to their stated defaults — no
+stale value readable from any of them immediately after `rst_n`
+deasserts.
 
 ## 3. Testbench requirements (`tb/tb_risk_engine.v`)
 

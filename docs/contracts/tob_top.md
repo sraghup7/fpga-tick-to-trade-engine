@@ -209,7 +209,16 @@ sync_2ff #(.RESET_VALUE(1'b0)) u_rst_sync (
 );
 ```
 
-Every module in §2.4 onward takes `.clk(gmii_rx_clk)`, `.rst_n(engine_rst_n)`.
+**Since D54, `engine_rst_n` is no longer wired directly to any module's `.rst_n` port.** Its ~19 prior consumers' fanout caused a Recovery-timing violation (D54); the fix replicates `engine_rst_n` into 19 local per-module reset buffer registers (`rst_n_mac`, `rst_n_feat`, `rst_n_risk`, etc. — see `rtl/tob_top.v`'s `D54 (Task 4)` comment block for the full list), each `(* keep = "true" *)` and each independently async-cleared by `engine_rst_n` directly:
+
+```verilog
+always @(posedge gmii_rx_clk or negedge engine_rst_n) begin
+    if (!engine_rst_n) rst_n_feat <= 1'b0;
+    else                rst_n_feat <= 1'b1;
+end
+```
+
+Every module in §2.4 onward takes `.clk(gmii_rx_clk)`, `.rst_n(rst_n_<its own local buffer>)` — never `engine_rst_n` directly. Assertion is cycle-identical to the pre-D54 scheme; release lags `engine_rst_n`'s own release by one uniform clock cycle across all 19 buffers (a registered signal can only update on a clock edge) — uniform, so every module's reset still releases in lockstep with every other, preserving D51's `refill_ctr`/`cur_cycle` invariant. See `docs/design_decisions.md` D54 for the full derivation.
 
 ### 2.3 PHY bring-up (`mdio_ctrl.v`)
 

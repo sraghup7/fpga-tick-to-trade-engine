@@ -93,12 +93,20 @@ if {$latch_count > 0} {
 opt_design
 place_design
 # D54: phys_opt_design (post-placement optimization) was missing from this
-# flow entirely. Its jobs include automatic replication of high-fanout
-# nets -- exactly the mechanism needed to close the async-reset-fanout
-# recovery-check violation (u_rst_sync's output fans out to 10,881 pins
-# after one inverting LUT; report_high_fanout_nets after this step should
-# show that net's fanout reduced by replication). Zero RTL change; this is
-# a pure build-flow addition.
+# flow entirely; added here as a generally-correct build-flow step (its
+# jobs include automatic replication of high-fanout nets, among other
+# post-placement optimizations). It was FIRST TRIED as the fix for the
+# async-reset-fanout recovery-check violation (u_rst_sync's output fanning
+# out to ~10,881 pins after one inverting LUT) but that did not hold up:
+# a later re-synthesis showed phys_opt_design made zero netlist
+# modifications for that violation ("No setup violation found. The
+# netlist was not modified." -- vivado.log), because phys_opt_design
+# structurally skips all setup optimization once place_design has already
+# reached WNS>=0, which it had here by placement luck alone. The durable
+# fix was RTL-side (19 local reset buffer registers, see
+# docs/design_decisions.md D54) and does not depend on this step. This
+# call is kept for its general value as a build-flow addition (zero RTL
+# change), not because it closes any specific violation.
 phys_opt_design
 route_design
 

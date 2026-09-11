@@ -421,11 +421,16 @@ class GoldenModel:
         # refill_ctr == cfg-1, i.e. the Nth refill lands at absolute cycle
         # N*cfg - 1, ONE CYCLE EARLIER than a plain `elapsed //
         # token_refill_cycles` floor-division predicts. refill_ctr and
-        # cur_cycle share the same reset (both gated by risk_engine's own
-        # rst_n / tob_top.v's engine_rst_n) and both increment by exactly 1
-        # every cycle unconditionally, so they stay in lockstep as absolute
-        # counters -- this +1 is not a guess, it's RTL's own combinational
-        # lookahead condition. Found the hard way (D51): a soak-order
+        # cur_cycle share the same reset lineage (since D54, gated by local
+        # buffers of tob_top.v's engine_rst_n -- rst_n_risk and
+        # rst_n_cur_cycle respectively; these buffers release one uniform
+        # clock cycle after engine_rst_n itself, but the shift is the SAME
+        # for both, so refill_ctr and cur_cycle stay in lockstep exactly as
+        # before D54 -- see docs/design_decisions.md D54) and both
+        # increment by exactly 1 every cycle unconditionally, so they stay
+        # in lockstep as absolute counters -- this +1 is not a guess, it's
+        # RTL's own combinational lookahead condition. Found the hard way
+        # (D51): a soak-order
         # mismatch traced to gate precedence flipping (8 vs 9) at exactly
         # the FIRST token-bucket refill boundary of a 5,000-message run --
         # this model refilled one order-position later than real RTL,

@@ -152,17 +152,26 @@ module tob_top #(
     );
 
     // ---- D54 (Task 4): local reset-fanout buffers, one per module
-    // instance. Each is independently async-reset by engine_rst_n
-    // directly (same posedge-clk-or-negedge-rst_n pattern engine_rst_n
-    // itself uses) -- NOT a synchronous pipeline stage, so every buffer
-    // releases on the exact same clock edge engine_rst_n itself releases
-    // on. Zero cycle-timing change anywhere; this only reduces engine_rst_n's
-    // own fanout to 19 (trivial to route) and gives each of these 19
-    // buffers' own, much smaller, LOCAL fanout to its own module -- letting
-    // placement put each buffer physically next to its own consumer
-    // instead of one point reaching ~10,881 scattered destinations
-    // (docs/design_decisions.md D54). (* keep = "true" *) stops synthesis
-    // from merging these 19 logically-identical registers back into one.
+    // instance. Each is independently ASSERTED (cleared to 0) by
+    // engine_rst_n directly and asynchronously, the instant engine_rst_n
+    // goes low -- same as before this change. Each buffer's RELEASE
+    // (0->1), however, is a registered transition (the `else` branch
+    // below captures a constant 1 only at the next posedge gmii_rx_clk
+    // after engine_rst_n has gone high) -- so release lags engine_rst_n's
+    // own release by exactly one clock cycle. This is NOT zero-latency,
+    // but it IS uniform: all 19 buffers share this one `always` block, so
+    // every one of them releases on the exact same cycle as every other,
+    // preserving every intra-design relative-timing invariant that held
+    // before this change (most importantly D51's refill_ctr/cur_cycle
+    // lockstep in risk_engine.v/sim/golden_model.py -- both are now gated
+    // by buffers from THIS SAME block, so they shift together). This
+    // fixes engine_rst_n's own fanout (down to 19, trivial to route) by
+    // giving each of these 19 buffers its own, much smaller, LOCAL fanout
+    // to its own module -- letting placement put each buffer physically
+    // next to its own consumer instead of one point reaching ~10,881
+    // scattered destinations (docs/design_decisions.md D54). (* keep =
+    // "true" *) stops synthesis from merging these 19 logically-identical
+    // registers back into one (which would undo the fanout split).
     (* keep = "true" *) reg rst_n_mac;
     (* keep = "true" *) reg rst_n_eth_if;
     (* keep = "true" *) reg rst_n_fc;
